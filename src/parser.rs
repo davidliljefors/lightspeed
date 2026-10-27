@@ -183,11 +183,18 @@ impl<'a> Parser<'a> {
     }
 
     /// From `i`, the index of the next top-level `;` (not consumed), `,` or `}`.
+    /// Template argument lists (`is_same_v<A, B>`) are skipped whole so their
+    /// commas don't look like more declarators.
     fn skip_initializer(&self, mut j: usize) -> usize {
         while j < self.t.len() {
             match self.t[j].kind {
                 K::Semi | K::Comma | K::RBrace => return j,
                 K::LParen | K::LBracket | K::LBrace => j = self.skip_balanced(j),
+                K::Lt if j > 0 && self.t[j - 1].kind == K::Ident => {
+                    let e = self.skip_angles(j);
+                    // Unclosed means a comparison, not a template list.
+                    j = if e > j + 1 && self.t[e - 1].kind == K::Gt { e } else { j + 1 };
+                }
                 _ => j += 1,
             }
         }
@@ -509,6 +516,7 @@ impl<'a> Parser<'a> {
         };
         let mut j = kw_i + 1;
         let mut cand: Option<usize> = None;
+        let mut spec = SymbolFlags::EMPTY;
         loop {
             match self.k(j) {
                 Some(K::LBracket) => j = self.skip_balanced(j),
@@ -518,7 +526,10 @@ impl<'a> Parser<'a> {
                     j += 1;
                 }
                 Some(K::ColonColon) => j += 1,
-                Some(K::Lt) if cand.is_some() => j = self.skip_angles(j).max(j + 1),
+                Some(K::Lt) if cand.is_some() => {
+                    spec = SymbolFlags::SPECIALIZATION;
+                    j = self.skip_angles(j).max(j + 1)
+                }
                 Some(K::Keyword) if self.kw(j) == Kw::Final && cand.is_some() => j += 1,
                 _ => break,
             }
@@ -528,14 +539,16 @@ impl<'a> Parser<'a> {
             Some(K::Semi) => {
                 let Some(c) = cand else { return false };
                 let name = self.db.intern(self.txt(c));
-                self.add(kind, name, c, kw_i, j + 1, SymbolFlags::EMPTY);
+                self.add(kind, name, c, kw_i, j + 1, spec);
                 self.i = j + 1;
                 true
             }
             Some(K::LBrace | K::Colon) => {
                 let sym = cand.map(|c| {
                     let name = self.db.intern(self.txt(c));
-                    (self.add(kind, name, c, kw_i, j, SymbolFlags::DEFINITION), name)
+                    let mut flags = spec;
+                    flags.insert(SymbolFlags::DEFINITION);
+                    (self.add(kind, name, c, kw_i, j, flags), name)
                 });
                 if let Some((id, _)) = sym {
                     if self.k(j) == Some(K::Colon) {

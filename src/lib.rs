@@ -28,6 +28,7 @@ pub use lexer::{Keyword, Lexer, Token, TokenFlags, TokenKind, lex_into};
 pub use source::{LineIndex, LoadError, LoadOptions, SourceFile};
 pub use symbols::{FileId, NameId, SymbolDb, SymbolId};
 pub mod parser;
+pub mod scope_decls;
 pub mod hierarchy;
 pub mod index;
 pub mod query;

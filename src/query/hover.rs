@@ -39,7 +39,12 @@ impl Query<'_> {
                 start,
                 end,
                 signature: l.signature,
-                kind: if l.kind == LocalKind::Param { "parameter" } else { "local variable" }.to_owned(),
+                kind: match l.kind {
+                    LocalKind::Param => "parameter",
+                    LocalKind::Variable => "local variable",
+                    LocalKind::TemplateParam => "template parameter",
+                }
+                .to_owned(),
                 container: db.qualified_name(self.idx.hier.canonical(f)),
                 path: path.to_owned(),
                 offset: l.decl.0,

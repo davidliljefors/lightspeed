@@ -14,6 +14,7 @@ mod hover;
 mod locals;
 mod refs;
 mod search;
+mod templates;
 mod types;
 
 pub use hover::Hover;
@@ -84,11 +85,52 @@ pub fn identifier_at(text: &str, offset: u32) -> Option<(u32, u32)> {
 fn ident_at(toks: &[Token], offset: u32) -> Option<usize> {
     let i = toks.partition_point(|t| t.start <= offset).checked_sub(1)?;
     let t = &toks[i];
-    (t.kind == TokenKind::Ident && offset <= t.start + t.len).then_some(i)
+    (t.kind == TokenKind::Ident && t.keyword != crate::lexer::Keyword::Reserved && offset <= t.start + t.len).then_some(i)
+}
+
+/// Using-directives and namespace aliases in effect at one point: those in
+/// the file before it plus the namespace-level ones of everything it includes.
+struct Decls {
+    local: crate::scope_decls::ScopeDecls,
+    included: Option<std::sync::Arc<crate::scope_decls::ScopeDecls>>,
+}
+
+impl Decls {
+    fn names_contain(&self, name: &str) -> bool {
+        self.local.names_contain(name) || self.included.as_ref().is_some_and(|d| d.names_contain(name))
+    }
+
+    fn alias(&self, alias: &str) -> Option<&str> {
+        self.local.alias(alias).or_else(|| self.included.as_ref().and_then(|d| d.alias(alias)))
+    }
 }
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Kinds that can be forward declared (`class X;`, `enum class E : int;`).
+fn is_forward_decl_kind(db: &crate::symbols::SymbolDb, c: SymbolId) -> bool {
+    let k = db.symbol(c).kind;
+    k.is_record() || k == crate::symbols::SymbolKind::Enum
+}
+
+/// Removes forward declarations that have a definition with the same
+/// qualified name among `cands`, so scoring can't prefer them (e.g. for
+/// being in the same file as the use).
+fn drop_forward_declarations(db: &crate::symbols::SymbolDb, cands: &mut Vec<SymbolId>) {
+    let is_def = |c: SymbolId| db.symbol(c).flags.contains(SymbolFlags::DEFINITION);
+    let fwd = |c: &SymbolId| is_forward_decl_kind(db, *c) && !is_def(*c);
+    if !cands.iter().any(fwd) || !cands.iter().any(|&c| is_forward_decl_kind(db, c) && is_def(c)) {
+        return;
+    }
+    let qname = |c: SymbolId| {
+        let mut s = String::new();
+        db.write_qualified_name(c, &mut s);
+        s
+    };
+    let defined: Vec<String> = cands.iter().copied().filter(|&c| is_forward_decl_kind(db, c) && is_def(c)).map(qname).collect();
+    cands.retain(|c| !fwd(c) || !defined.contains(&qname(*c)));
 }
 
 /// Number of top-level arguments in the call whose `(` is `toks[open]`.
@@ -209,22 +251,56 @@ impl<'a> Query<'a> {
         cands.sort_unstable();
         cands.dedup();
 
+        // Computed on first use: most lookups never need them.
+        let decls = std::cell::OnceCell::new();
+        let decls_at = || -> &Decls {
+            decls.get_or_init(|| Decls {
+                local: crate::scope_decls::scan(toks, text, i, false),
+                included: fi.map(|f| self.idx.included_decls(f)),
+            })
+        };
+
         if !qual.is_empty() {
-            let want = qual.join("::");
             let mut buf = String::new();
-            let filtered: Vec<SymbolId> = cands
-                .iter()
-                .copied()
-                .filter(|&c| {
-                    let Some(p) = db.symbol(c).parent else { return false };
-                    buf.clear();
-                    db.write_qualified_name(p, &mut buf);
-                    buf == want || buf.strip_suffix(want.as_str()).is_some_and(|r| r.ends_with("::"))
-                })
-                .collect();
+            let mut by_qualifier = |want: &str, cands: &[SymbolId]| -> Vec<SymbolId> {
+                cands
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        let Some(p) = db.symbol(c).parent else { return false };
+                        buf.clear();
+                        db.write_qualified_name(p, &mut buf);
+                        buf == want || buf.strip_suffix(want).is_some_and(|r| r.ends_with("::"))
+                    })
+                    .collect()
+            };
+            let mut filtered = by_qualifier(&qual.join("::"), &cands);
+            if filtered.is_empty()
+                && let Some(target) = decls_at().alias(qual[0])
+            {
+                // `namespace fs = std::filesystem;` makes `fs::` mean `std::filesystem::`.
+                let mut want = target.to_owned();
+                for q in &qual[1..] {
+                    want.push_str("::");
+                    want.push_str(q);
+                }
+                filtered = by_qualifier(&want, &cands);
+            }
             if !filtered.is_empty() {
                 cands = filtered;
             }
+        }
+
+        drop_forward_declarations(db, &mut cands);
+        if cands.iter().any(|&c| db.symbol(c).flags.contains(crate::symbols::SymbolFlags::SPECIALIZATION)) {
+            let args = (toks.get(i + 1).is_some_and(|t| t.kind == TokenKind::Lt))
+                .then(|| types::matching_fwd(toks, i + 1))
+                .flatten()
+                .map(|c| types::split_args(&toks[i + 2..c], text));
+            self.choose_specialization(&mut cands, args.as_deref());
+        }
+        if !member && qual.is_empty() && !(i > 0 && toks[i - 1].kind == TokenKind::ColonColon) {
+            cands.retain(|&c| db.symbol(c).kind.is_callable() || self.visible_unqualified(c, &in_scope, &in_bases, || decls_at()));
         }
 
         let mut best: (i32, Vec<SymbolId>) = (i32::MIN, Vec::new());
@@ -237,7 +313,7 @@ impl<'a> Query<'a> {
                 score += if is_member { 4 } else { -6 };
             } else if qual.is_empty() {
                 if let Some(p) = s.parent {
-                    if let Some(pos) = in_scope.iter().position(|&x| x == p) {
+                    if let Some(pos) = in_scope.iter().position(|&x| self.same_scope(x, p)) {
                         score += 8 - pos.min(4) as i32;
                     } else if in_bases.contains(&p) {
                         score += 3;
@@ -274,8 +350,8 @@ impl<'a> Query<'a> {
         }
 
         let mut picked = best.1;
-        if picked.iter().any(|&c| db.symbol(c).kind.is_record() && db.symbol(c).flags.contains(SymbolFlags::DEFINITION)) {
-            picked.retain(|&c| !db.symbol(c).kind.is_record() || db.symbol(c).flags.contains(SymbolFlags::DEFINITION));
+        if picked.iter().any(|&c| is_forward_decl_kind(db, c) && db.symbol(c).flags.contains(SymbolFlags::DEFINITION)) {
+            picked.retain(|&c| !is_forward_decl_kind(db, c) || db.symbol(c).flags.contains(SymbolFlags::DEFINITION));
         }
         let mut out = Vec::new();
         for c in picked {
@@ -287,6 +363,55 @@ impl<'a> Query<'a> {
             }
         }
         out
+    }
+
+    /// Whether `a` and `b` are the same scope; reopened namespaces are separate
+    /// symbols, so those compare by their chain of names.
+    fn same_scope(&self, mut a: SymbolId, mut b: SymbolId) -> bool {
+        use crate::symbols::SymbolKind as K;
+        let db = &self.idx.db;
+        loop {
+            if a == b {
+                return true;
+            }
+            let (sa, sb) = (db.symbol(a), db.symbol(b));
+            if sa.kind != K::Namespace || sb.kind != K::Namespace || sa.name != sb.name {
+                return false;
+            }
+            match (sa.parent, sb.parent) {
+                (None, None) => return true,
+                (Some(pa), Some(pb)) => (a, b) = (pa, pb),
+                _ => return false,
+            }
+        }
+    }
+
+    /// Whether `c` can be named without qualification from a scope whose
+    /// enclosing scopes are `in_scope` (and inherited ones `in_bases`).
+    /// Members of other namespaces and classes need a qualifier or a `using`.
+    fn visible_unqualified<'t>(&self, c: SymbolId, in_scope: &[SymbolId], in_bases: &[SymbolId], decls: impl FnOnce() -> &'t Decls) -> bool {
+        use crate::symbols::SymbolKind as K;
+        let db = &self.idx.db;
+        // Unscoped enumerators and anonymous namespaces belong to the enclosing scope.
+        let mut parent = db.symbol(c).parent;
+        while let Some(p) = parent {
+            let s = db.symbol(p);
+            let transparent = (s.kind == K::Enum && !s.flags.contains(SymbolFlags::SCOPED)) || (s.kind == K::Namespace && db.names.get(s.name).is_empty());
+            if !transparent {
+                break;
+            }
+            parent = s.parent;
+        }
+        let Some(p) = parent else { return true };
+        let kind = db.symbol(p).kind;
+        if !matches!(kind, K::Namespace | K::Enum) && !kind.is_record() {
+            return true;
+        }
+        if in_scope.iter().any(|&s| self.same_scope(s, p)) || in_bases.contains(&p) {
+            return true;
+        }
+        let name = db.names.get(db.symbol(p).name);
+        decls().names_contain(name)
     }
 
     /// Where `id`'s name is written.

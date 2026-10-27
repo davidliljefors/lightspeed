@@ -126,8 +126,10 @@ impl SymbolFlags {
     pub const SCOPED: Self = Self(1 << 12);
     /// Tombstone: the symbol's file was re-indexed. Never persisted.
     pub const DEAD: Self = Self(1 << 13);
+    /// Explicit or partial specialization (`struct X<int>`, `struct X<T*>`) of a template.
+    pub const SPECIALIZATION: Self = Self(1 << 14);
 
-    const NAMES: [(Self, &'static str); 14] = [
+    const NAMES: [(Self, &'static str); 15] = [
         (Self::VIRTUAL, "VIRTUAL"),
         (Self::OVERRIDE, "OVERRIDE"),
         (Self::FINAL, "FINAL"),
@@ -142,6 +144,7 @@ impl SymbolFlags {
         (Self::DEFAULTED, "DEFAULTED"),
         (Self::SCOPED, "SCOPED"),
         (Self::DEAD, "DEAD"),
+        (Self::SPECIALIZATION, "SPECIALIZATION"),
     ];
 
     #[inline]
@@ -151,7 +154,7 @@ impl SymbolFlags {
 
     /// Unknown bits are dropped.
     pub const fn from_bits_truncate(bits: u16) -> Self {
-        Self(bits & ((1 << 13) - 1))
+        Self(bits & (((1 << 13) - 1) | (1 << 14)))
     }
 
     #[inline]

@@ -115,6 +115,10 @@ pub enum Keyword {
     Concept,
     Delete,
     Default,
+    /// Any other reserved word (`static_cast`, `int`, `return`, ...). These
+    /// stay [`TokenKind::Ident`] so declaration parsing sees types as before,
+    /// but they never name a symbol.
+    Reserved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]
@@ -208,7 +212,7 @@ static CLASS: [u8; 256] = {
 };
 
 fn keyword(s: &[u8]) -> Keyword {
-    if s.len() < 3 || s.len() > 9 || !s[0].is_ascii_lowercase() {
+    if s.len() < 2 || s.len() > 16 || !s[0].is_ascii_lowercase() {
         return Keyword::None;
     }
     match s {
@@ -244,6 +248,12 @@ fn keyword(s: &[u8]) -> Keyword {
         b"concept" => Keyword::Concept,
         b"delete" => Keyword::Delete,
         b"default" => Keyword::Default,
+        b"alignas" | b"alignof" | b"and" | b"and_eq" | b"asm" | b"auto" | b"bitand" | b"bitor" | b"bool" | b"break" | b"case" | b"catch" | b"char"
+        | b"char8_t" | b"char16_t" | b"char32_t" | b"co_await" | b"co_return" | b"co_yield" | b"compl" | b"const_cast" | b"continue" | b"decltype"
+        | b"do" | b"double" | b"dynamic_cast" | b"else" | b"export" | b"false" | b"float" | b"for" | b"goto" | b"if" | b"int" | b"long" | b"new"
+        | b"not" | b"not_eq" | b"nullptr" | b"or" | b"or_eq" | b"register" | b"reinterpret_cast" | b"return" | b"short" | b"signed" | b"sizeof"
+        | b"static_assert" | b"static_cast" | b"switch" | b"this" | b"thread_local" | b"throw" | b"true" | b"try" | b"typeid" | b"unsigned"
+        | b"void" | b"wchar_t" | b"while" | b"xor" | b"xor_eq" => Keyword::Reserved,
         _ => Keyword::None,
     }
 }
@@ -528,7 +538,7 @@ impl<'a> Lexer<'a> {
                 }
                 _ => {
                     kw = keyword(&b[p..id_end]);
-                    (if kw == Keyword::None { TokenKind::Ident } else { TokenKind::Keyword }, id_end)
+                    (if matches!(kw, Keyword::None | Keyword::Reserved) { TokenKind::Ident } else { TokenKind::Keyword }, id_end)
                 }
             }
         } else if CLASS[c as usize] & DIGIT != 0 || (c == b'.' && b.get(p + 1).is_some_and(u8::is_ascii_digit)) {

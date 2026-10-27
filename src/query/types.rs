@@ -8,6 +8,10 @@
 //! * names (`x`), `this`, `new T`, `T(...)`, `make_unique<T>(...)`;
 //! * calls to functions/methods (their written return type);
 //! * member chains (`a.b().c`, `p->q`), `[]` on `Foo<T>` yields `T`;
+//! * template arguments flow into members: for `vector<Foo> v`, `v.front()`
+//!   is `Foo`; for `unordered_map<K, V>`, `m[k]` is `V` and iterating yields
+//!   `pair<K, V>`. Parameters are read from the `template<...>` header, and
+//!   member aliases (`value_type`, `iterator`...) are expanded;
 //! * `auto x = <expr>;` by evaluating the initializer (depth-limited);
 //! * smart pointers: `->` on `unique_ptr<T>` and friends yields `T`.
 //!
@@ -17,6 +21,7 @@
 //!
 //! This is the one place to extend type inference.
 
+use super::templates::template_header;
 use super::{Query, sig_tokens};
 use crate::lexer::{Keyword, Token, TokenKind as K};
 use crate::symbols::{SymbolId, SymbolKind};
@@ -28,24 +33,47 @@ const MAKE_SMART: &[&str] = &["make_unique", "make_shared", "make_intrusive", "a
 const PASS_THROUGH: &[&str] = &["move", "forward", "as_const", "addressof", "ref", "cref"];
 
 /// A written type reduced to what member lookup needs: its leading name and,
-/// for templates, the first type argument.
+/// for templates, its arguments, each as normalized type text (`Foo`,
+/// `vector<Foo>`; qualifiers, `const` and `*`/`&` dropped) so they can be
+/// parsed again with [`parse_ty`] when substituted into a member's type.
 #[derive(Clone)]
 struct Ty {
     head: String,
-    arg: Option<String>,
+    args: Vec<String>,
 }
 
 impl Ty {
     fn plain(head: &str) -> Self {
-        Self { head: head.to_owned(), arg: None }
+        Self { head: head.to_owned(), args: Vec::new() }
+    }
+
+    fn text(&self) -> String {
+        if self.args.is_empty() { self.head.clone() } else { format!("{}<{}>", self.head, self.args.join(", ")) }
     }
 
     /// The type reached through `->` or `*` on a smart pointer.
     fn smart_inner(&self) -> Option<Self> {
-        match &self.arg {
-            Some(a) if SMART_PTRS.contains(&self.head.as_str()) => Some(Self::plain(a)),
-            _ => None,
+        if SMART_PTRS.contains(&self.head.as_str()) { self.args.first().and_then(|a| parse_ty(a)) } else { None }
+    }
+}
+
+/// Type names an STL-style container class exposes that are rarely written
+/// out in the headers we can see: what they stand for given its arguments.
+fn container_alias(name: &str, recv: &Ty) -> Option<Ty> {
+    let arg = |i: usize| recv.args.get(i).and_then(|a| parse_ty(a));
+    let is_map = recv.head.contains("map");
+    match name {
+        "key_type" => arg(0),
+        "mapped_type" => arg(1),
+        "value_type" | "reference" | "const_reference" | "pointer" | "const_pointer" | "iterator" | "const_iterator" | "reverse_iterator"
+        | "const_reverse_iterator" | "local_iterator" | "const_local_iterator"
+            if is_map && recv.args.len() >= 2 =>
+        {
+            Some(Ty { head: "pair".to_owned(), args: recv.args[..2].to_vec() })
         }
+        "value_type" | "reference" | "const_reference" | "pointer" | "const_pointer" | "iterator" | "const_iterator" | "reverse_iterator"
+        | "const_reverse_iterator" | "local_iterator" | "const_local_iterator" => arg(0),
+        _ => None,
     }
 }
 
@@ -64,10 +92,13 @@ impl Cx<'_> {
 /// What the nearest earlier declaration of a name says.
 enum Decl {
     Ty(Ty),
-    /// `auto name = <init>`: the declaration's token index and the end of its initializer.
-    Auto { decl: usize, end: usize },
+    /// `auto name = <init>`: the declaration's token index, where its
+    /// initializer starts and where it ends.
+    Auto { decl: usize, start: usize, end: usize },
     /// `auto name : <range>` in a range-for.
-    Range { decl: usize, end: usize },
+    Range { decl: usize, start: usize, end: usize },
+    /// The `n`th name of a structured binding `auto [a, b] = <init>` / `: <range>`.
+    Bind(usize, Box<Decl>),
 }
 
 impl Query<'_> {
@@ -187,7 +218,7 @@ impl Query<'_> {
                     i = matching_fwd(expr, i)? + 1;
                     ty = match self.operator_ty(cx, &ty, "operator[]").filter(|t| self.resolves(t)) {
                         Some(t) => t,
-                        None => ty.arg.take().map_or(ty, |a| Ty::plain(&a)),
+                        None => ty.args.first().and_then(|a| parse_ty(a)).unwrap_or(ty),
                     };
                 }
                 _ => break,
@@ -220,14 +251,16 @@ impl Query<'_> {
         i += is_new as usize;
 
         let mut path: Vec<&str> = Vec::new();
-        let mut targ: Option<&str> = None;
+        let mut targs: Vec<String> = Vec::new();
         loop {
             let t = expr.get(i).filter(|t| t.kind == K::Ident)?;
             path.push(tx(t));
             i += 1;
             if expr.get(i).is_some_and(|t| t.kind == K::Lt) {
                 let close = matching_fwd(expr, i)?;
-                targ = targ.or_else(|| first_type_name(&expr[i + 1..close], cx.text));
+                if targs.is_empty() {
+                    targs = split_args(&expr[i + 1..close], cx.text);
+                }
                 i = close + 1;
             }
             if expr.get(i).is_some_and(|t| t.kind == K::ColonColon) {
@@ -243,16 +276,16 @@ impl Query<'_> {
             i = matching_fwd(expr, i)? + 1;
         }
         let ty = if is_new {
-            Ty { head: name.to_owned(), arg: targ.map(str::to_owned) }
+            Ty { head: name.to_owned(), args: targs }
         } else if called && PASS_THROUGH.contains(&name) {
             let args = &expr[open + 1..i - 1];
             let first = &args[..top_level(args, K::Comma).unwrap_or(args.len())];
             self.expr_ty(cx, prefix, first, depth + 1)?
         } else if called {
-            self.call_ty(cx, path.last().copied(), name, targ)?
+            self.call_ty(cx, path.last().copied(), name, &targs)?
         } else if let Some(q) = path.last() {
             let owners = self.resolve_records(self.idx.db.lookup(q).iter().copied());
-            self.member_ty(cx, &owners, name)?
+            self.member_ty(cx, &owners, name, None)?
         } else {
             self.ident_ty(cx, prefix, name, depth)?
         };
@@ -265,8 +298,9 @@ impl Query<'_> {
 
     /// Member `name` (usually an `operator…`) of the class `ty` names, or its bases.
     fn operator_ty(&self, cx: &Cx, ty: &Ty, name: &str) -> Option<Ty> {
-        let owners = self.resolve_records(self.idx.db.lookup(&ty.head).iter().copied());
-        self.member_ty(cx, &owners, name)
+        let mut owners = self.resolve_records(self.idx.db.lookup(&ty.head).iter().copied());
+        self.choose_specialization(&mut owners, (!ty.args.is_empty()).then_some(&ty.args[..]));
+        self.member_ty(cx, &owners, name, Some(ty))
     }
 
     /// The type reached through `->`.
@@ -287,16 +321,49 @@ impl Query<'_> {
 
     /// Element type when iterating over a value of type `ty` in a range-for.
     fn element_ty(&self, cx: &Cx, ty: Ty) -> Option<Ty> {
-        if ty.head.contains("map") {
-            return None; // elements are pairs; not modelled
+        if ty.head.contains("map") && ty.args.len() >= 2 {
+            return container_alias("value_type", &ty);
         }
-        if let Some(a) = &ty.arg {
-            return Some(Ty::plain(a));
+        if let Some(a) = ty.args.first() {
+            return parse_ty(a);
         }
         match self.operator_ty(cx, &ty, "begin") {
             Some(it) => Some(self.deref_ty(cx, it)),
             None => Some(ty), // plain C array
         }
+    }
+
+    /// Type of a name declared with `auto` (possibly as one element of a structured binding).
+    fn auto_decl_ty(&self, cx: &Cx, prefix: &[Token], d: Decl, depth: u8) -> Option<Ty> {
+        match d {
+            Decl::Ty(t) => Some(t),
+            Decl::Auto { decl, start, end } => self.expr_ty(cx, &prefix[..decl], &prefix[start..end], depth + 1),
+            Decl::Range { decl, start, end } => {
+                let container = self.expr_ty(cx, &prefix[..decl], &prefix[start..end], depth + 1)?;
+                self.element_ty(cx, container)
+            }
+            Decl::Bind(n, inner) => {
+                let whole = self.auto_decl_ty(cx, prefix, *inner, depth)?;
+                self.binding_ty(cx, &whole, n)
+            }
+        }
+    }
+
+    /// Type of the `n`th name in `auto [a, b, ...] = <value of type ty>`.
+    fn binding_ty(&self, cx: &Cx, ty: &Ty, n: usize) -> Option<Ty> {
+        if matches!(ty.head.as_str(), "pair" | "tuple") {
+            return ty.args.get(n).and_then(|a| parse_ty(a));
+        }
+        if ty.head == "array" {
+            return ty.args.first().and_then(|a| parse_ty(a));
+        }
+        let db = &self.idx.db;
+        let mut owners = self.resolve_records(db.lookup(&ty.head).iter().copied());
+        self.choose_specialization(&mut owners, (!ty.args.is_empty()).then_some(&ty.args[..]));
+        let owner = *owners.first()?;
+        let field = db.children(owner).iter().copied().filter(|&m| db.symbol(m).kind == SymbolKind::Field && !db.symbol(m).flags.contains(crate::symbols::SymbolFlags::STATIC)).nth(n)?;
+        let t = self.decl_ty(cx, field)?;
+        Some(self.instantiate(cx, t, owner, ty))
     }
 
     /// Inferred type of the `auto` local `name` declared at `decl_offset`, as written (`Foo<Bar>`).
@@ -325,10 +392,7 @@ impl Query<'_> {
         let cx = Cx { path, text, scopes: &scopes };
         let toks = sig_tokens(&text[..cut]);
         let ty = self.ident_ty(&cx, &toks, name, 0)?;
-        Some(match ty.arg {
-            Some(a) => format!("{}<{a}>", ty.head),
-            None => ty.head,
-        })
+        Some(ty.text())
     }
 
     /// Type of the variable, parameter, field or `this` called `name`.
@@ -340,11 +404,7 @@ impl Query<'_> {
         }
         match declared_before(prefix, cx.text, name) {
             Some(Decl::Ty(t)) => return Some(t),
-            Some(Decl::Auto { decl, end }) => return self.expr_ty(cx, &prefix[..decl], &prefix[decl + 2..end], depth + 1),
-            Some(Decl::Range { decl, end }) => {
-                let container = self.expr_ty(cx, &prefix[..decl], &prefix[decl + 2..end], depth + 1)?;
-                return self.element_ty(cx, container);
-            }
+            Some(d) => return self.auto_decl_ty(cx, prefix, d, depth),
             None => {}
         }
         let (in_scope, in_bases) = self.scope_set(cx.scopes);
@@ -359,12 +419,12 @@ impl Query<'_> {
     }
 
     /// Result type of calling `name` (optionally qualified by `qual`).
-    fn call_ty(&self, cx: &Cx, qual: Option<&str>, name: &str, targ: Option<&str>) -> Option<Ty> {
+    fn call_ty(&self, cx: &Cx, qual: Option<&str>, name: &str, targs: &[String]) -> Option<Ty> {
         if name.ends_with("_cast") {
-            return targ.map(Ty::plain);
+            return targs.first().and_then(|a| parse_ty(a));
         }
         if MAKE_SMART.contains(&name) {
-            return targ.map(|a| Ty { head: "unique_ptr".to_owned(), arg: Some(a.to_owned()) });
+            return targs.first().map(|a| Ty { head: "unique_ptr".to_owned(), args: vec![a.clone()] });
         }
         let db = &self.idx.db;
         if !self.resolve_records(db.lookup(name).iter().copied()).is_empty() {
@@ -380,7 +440,9 @@ impl Query<'_> {
     }
 
     /// Type of member `name` (field type or method return type) of `owners` or their bases.
-    fn member_ty(&self, cx: &Cx, owners: &[SymbolId], name: &str) -> Option<Ty> {
+    /// `recv` is the instantiated type the member is accessed on; template
+    /// parameters in the member's type are replaced by its arguments.
+    fn member_ty(&self, cx: &Cx, owners: &[SymbolId], name: &str, recv: Option<&Ty>) -> Option<Ty> {
         let db = &self.idx.db;
         let mut chain = Vec::new();
         for &o in owners {
@@ -391,19 +453,114 @@ impl Query<'_> {
             .iter()
             .flat_map(|&o| db.children(o).iter().copied())
             .filter(|&m| db.name(m) == name && matches!(db.symbol(m).kind, SymbolKind::Field | SymbolKind::Variable | SymbolKind::Function | SymbolKind::Method))
-            .find_map(|m| self.decl_ty(cx, m))
+            .find_map(|m| {
+                let ty = self.decl_ty(cx, m)?;
+                // Only the receiver's own members map onto its arguments, not those of bases.
+                match (recv, db.symbol(m).parent) {
+                    (Some(r), Some(p)) if owners.contains(&p) => Some(self.instantiate(cx, ty, p, r)),
+                    _ => Some(ty),
+                }
+            })
+    }
+
+    /// `ty`, written inside template `owner`, as seen from `recv = owner<args>`.
+    fn instantiate(&self, cx: &Cx, ty: Ty, owner: SymbolId, recv: &Ty) -> Ty {
+        let params = self.template_params(cx, owner);
+        if params.is_empty() {
+            return ty;
+        }
+        if self.idx.db.symbol(owner).flags.contains(crate::symbols::SymbolFlags::SPECIALIZATION) {
+            // `struct X<T*>`: each parameter is bound by where it appears in the written arguments.
+            let written = self.spec_args(owner);
+            let args = params
+                .iter()
+                .map(|p| {
+                    let k = written.iter().position(|w| w.trim_end_matches('*') == p)?;
+                    let stars = written[k].len() - p.len();
+                    let a = recv.args.get(k)?;
+                    Some(a[..a.len().saturating_sub(stars)].to_owned())
+                })
+                .map(Option::unwrap_or_default)
+                .collect();
+            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args }, 0);
+        }
+        self.subst(cx, ty, owner, &params, recv, 0)
+    }
+
+    fn subst(&self, cx: &Cx, ty: Ty, owner: SymbolId, params: &[String], recv: &Ty, depth: u8) -> Ty {
+        if depth > 6 {
+            return ty;
+        }
+        if let Some(i) = params.iter().position(|p| *p == ty.head) {
+            return recv.args.get(i).and_then(|a| parse_ty(a)).unwrap_or(ty);
+        }
+        if ty.args.is_empty() {
+            let own = self.idx.db.children(owner).iter().copied().find(|&m| self.idx.db.name(m) == ty.head && self.idx.db.symbol(m).kind == SymbolKind::TypeAlias);
+            let expanded = match own {
+                Some(m) => self.alias_full_ty(cx, m),
+                None => container_alias(&ty.head, &self.subst_args(cx, recv, owner, params, recv, depth)),
+            };
+            if let Some(t) = expanded {
+                return self.subst(cx, t, owner, params, recv, depth + 1);
+            }
+        }
+        self.subst_args(cx, &ty, owner, params, recv, depth)
+    }
+
+    fn subst_args(&self, cx: &Cx, ty: &Ty, owner: SymbolId, params: &[String], recv: &Ty, depth: u8) -> Ty {
+        let args = ty
+            .args
+            .iter()
+            .map(|a| match parse_ty(a) {
+                Some(t) => self.subst(cx, t, owner, params, recv, depth + 1).text(),
+                None => a.clone(),
+            })
+            .collect();
+        Ty { head: ty.head.clone(), args }
+    }
+
+    /// Source text of the file declaring `s`.
+    fn source_of<R>(&self, cx: &Cx, s: &crate::symbols::Symbol, f: impl FnOnce(&str) -> Option<R>) -> Option<R> {
+        let fpath = self.idx.db.files.path(s.file);
+        let t = if fpath == cx.path { None } else { self.texts.text(fpath) };
+        f(t.as_ref().map(|t| t.as_str()).unwrap_or(cx.text))
+    }
+
+    /// Names of the template parameters of `id`, read from the `template<...>`
+    /// header written just before its declaration.
+    fn template_params(&self, cx: &Cx, id: SymbolId) -> Vec<String> {
+        let s = self.idx.db.symbol(id);
+        if !s.flags.contains(crate::symbols::SymbolFlags::TEMPLATE) {
+            return Vec::new();
+        }
+        self.source_of(cx, s, |src| template_header(src, s.extent_start as usize).map(|h| h.params.into_iter().map(|p| p.name).collect())).unwrap_or_default()
+    }
+
+    /// The type a `using X = T;` / `typedef T X;` declaration spells, with its arguments.
+    fn alias_full_ty(&self, cx: &Cx, id: SymbolId) -> Option<Ty> {
+        let s = self.idx.db.symbol(id);
+        let name = self.idx.db.name(id);
+        self.source_of(cx, s, |text| {
+            let src = text.get(s.extent_start as usize..s.extent_end as usize)?;
+            let toks = sig_tokens(src);
+            let (lo, hi) = if toks.first()?.is_keyword(Keyword::Using) {
+                let eq = toks.iter().position(|t| t.kind == K::Eq)?;
+                (eq + 1, toks.len() - toks.last().is_some_and(|t| t.kind == K::Semi) as usize)
+            } else {
+                (1, toks.iter().rposition(|t| t.kind == K::Ident && t.text(src) == name)?)
+            };
+            declared_type_tail(toks.get(lo..hi)?, src)
+        })
     }
 
     /// Written type of a declaration: a field/variable's type or a function's return type.
     fn decl_ty(&self, cx: &Cx, id: SymbolId) -> Option<Ty> {
-        let db = &self.idx.db;
-        let s = db.symbol(id);
-        let fpath = db.files.path(s.file);
-        let t = if fpath == cx.path { None } else { self.texts.text(fpath) };
-        let src = t.as_ref().map(|t| t.as_str()).unwrap_or(cx.text);
-        let slice = src.get(s.extent_start.min(s.name_offset) as usize..s.name_offset as usize)?;
-        let toks = sig_tokens(slice);
-        declared_type_tail(&toks, slice).filter(|t| t.head != "auto")
+        let s = self.idx.db.symbol(id);
+        self.source_of(cx, s, |src| {
+            let slice = src.get(s.extent_start.min(s.name_offset) as usize..s.name_offset as usize)?;
+            let toks = sig_tokens(slice);
+            declared_type_tail(&toks, slice).filter(|t| t.head != "auto")
+        })
     }
 }
 
@@ -508,17 +665,8 @@ fn matching_back(toks: &[Token], i: usize) -> Option<usize> {
     None
 }
 
-/// Last segment of the first qualified name in `toks` (a template argument list).
-fn first_type_name<'t>(toks: &[Token], text: &'t str) -> Option<&'t str> {
-    let mut i = toks.iter().position(|t| t.kind == K::Ident)?;
-    while toks.get(i + 1).is_some_and(|t| t.kind == K::ColonColon) && toks.get(i + 2).is_some_and(|t| t.kind == K::Ident) {
-        i += 2;
-    }
-    Some(toks[i].text(text))
-}
-
 /// Type spelled at the end of `toks` in a declaration like
-/// `eastl::vector<Foo> *`, reduced to its leading template name and first argument.
+/// `eastl::vector<Foo> *`, reduced to its leading template name and arguments.
 fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
     let mut i = toks.len();
     // Out-of-line definitions: `Foo* Bar::baz` leaves `Bar::` before the name.
@@ -528,13 +676,98 @@ fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
     while i > 0 && (matches!(toks[i - 1].kind, K::Star | K::Amp | K::AmpAmp) || toks[i - 1].is_keyword(Keyword::Const)) {
         i -= 1;
     }
-    let mut arg = None;
+    let mut args = Vec::new();
     if i > 0 && toks[i - 1].kind == K::Gt {
         let open = matching_back(toks, i - 1)?;
-        arg = first_type_name(&toks[open + 1..i - 1], text).map(str::to_owned);
+        args = split_args(&toks[open + 1..i - 1], text);
         i = open;
     }
-    (i > 0 && toks[i - 1].kind == K::Ident).then(|| Ty { head: toks[i - 1].text(text).to_owned(), arg })
+    (i > 0 && toks[i - 1].kind == K::Ident).then(|| Ty { head: toks[i - 1].text(text).to_owned(), args })
+}
+
+/// The type written in `s`, e.g. `vector<Foo>`.
+fn parse_ty(s: &str) -> Option<Ty> {
+    let toks = sig_tokens(s);
+    declared_type_tail(&toks, s)
+}
+
+/// Template arguments (the tokens between `<` and `>`) as normalized type
+/// texts; an argument that isn't a type (`3`, `sizeof(T)`) becomes empty so
+/// positions stay aligned with the parameters.
+pub(super) fn split_args(toks: &[Token], text: &str) -> Vec<String> {
+    // Pointer-ness is kept (`Foo*`) so partial specializations like `X<T*>` can be told apart.
+    let norm = |seg: &[Token]| {
+        let stars = seg.iter().rev().take_while(|t| matches!(t.kind, K::Star | K::Amp | K::AmpAmp) || t.is_keyword(Keyword::Const)).filter(|t| t.kind == K::Star).count();
+        declared_type_tail(seg, text).map(|t| t.text() + &"*".repeat(stars)).unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            K::Lt | K::LParen | K::LBracket | K::LBrace => depth += 1,
+            K::Gt | K::RParen | K::RBracket | K::RBrace => depth -= 1,
+            K::Comma if depth == 0 => {
+                out.push(norm(&toks[start..i]));
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < toks.len() {
+        out.push(norm(&toks[start..]));
+    }
+    out
+}
+
+/// Where the range expression of a range-for that starts at `from` ends: the
+/// closing paren of the `for (`.
+fn range_end(toks: &[Token], from: usize) -> usize {
+    let mut depth = 0i32;
+    for (j, t) in toks.iter().enumerate().skip(from) {
+        match t.kind {
+            K::LParen | K::LBracket | K::LBrace => depth += 1,
+            K::RParen if depth == 0 => return j,
+            K::RParen | K::RBracket | K::RBrace => depth -= 1,
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
+/// Where the initializer starting at `from` ends: the next top-level `;`.
+fn init_end(toks: &[Token], from: usize) -> usize {
+    let mut depth = 0i32;
+    for (j, t) in toks.iter().enumerate().skip(from) {
+        match t.kind {
+            K::LParen | K::LBracket | K::LBrace => depth += 1,
+            K::RParen | K::RBracket | K::RBrace => depth -= 1,
+            K::Semi if depth <= 0 => return j,
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
+/// The `[`..`]` of the structured binding `auto& [a, b]` that names `toks[i]`.
+fn binding_group(toks: &[Token], text: &str, i: usize) -> Option<(usize, usize)> {
+    let mut lb = i;
+    loop {
+        lb = lb.checked_sub(1)?;
+        match toks[lb].kind {
+            K::Ident | K::Comma => {}
+            K::LBracket => break,
+            _ => return None,
+        }
+    }
+    let mut k = lb;
+    while k > 0 && (matches!(toks[k - 1].kind, K::Star | K::Amp | K::AmpAmp) || toks[k - 1].is_keyword(Keyword::Const)) {
+        k -= 1;
+    }
+    if k == 0 || toks[k - 1].kind != K::Ident || toks[k - 1].text(text) != "auto" {
+        return None;
+    }
+    Some((lb, matching_fwd(toks, lb).filter(|&rb| rb > i)?))
 }
 
 /// Finds the nearest earlier declaration `Type [*&] name` of `name` in `toks`
@@ -545,46 +778,28 @@ fn declared_before(toks: &[Token], text: &str, name: &str) -> Option<Decl> {
         if t.kind != K::Ident || t.text(text) != name {
             continue;
         }
-        let follows = toks.get(i + 1).is_none_or(|n| matches!(n.kind, K::Semi | K::Eq | K::LParen | K::LBrace | K::Comma | K::RParen | K::LBracket | K::Colon));
+        let follows = toks.get(i + 1).is_none_or(|n| matches!(n.kind, K::Semi | K::Eq | K::LParen | K::LBrace | K::Comma | K::RParen | K::LBracket | K::RBracket | K::Colon));
         if !follows {
             continue;
+        }
+        if let Some((lb, rb)) = binding_group(toks, text, i) {
+            let n = toks[lb + 1..i].iter().filter(|t| t.kind == K::Ident).count();
+            let start = rb + 2;
+            let inner = match toks.get(rb + 1).map(|t| t.kind) {
+                Some(K::Colon) => Decl::Range { decl: lb, start, end: range_end(toks, start) },
+                Some(K::Eq) => Decl::Auto { decl: lb, start, end: init_end(toks, start) },
+                _ => continue,
+            };
+            return Some(Decl::Bind(n, Box::new(inner)));
         }
         let Some(ty) = declared_type_tail(&toks[..i], text) else { continue };
         if ty.head != "auto" {
             return Some(Decl::Ty(ty));
         }
-        if toks.get(i + 1).is_some_and(|n| n.kind == K::Colon) {
-            // Range-for: the range expression runs to the closing paren of the `for (`.
-            let mut depth = 0i32;
-            let mut end = toks.len();
-            for (j, t) in toks.iter().enumerate().skip(i + 2) {
-                match t.kind {
-                    K::LParen | K::LBracket | K::LBrace => depth += 1,
-                    K::RParen if depth == 0 => {
-                        end = j;
-                        break;
-                    }
-                    K::RParen | K::RBracket | K::RBrace => depth -= 1,
-                    _ => {}
-                }
-            }
-            return Some(Decl::Range { decl: i, end });
-        }
-        if toks.get(i + 1).is_some_and(|n| n.kind == K::Eq) {
-            let mut depth = 0i32;
-            let mut end = toks.len();
-            for (j, t) in toks.iter().enumerate().skip(i + 2) {
-                match t.kind {
-                    K::LParen | K::LBracket | K::LBrace => depth += 1,
-                    K::RParen | K::RBracket | K::RBrace => depth -= 1,
-                    K::Semi if depth <= 0 => {
-                        end = j;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            return Some(Decl::Auto { decl: i, end });
+        match toks.get(i + 1).map(|n| n.kind) {
+            Some(K::Colon) => return Some(Decl::Range { decl: i, start: i + 2, end: range_end(toks, i + 2) }),
+            Some(K::Eq) => return Some(Decl::Auto { decl: i, start: i + 2, end: init_end(toks, i + 2) }),
+            _ => {}
         }
     }
     None

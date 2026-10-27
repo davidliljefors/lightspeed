@@ -68,6 +68,10 @@ pub struct FileInfo {
     /// Sorted, deduplicated [`ident_hash`]es of every identifier in the file.
     pub idents: Vec<u32>,
     pub content_hash: u64,
+    /// [`path_key`]s of the files this one includes directly.
+    pub includes: Vec<u64>,
+    /// Using-directives and namespace aliases at namespace level.
+    pub decls: crate::scope_decls::ScopeDecls,
 }
 
 impl FileInfo {
@@ -106,6 +110,7 @@ pub struct BuildStats {
     pub preprocess_us: u64,
     pub parse_us: u64,
     pub lex_idents_us: u64,
+    pub scope_us: u64,
     pub waves: u32,
     pub parallel_wall_ms: f64,
     pub absorb_wall_ms: f64,
@@ -118,7 +123,7 @@ impl BuildStats {
     pub fn report(&self, threads: usize) -> String {
         let ms = |us: u64| us as f64 / 1e3;
         let mut s = format!(
-            "  parallel analyze {:.0} ms wall ({} waves) | serial absorb {:.0} ms | flush (indexes+hierarchy) {:.0} ms\n  cpu total: load {:.0} ms, preprocess {:.0} ms, parse {:.0} ms, lex+idents {:.0} ms (÷{threads} threads for wall share)",
+            "  parallel analyze {:.0} ms wall ({} waves) | serial absorb {:.0} ms | flush (indexes+hierarchy) {:.0} ms\n  cpu total: load {:.0} ms, preprocess {:.0} ms, parse {:.0} ms, lex+idents {:.0} ms, using/alias scan {:.0} ms (÷{threads} threads for wall share)\n  (template params, specializations, bindings and type inference are lazy: they cost nothing at index time)",
             self.parallel_wall_ms,
             self.waves,
             self.absorb_wall_ms,
@@ -127,6 +132,7 @@ impl BuildStats {
             ms(self.preprocess_us),
             ms(self.parse_us),
             ms(self.lex_idents_us),
+            ms(self.scope_us),
         );
         for (us, p) in self.slowest.iter().take(5) {
             s.push_str(&format!("\n  slow: {:.0} ms {p}", ms(*us)));
@@ -139,8 +145,9 @@ struct Analysis {
     shard: SymbolDb,
     idents: Vec<u32>,
     includes: Vec<String>,
+    decls: crate::scope_decls::ScopeDecls,
     content_hash: u64,
-    times: [u32; 4],
+    times: [u32; 5],
 }
 
 /// Per-thread analysis state. Nothing here is shared between workers.
@@ -193,7 +200,7 @@ impl Worker {
         self.toks.clear();
         lex_into(text, &mut self.toks);
         let mut idents: Vec<u32> =
-            self.toks.iter().filter(|t| t.kind == TokenKind::Ident).map(|t| ident_hash(t.text(text))).collect();
+            self.toks.iter().filter(|t| t.kind == TokenKind::Ident && t.keyword != crate::lexer::Keyword::Reserved).map(|t| ident_hash(t.text(text))).collect();
         idents.sort_unstable();
         idents.dedup();
 
@@ -209,7 +216,11 @@ impl Worker {
             })
             .collect();
         let t_lex = t.elapsed().as_micros() as u32;
-        Analysis { shard, idents, includes, content_hash, times: [0, t_pp, t_parse, t_lex] }
+        let t = std::time::Instant::now();
+        let mut decls = crate::scope_decls::scan(&self.toks, text, self.toks.len(), true);
+        decls.normalize();
+        let t_scope = t.elapsed().as_micros() as u32;
+        Analysis { shard, idents, includes, decls, content_hash, times: [0, t_pp, t_parse, t_lex, t_scope] }
     }
 }
 
@@ -228,6 +239,7 @@ pub struct Index {
     by_path: HashMap<u64, u32, FxBuildHasher>,
     worker: Worker,
     shared: std::sync::Arc<crate::pp::SharedHeaders>,
+    scope_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<crate::scope_decls::ScopeDecls>>>,
     dirty: bool,
     dead_symbols: usize,
     /// Files that could not be read during the last build.
@@ -247,6 +259,7 @@ impl Index {
         worker.pp.set_snapshotting(true);
         Self {
             shared,
+            scope_cache: Default::default(),
             db,
             hier,
             files: Vec::new(),
@@ -295,10 +308,11 @@ impl Index {
                     idx.unreadable += 1;
                     continue;
                 };
-                let [l, p, s, x] = a.times.map(u64::from);
+                let [l, p, s, x, d] = a.times.map(u64::from);
                 let st = &mut idx.stats;
                 (st.load_us, st.preprocess_us, st.parse_us, st.lex_idents_us) = (st.load_us + l, st.preprocess_us + p, st.parse_us + s, st.lex_idents_us + x);
-                st.slowest.push((l + p + s + x, job.path.clone()));
+                st.scope_us += d;
+                st.slowest.push((l + p + s + x + d, job.path.clone()));
                 if st.slowest.len() > 64 {
                     st.slowest.sort_unstable_by(|a, b| b.cmp(a));
                     st.slowest.truncate(8);
@@ -383,6 +397,9 @@ impl Index {
                 f.is_tu |= is_tu;
                 f.idents = a.idents;
                 f.content_hash = a.content_hash;
+                f.includes = a.includes.iter().map(|p| path_key(p)).collect();
+                f.decls = a.decls;
+                self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
                 return a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect();
             }
         }
@@ -406,7 +423,10 @@ impl Index {
         f.syms = (base as u32, (base + a.shard.len()) as u32);
         f.idents = a.idents;
         f.content_hash = a.content_hash;
+        f.includes = a.includes.iter().map(|p| path_key(p)).collect();
+        f.decls = a.decls;
         self.dirty = true;
+        self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect()
     }
 
@@ -418,8 +438,40 @@ impl Index {
         }
         f.syms = (0, 0);
         f.idents = Vec::new();
+        f.includes = Vec::new();
+        f.decls = Default::default();
         f.alive = false;
         self.dirty = true;
+        self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Using-directives and namespace aliases that files included (directly
+    /// or not) by `file` bring into scope. Cached until any file changes.
+    pub fn included_decls(&self, file: usize) -> std::sync::Arc<crate::scope_decls::ScopeDecls> {
+        if let Ok(c) = self.scope_cache.read()
+            && let Some(d) = c.get(&file)
+        {
+            return d.clone();
+        }
+        let mut out = crate::scope_decls::ScopeDecls::default();
+        let mut seen: hashbrown::HashSet<usize, FxBuildHasher> = Default::default();
+        let mut stack = vec![file];
+        while let Some(f) = stack.pop() {
+            if !seen.insert(f) {
+                continue;
+            }
+            let info = &self.files[f];
+            if f != file {
+                out.merge(&info.decls);
+            }
+            stack.extend(info.includes.iter().filter_map(|k| self.by_path.get(k)).map(|&i| i as usize).filter(|&i| self.files[i].alive));
+        }
+        out.normalize();
+        let d = std::sync::Arc::new(out);
+        if let Ok(mut c) = self.scope_cache.write() {
+            c.insert(file, d.clone());
+        }
+        d
     }
 
     pub fn file_index(&self, path: &str) -> Option<usize> {

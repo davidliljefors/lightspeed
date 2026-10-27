@@ -121,6 +121,295 @@ fn class_definition_beats_forward_declaration() {
 }
 
 #[test]
+fn definition_skips_forward_declarations_across_files_and_scopes() {
+    let ws = Ws::new(
+        &[
+            ("fwd.h", "#pragma once\nnamespace gfx { class Mesh; struct Vertex; enum class Kind : int; template <class T> class Vec; }\nclass Window;\n"),
+            ("mesh.h", "#pragma once\nnamespace gfx {\nclass Mesh { public: int n; };\nstruct Vertex { float x; };\nenum class Kind : int { A, B };\ntemplate <class T> class Vec { T v; };\n}\n"),
+            ("window.h", "#pragma once\nclass Window { public: void show(); };\n"),
+            (
+                "use.cpp",
+                "#include \"fwd.h\"\n#include \"mesh.h\"\n#include \"window.h\"\nclass Window;\nnamespace gfx { class Mesh; }\n\
+                 void go(gfx::Mesh* m, gfx::Vertex* v, gfx::Kind k, gfx::Vec<int>* ve, Window* w, class Window* w2) {}\n",
+            ),
+            ("only.cpp", "class Lonely;\nvoid f(Lonely* l);\n"),
+        ],
+        &[],
+    );
+    let idx = ws.index(&["use.cpp", "only.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("use.cpp");
+    let text = std::fs::read_to_string(&p).unwrap();
+    let go = text.find("void go").unwrap();
+    let at = |s: &str, nth: usize| (go + text[go..].match_indices(s).nth(nth).unwrap().0) as u32;
+    let is_def = |id| idx.db.symbol(id).flags.contains(lightspeed::symbols::SymbolFlags::DEFINITION);
+    let file_of = |id| idx.files[q.location(id).unwrap().file as usize].path.rsplit('/').next().unwrap().to_owned();
+    for (what, off, file) in [
+        ("Mesh", at("Mesh", 0), "mesh.h"),
+        ("Vertex", at("Vertex", 0), "mesh.h"),
+        ("Kind", at("Kind", 0), "mesh.h"),
+        ("Vec", at("Vec", 0), "mesh.h"),
+        ("Window", at("Window*", 0), "window.h"),
+        ("class Window", at("Window*", 1), "window.h"),
+    ] {
+        let defs = q.definition(&p, &text, off);
+        assert!(!defs.is_empty(), "{what}");
+        assert!(defs.iter().all(|&d| is_def(d)), "{what} resolved to a forward declaration: {:?}", names(&idx, &defs));
+        assert!(defs.iter().all(|&d| file_of(d) == file), "{what} -> {:?}", defs.iter().map(|&d| file_of(d)).collect::<Vec<_>>());
+    }
+
+    // Clicking the forward declaration itself jumps to the definition too.
+    let fwd = text.find("class Window;").unwrap() as u32 + 6;
+    let defs = q.definition(&p, &text, fwd);
+    assert!(defs.iter().all(|&d| is_def(d) && file_of(d) == "window.h"), "{:?}", names(&idx, &defs));
+    let ns = text.find("class Mesh;").unwrap() as u32 + 6;
+    let defs = q.definition(&p, &text, ns);
+    assert!(defs.iter().all(|&d| is_def(d) && file_of(d) == "mesh.h"), "{:?}", names(&idx, &defs));
+
+    // With no definition anywhere, the forward declaration is the answer.
+    let only = std::fs::read_to_string(ws.path("only.cpp")).unwrap();
+    let defs = q.definition(&ws.path("only.cpp"), &only, only.find("Lonely*").unwrap() as u32);
+    assert_eq!(names(&idx, &defs), ["Lonely"]);
+}
+
+#[test]
+fn variable_template_with_default_bool_param_does_not_leak_symbols() {
+    let src = "#pragma warning(push)\n#pragma warning(disable : 4806) // no value\n\
+               template <class _Elem1, class _Elem2,\n    bool = sizeof(_Elem1) == sizeof(_Elem2) && is_integral_v<_Elem1> && is_integral_v<_Elem2>>\n\
+               constexpr bool _Can_memcmp_elements =\n    is_same_v<_Elem1, bool> || is_same_v<_Elem2, bool> || static_cast<_Elem1>(-1) == static_cast<_Elem2>(-1);\n\
+               #pragma warning(pop)\nstruct After { int x; };\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let all: Vec<String> = idx.live_files().flat_map(|(f, _)| idx.file_symbols(f)).map(|s| format!("{:?} {}", idx.db.symbol(s).kind, idx.db.qualified_name(s))).collect();
+    assert!(idx.db.lookup("static_cast").is_empty(), "{all:?}");
+    assert_eq!(idx.db.lookup("_Can_memcmp_elements").len(), 1, "{all:?}");
+    assert_eq!(idx.db.lookup("After").len(), 1, "{all:?}");
+}
+
+#[test]
+fn unqualified_names_do_not_match_members_of_unrelated_scopes() {
+    let src = "namespace Dummy { struct Test { unsigned long u64; }; }\n\
+               namespace t { using u64 = unsigned long; enum Plain { Red }; enum class Strong { Blue }; }\n\
+               namespace other { void helper(int); }\n\
+               namespace { struct Hidden { int h; }; }\n\
+               namespace t { void inside() { u64 a; } }\n\
+               struct Outer { using Id = int; Id make(); struct Inner { Id x; }; };\n\
+               int test_func() { u64 vv; Red; Hidden h; helper(1); }\n\
+               void other_fn() { using namespace t; u64 w; Red; }\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let at = |s: &str, nth: usize| src.match_indices(s).nth(nth).unwrap().0 as u32;
+    let func = at("int test_func", 0) as usize;
+    let in_func = |s: &str| (func + src[func..].find(s).unwrap()) as u32;
+
+    // Neither `Dummy::Test::u64` nor `t::u64` is visible from the global function.
+    assert!(names(&idx, &q.definition(&p, src, in_func("u64 vv"))).is_empty());
+    // Unscoped enumerators of a namespace aren't visible either; anonymous namespaces are.
+    assert!(names(&idx, &q.definition(&p, src, in_func("Red"))).is_empty());
+    assert_eq!(names(&idx, &q.definition(&p, src, in_func("Hidden"))).len(), 1);
+    // Function calls stay lenient (argument-dependent lookup finds them).
+    assert_eq!(names(&idx, &q.definition(&p, src, in_func("helper"))), ["other::helper"]);
+
+    // Inside the namespace, and via `using namespace`, they resolve.
+    assert_eq!(names(&idx, &q.definition(&p, src, at("u64 a", 0))), ["t::u64"]);
+    let other = at("void other_fn", 0) as usize;
+    assert_eq!(names(&idx, &q.definition(&p, src, (other + src[other..].find("u64 w").unwrap()) as u32)), ["t::u64"]);
+    assert_eq!(names(&idx, &q.definition(&p, src, (other + src[other..].rfind("Red").unwrap()) as u32)), ["t::Plain::Red"]);
+    // Declaration sites resolve to themselves, and class-scope names resolve in nested scopes.
+    assert_eq!(names(&idx, &q.definition(&p, src, at("u64;", 0))), ["Dummy::Test::u64"]);
+    assert_eq!(names(&idx, &q.definition(&p, src, at("Id x", 0))), ["Outer::Id"]);
+}
+
+#[test]
+fn std_containers_substitute_template_arguments() {
+    let std_h = "#pragma once\nnamespace std {\n\
+        template<class A, class B> struct pair { A first; B second; };\n\
+        template<class T> struct allocator {};\n\
+        template<class T, class Alloc = allocator<T>> class vector {\n\
+        public:\n typedef T value_type;\n typedef value_type& reference;\n typedef T* iterator;\n\
+         reference operator[](unsigned i);\n T& front();\n value_type& back();\n iterator begin();\n iterator end();\n void push_back(const T& v);\n};\n\
+        template<class K, class V, class H = int> class unordered_map {\n\
+        public:\n using iterator = pair<const K, V>*;\n V& operator[](const K& k);\n iterator find(const K& k);\n};\n}\n";
+    let main = "#include \"std.h\"\nstruct Foo { int x; void run(); };\nstruct Bar { void go(); };\nstruct Other { void run(); void go(); };\n\
+        void f(std::vector<Foo>& v, std::unordered_map<int, Foo> m, std::unordered_map<int, std::vector<Bar>> nested) {\n\
+        v.front().run();\n v.back().run();\n v[0].run();\n m[1].run();\n m.find(1)->second.run();\n m.find(1)->first;\n\
+        for (auto& e : v) e.run();\n for (auto& kv : m) kv.second.run();\n\
+        auto it = v.begin(); it->run();\n nested[3][0].go();\n auto& r = m[2]; r.run();\n}\n";
+    let ws = Ws::new(&[("std.h", std_h), ("a.cpp", main)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let find = |stmt: &str, member: &str| {
+        let s = main.find(stmt).unwrap_or_else(|| panic!("{stmt}"));
+        (s + stmt.rfind(member).unwrap()) as u32
+    };
+    let cases = [
+        ("v.front().run()", "run", "Foo::run"),
+        ("v.back().run()", "run", "Foo::run"),
+        ("v[0].run()", "run", "Foo::run"),
+        ("m[1].run()", "run", "Foo::run"),
+        ("m.find(1)->second.run()", "run", "Foo::run"),
+        ("e.run()", "run", "Foo::run"),
+        ("kv.second.run()", "run", "Foo::run"),
+        ("it->run()", "run", "Foo::run"),
+        ("nested[3][0].go()", "go", "Bar::go"),
+        ("r.run()", "run", "Foo::run"),
+    ];
+    for (stmt, member, want) in cases {
+        let got = names(&idx, &q.definition(&p, main, find(stmt, member)));
+        assert_eq!(got, [want], "{stmt}");
+    }
+}
+
+#[test]
+fn template_parameters_are_local_names() {
+    let src = "struct T {};\ntemplate<class T, int N = 3> struct Box {\n T v; T get(T d) { return d; }\n int arr[N];\n};\n\
+               template<typename U> U id(U x) { U y = x; return y; }\n\
+               template<class T> struct Other { T w; };\nT global;\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let at = |s: &str, nth: usize| src.match_indices(s).nth(nth).unwrap().0 as u32;
+    // Box's T: header, `T v`, `T get`, `T d` = 4 uses; Other's T and the struct T are separate.
+    let l = q.local_at(&p, src, at("T v", 0)).unwrap();
+    assert_eq!(l.uses.len(), 4);
+    assert!(q.local_at(&p, src, at("T v", 0)).is_some());
+    assert_eq!(q.local_at(&p, src, at("U y", 0)).unwrap().uses.len(), 4);
+    assert_eq!(q.local_at(&p, src, at("N]", 0)).unwrap().uses.len(), 2);
+    assert_eq!(q.local_at(&p, src, at("T w", 0)).unwrap().uses.len(), 2);
+    assert!(q.local_at(&p, src, at("T global", 0)).is_none());
+    assert_eq!(q.hover(&p, src, at("T v", 0)).unwrap().kind, "template parameter");
+}
+
+#[test]
+fn specializations_resolve_to_matching_template() {
+    let src = "template<class T> struct X { void gen(); };\n\
+               template<> struct X<int> { void ints(); };\n\
+               template<class T> struct X<T*> { T deref(); };\n\
+               struct Foo { void run(); };\n\
+               void f(X<int> a, X<Foo*> b, X<float> c) { a.ints(); b.deref().run(); c.gen(); X<int> z; X<float> w; }\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let at = |s: &str| src.find(s).unwrap() as u32;
+    let d = q.definition(&p, src, at("X<int> z"));
+    assert_eq!(d.len(), 1);
+    assert_eq!(idx.db.symbol(d[0]).name_offset, src.find("X<int> {").unwrap() as u32);
+    let d = q.definition(&p, src, at("X<float> w"));
+    assert_eq!(d.len(), 1);
+    assert_eq!(idx.db.symbol(d[0]).name_offset, src.find("X {").unwrap() as u32);
+    assert_eq!(names(&idx, &q.definition(&p, src, at("ints()"))), ["X::ints"]);
+    assert_eq!(names(&idx, &q.definition(&p, src, at("c.gen") + 2)), ["X::gen"]);
+    assert_eq!(names(&idx, &q.definition(&p, src, at("run(); c"))), ["Foo::run"]);
+}
+
+#[test]
+fn structured_bindings_are_locals_with_inferred_types() {
+    let std_h = "#pragma once\nnamespace std {\n\
+         template<class A, class B> struct pair { A first; B second; };\n\
+         template<class K, class V> class map { public: using iterator = pair<const K, V>*; iterator begin(); iterator end(); };\n}\n";
+    let main = "#include \"std.h\"\nstruct Foo { void run(); };\nstruct Bar { void go(); };\nstruct Both { Foo f; Bar b; };\n\
+         std::pair<int, Foo> mk();\nBoth both();\n\
+         void f(std::map<int, Foo>& m) {\n for (auto& [k, v] : m) { v.run(); k; }\n auto [a, b] = mk();\n b.run();\n auto [p, q] = both();\n q.go();\n p.run();\n}\n";
+    let ws = Ws::new(&[("std.h", std_h), ("a.cpp", main)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let at = |s: &str, off: usize| (main.find(s).unwrap() + off) as u32;
+    for (stmt, off, want) in [("v.run()", 2, "Foo::run"), ("b.run()", 2, "Foo::run"), ("q.go()", 2, "Bar::go"), ("p.run()", 2, "Foo::run")] {
+        assert_eq!(names(&idx, &q.definition(&p, main, at(stmt, off))), [want], "{stmt}");
+    }
+    assert_eq!(q.local_at(&p, main, at("[k, v]", 1)).unwrap().uses.len(), 2);
+    assert_eq!(q.local_at(&p, main, at("v.run", 0)).unwrap().uses.len(), 2);
+}
+
+/// Real MSVC STL headers (skipped when no Visual Studio is installed).
+#[test]
+fn real_msvc_stl_containers() {
+    let Some(inc) = std::fs::read_dir(r"C:\Program Files\Microsoft Visual Studio")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|v| std::fs::read_dir(v.path()).into_iter().flatten().flatten())
+        .flat_map(|e| std::fs::read_dir(e.path().join(r"VC\Tools\MSVC")).into_iter().flatten().flatten())
+        .map(|m| m.path().join("include"))
+        .find(|p| p.join("vector").exists() && p.join("unordered_map").exists())
+    else {
+        return;
+    };
+    let inc = inc.to_str().unwrap().replace('\\', "/");
+    let src = "#include <vector>\n#include <unordered_map>\nstruct Foo { void run(); };\n\
+        void f(std::vector<Foo>& v, std::unordered_map<int, Foo>& m) {\n v.front().run();\n v[0].run();\n m[1].run();\n\
+        for (auto& [k, e] : m) e.run();\n for (auto& e : v) e.run();\n auto it = m.find(1); it->second.run();\n}\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let cdb = CompileDb::from_json(&format!(
+        r#"[{{"directory":"{r}","file":"a.cpp","arguments":["clang++","-c","a.cpp","-I","{inc}","-D_MSC_VER=1944","-D_WIN64","-D_M_X64","-D_CPPLIB_VER=650"]}}]"#,
+        r = ws.root
+    ))
+    .unwrap();
+    let idx = Index::build(cdb, IndexConfig::default());
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let mut failed = vec![];
+    for stmt in ["v.front().run()", "v[0].run()", "m[1].run()", "e.run()", "it->second.run()"] {
+        let off = (src.find(stmt).unwrap() + stmt.rfind("run").unwrap()) as u32;
+        if names(&idx, &q.definition(&p, src, off)) != ["Foo::run"] {
+            failed.push(stmt);
+        }
+    }
+    eprintln!("symbols: {}", idx.db.len());
+    assert!(failed.is_empty(), "unresolved with real headers: {failed:?}");
+}
+
+#[test]
+fn reserved_words_are_never_symbols() {
+    let src = "struct static_cast_t {};\nint go(long x) { int y = static_cast<int>(x); return sizeof(y) + (this ? 1 : 0); }\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    for w in ["static_cast<", "int y", "return", "sizeof", "long x"] {
+        let off = src.find(w).unwrap() as u32;
+        assert!(q.definition(&p, src, off).is_empty(), "{w}");
+        assert!(q.hover(&p, src, off).is_none(), "{w}");
+    }
+    assert_eq!(names(&idx, &q.definition(&p, src, src.find("static_cast_t").unwrap() as u32)), ["static_cast_t"]);
+}
+
+#[test]
+fn using_directives_and_aliases_from_headers_and_namespace_aliases() {
+    let types = "#pragma once\nnamespace gfx { using u64 = unsigned long; struct Mesh {}; }\nnamespace fs = gfx;\n\
+                 inline void f() { using namespace other; }\nnamespace other { struct Leak {}; }\n";
+    let hdr = "#pragma once\n#include \"types.h\"\nusing namespace gfx;\n";
+    let main = "#include \"hdr.h\"\nvoid g() { u64 a; Mesh m; fs::Mesh n; Leak l; }\n";
+    let ws = Ws::new(&[("types.h", types), ("hdr.h", hdr), ("a.cpp", main)], &[]);
+    let mut idx = ws.index(&["a.cpp"]);
+    let p = ws.path("a.cpp");
+    {
+        let q = Query::new(&idx, &DiskText);
+        let at = |s: &str| main.find(s).unwrap() as u32;
+        assert_eq!(names(&idx, &q.definition(&p, main, at("u64 a"))), ["gfx::u64"]);
+        assert_eq!(names(&idx, &q.definition(&p, main, at("Mesh m"))), ["gfx::Mesh"]);
+        assert_eq!(names(&idx, &q.definition(&p, main, at("Mesh n"))), ["gfx::Mesh"]);
+        // A using inside a function body in a header doesn't leak into includers.
+        assert!(names(&idx, &q.definition(&p, main, at("Leak"))).is_empty());
+    }
+    // Removing the using from the header must invalidate the cached closure.
+    ws.write("hdr.h", "#pragma once\n#include \"types.h\"\n");
+    idx.update(&ws.path("hdr.h"), None);
+    idx.update(&p, None);
+    idx.flush();
+    let q = Query::new(&idx, &DiskText);
+    let at = main.find("u64 a").unwrap() as u32;
+    assert!(names(&idx, &q.definition(&p, main, at)).is_empty());
+}
+
+#[test]
 fn references_cover_base_and_overrides() {
     let ws = Ws::new(
         &[

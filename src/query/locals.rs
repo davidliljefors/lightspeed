@@ -12,6 +12,7 @@ use crate::symbols::SymbolId;
 pub enum LocalKind {
     Param,
     Variable,
+    TemplateParam,
 }
 
 pub struct Local {
@@ -41,6 +42,8 @@ struct Declared {
     decl_start: usize,
     end: usize,
     param: bool,
+    /// Element of a structured binding `auto& [a, b]`.
+    binding: bool,
 }
 
 const NON_TYPE: &[&str] = &[
@@ -99,6 +102,22 @@ fn parse_decl(toks: &[Token], text: &str, s: usize, limit: usize, param: bool, c
         }
     }
     let ty_end = i;
+    if first == "auto" {
+        let mut j = i;
+        while at(j).is_some_and(|t| matches!(t.kind, K::Star | K::Amp | K::AmpAmp) || t.is_keyword(Keyword::Const)) {
+            j += 1;
+        }
+        if at(j).is_some_and(|t| t.kind == K::LBracket)
+            && let Some(c) = matching_fwd(&toks[..limit], j)
+        {
+            for (n, t) in toks.iter().enumerate().take(c).skip(j + 1) {
+                if t.kind == K::Ident {
+                    out.push(Declared { name: n, ty_start, ty_end, decl_start: ty_end, end: c + 1, param, binding: true });
+                }
+            }
+            return Some(());
+        }
+    }
     let mut first_declarator = true;
     loop {
         let decl_start = i;
@@ -142,7 +161,7 @@ fn parse_decl(toks: &[Token], text: &str, s: usize, limit: usize, param: bool, c
         if param {
             end = default_at.unwrap_or(j.min(limit));
         }
-        out.push(Declared { name: i, ty_start, ty_end, decl_start, end, param });
+        out.push(Declared { name: i, ty_start, ty_end, decl_start, end, param, binding: false });
         if param || at(j).is_none_or(|t| t.kind != K::Comma) {
             return Some(());
         }
@@ -180,6 +199,10 @@ impl Query<'_> {
 
     /// Like [`Self::local_at`] for the identifier token `toks[hit]` of an already lexed file.
     pub(super) fn local_in(&self, toks: &[Token], path: &str, text: &str, hit: usize) -> Option<Local> {
+        self.function_local_in(toks, path, text, hit).or_else(|| self.template_param_in(toks, path, text, hit))
+    }
+
+    fn function_local_in(&self, toks: &[Token], path: &str, text: &str, hit: usize) -> Option<Local> {
         let name = toks[hit].text(text);
         let offset = toks[hit].start;
         if hit > 0 && matches!(toks[hit - 1].kind, K::Dot | K::Arrow | K::ColonColon) {
@@ -358,7 +381,7 @@ impl Query<'_> {
             decl: (toks[d.name].start, toks[d.name].end()),
             uses,
             hovered: (toks[hit].start, toks[hit].end()),
-            decl_offset: toks[d.name].start,
+            decl_offset: if d.binding { toks[d.ty_start].start } else { toks[d.name].start },
         })
     }
 }

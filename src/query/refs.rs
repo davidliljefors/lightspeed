@@ -33,6 +33,13 @@ impl Query<'_> {
         }
         let mut items = vec![seed, id];
         if db.symbol(seed).kind.is_record() {
+            // Specializations share the template's name.
+            let q = db.qualified_name(seed);
+            let spec = |c: SymbolId| db.symbol(c).flags.contains(crate::symbols::SymbolFlags::SPECIALIZATION);
+            let seed_spec = spec(seed);
+            items.extend(db.lookup(db.name(seed)).iter().copied().filter(|&c| db.symbol(c).kind.is_record() && (seed_spec || spec(c)) && db.qualified_name(c) == q));
+        }
+        if db.symbol(seed).kind.is_record() {
             items.extend(db.children(seed).iter().copied().filter(|&c| matches!(db.symbol(c).kind, SymbolKind::Constructor | SymbolKind::Destructor)));
         }
         if let Some(f) = db.symbol(seed).family {
