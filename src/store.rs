@@ -162,7 +162,9 @@ fn put_str(o: &mut Vec<u8>, s: &str) {
     o.extend_from_slice(s.as_bytes());
 }
 
-/// Serializes a record into `out` (cleared first).
+/// Serializes a record into `out` (cleared first). Everything after the
+/// dependency keys is zstd-compressed; the keys stay readable so a snapshot
+/// can be validated without decompressing anything.
 pub fn encode_record(p: &RecordParts, out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(RECORD_MAGIC);
@@ -173,30 +175,50 @@ pub fn encode_record(p: &RecordParts, out: &mut Vec<u8>) {
     for d in p.deps {
         out.extend_from_slice(&d.to_le_bytes());
     }
-    put_u32(out, p.idents.len());
+    let mut pay: Vec<u8> = Vec::new();
+    put_u32(&mut pay, p.idents.len());
     for i in p.idents {
-        out.extend_from_slice(&i.to_le_bytes());
+        pay.extend_from_slice(&i.to_le_bytes());
     }
-    put_u32(out, p.includes.len());
+    put_u32(&mut pay, p.includes.len());
     for s in p.includes {
-        put_str(out, s);
+        put_str(&mut pay, s);
     }
-    put_u32(out, p.decls.names.len());
+    put_u32(&mut pay, p.decls.names.len());
     for s in &p.decls.names {
-        put_str(out, s);
+        put_str(&mut pay, s);
     }
-    put_u32(out, p.decls.aliases.len());
+    put_u32(&mut pay, p.decls.aliases.len());
     for (a, b) in &p.decls.aliases {
-        put_str(out, a);
-        put_str(out, b);
+        put_str(&mut pay, a);
+        put_str(&mut pay, b);
     }
     let mut shard = Vec::new();
     encode_shard(&ShardKey { path: p.path, content_hash: p.content_hash, flags_hash: p.flags_fp }, p.shard, &mut shard);
-    put_u32(out, shard.len());
-    out.extend_from_slice(&shard);
+    put_u32(&mut pay, shard.len());
+    pay.extend_from_slice(&shard);
+    put_u32(out, pay.len());
+    let at = out.len();
+    out.resize(at + zstd::zstd_safe::compress_bound(pay.len()), 0);
+    let n = COMPRESSOR
+        .with(|c| c.borrow_mut().compress_to_buffer(&pay, &mut out[at..]))
+        .expect("zstd compression into a bound-sized buffer cannot fail");
+    out.truncate(at + n);
     let sum = hash_bytes(out);
     out.extend_from_slice(&sum.to_le_bytes());
 }
+
+thread_local! {
+    static DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> =
+        std::cell::RefCell::new(zstd::bulk::Decompressor::new().expect("zstd decompressor"));
+    static COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> =
+        std::cell::RefCell::new(zstd::bulk::Compressor::new(ZSTD_LEVEL).expect("zstd level"));
+}
+
+/// Level 1 compresses at hundreds of MB/s per thread and still shrinks records about 3x.
+const ZSTD_LEVEL: i32 = 1;
+/// No record legitimately expands past this; guards the decompression buffer.
+const MAX_RAW_RECORD: usize = 1 << 30;
 
 struct Rd<'a> {
     b: &'a [u8],
@@ -254,6 +276,17 @@ pub fn decode_record(bytes: &[u8], path: &str, flags_fp: u64) -> R<Decoded> {
     }
     let n = r.count(8)?;
     r.bytes(n * 8)?;
+    let raw = r.u32()? as usize;
+    if raw > MAX_RAW_RECORD {
+        return corrupt("record too large");
+    }
+    let pay = DECOMPRESSOR
+        .with(|d| d.borrow_mut().decompress(&body[r.pos..], raw))
+        .or(corrupt("bad compressed payload"))?;
+    if pay.len() != raw {
+        return corrupt("payload length");
+    }
+    let mut r = Rd { b: &pay, pos: 0 };
     let n = r.count(4)?;
     let idents = r.bytes(n * 4)?.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
     let n = r.count(4)?;
@@ -273,7 +306,7 @@ pub fn decode_record(bytes: &[u8], path: &str, flags_fp: u64) -> R<Decoded> {
     }
     let n = r.u32()? as usize;
     let shard = decode_shard(r.bytes(n)?, &ShardKey { path, content_hash, flags_hash: flags_fp })?;
-    if r.pos != body.len() {
+    if r.pos != pay.len() {
         return corrupt("trailing bytes");
     }
     Ok(Decoded { content_hash, shard, idents, includes, decls: ScopeDecls { names, aliases } })
@@ -541,8 +574,60 @@ fn parse_dirs(b: &[u8], n: usize) -> Result<Vec<DirEnt<'_>>, OpenError> {
 /// Where a record's bytes come from when a snapshot is written.
 pub enum RecSrc {
     Fresh(Vec<u8>),
+    /// Already appended to the build's [`Spill`] at this offset.
+    Written { off: u64, len: u32 },
     /// Copied from the snapshot the index was started from.
     Old { off: u64, len: u32 },
+}
+
+static TMP_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn tmp_path(path: &Path) -> PathBuf {
+    let n = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_extension(format!("{}.{n}.tmp", std::process::id()))
+}
+
+fn open_new(path: &Path, fingerprint: u64) -> io::Result<(Counting<BufWriter<File>>, PathBuf)> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = tmp_path(path);
+    let mut w = Counting { inner: BufWriter::with_capacity(1 << 20, File::create(&tmp)?), pos: 0 };
+    w.write_all(FILE_MAGIC)?;
+    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    w.write_all(&fingerprint.to_le_bytes())?;
+    Ok((w, tmp))
+}
+
+/// The next snapshot, being written while the index builds so fresh records
+/// never pile up in memory. [`save`] finishes it.
+pub struct Spill {
+    w: Option<Counting<BufWriter<File>>>,
+    tmp: PathBuf,
+}
+
+impl Spill {
+    pub fn create(path: &Path, fingerprint: u64) -> io::Result<Self> {
+        let (w, tmp) = open_new(path, fingerprint)?;
+        Ok(Self { w: Some(w), tmp })
+    }
+
+    /// Appends one record; returns where it landed.
+    pub fn push(&mut self, bytes: &[u8]) -> io::Result<(u64, u32)> {
+        let w = self.w.as_mut().ok_or_else(|| io::Error::other("spill already finished"))?;
+        let off = w.pos;
+        w.write_all(bytes)?;
+        Ok((off, bytes.len() as u32))
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // Still owning the writer means the snapshot was never finished.
+        if self.w.take().is_some() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
 }
 
 /// Everything needed to write the next snapshot, owned so it can run on another thread.
@@ -550,6 +635,7 @@ pub struct SaveJob {
     pub path: PathBuf,
     pub fingerprint: u64,
     pub old: Option<Arc<Mmap>>,
+    pub spill: Option<Spill>,
     pub recs: Vec<(u64, RecSrc)>,
     /// `(key, path, content hash)`; hash [`UNTRUSTED`] for files seen with two different contents.
     pub files: Vec<(u64, String, u64)>,
@@ -565,16 +651,16 @@ impl Snapshot {
 
 /// Writes the snapshot atomically (temp file + rename). Returns its size.
 pub fn save(job: SaveJob) -> io::Result<u64> {
-    let SaveJob { path, fingerprint, old, mut recs, mut files, mut dirs } = job;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let SaveJob { path, fingerprint, old, spill, mut recs, mut files, mut dirs } = job;
+    let (w, tmp) = match spill {
+        Some(mut s) => match s.w.take() {
+            Some(w) => (w, s.tmp.clone()),
+            None => return Err(io::Error::other("spill already finished")),
+        },
+        None => open_new(&path, fingerprint)?,
+    };
     let result = (|| {
-        let mut w = Counting { inner: BufWriter::with_capacity(1 << 20, File::create(&tmp)?), pos: 0 };
-        w.write_all(FILE_MAGIC)?;
-        w.write_all(&FORMAT_VERSION.to_le_bytes())?;
-        w.write_all(&fingerprint.to_le_bytes())?;
+        let mut w = w;
         let mut manifest: Vec<(u64, u64, u32)> = Vec::with_capacity(recs.len());
         for (key, src) in recs.drain(..) {
             let off = w.pos;
@@ -583,6 +669,7 @@ pub fn save(job: SaveJob) -> io::Result<u64> {
                     w.write_all(&b)?;
                     manifest.push((key, off, b.len() as u32));
                 }
+                RecSrc::Written { off, len } => manifest.push((key, off, len)),
                 RecSrc::Old { off: o, len } => {
                     let old = old.as_ref().ok_or_else(|| io::Error::other("record from a missing snapshot"))?;
                     let s = old.get(o as usize..o as usize + len as usize).ok_or_else(|| io::Error::other("record out of range"))?;

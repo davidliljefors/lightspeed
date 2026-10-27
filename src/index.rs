@@ -122,6 +122,9 @@ pub struct CacheStats {
     pub encode_us: u64,
     pub saved_bytes: u64,
     pub save_ms: f64,
+    /// Compressed bytes of the records written this build, and the largest one.
+    pub fresh_bytes: u64,
+    pub biggest_rec: (u64, String),
 }
 
 impl CacheStats {
@@ -142,6 +145,9 @@ impl CacheStats {
             self.decode_us as f64 / 1e3,
             self.encode_us as f64 / 1e3,
         );
+        if self.fresh_bytes > 0 {
+            s.push_str(&format!(" | new records {} (largest {}: {})", crate::mem::mib(self.fresh_bytes as usize), crate::mem::mib(self.biggest_rec.0 as usize), self.biggest_rec.1));
+        }
         if self.saved_bytes > 0 {
             s.push_str(&format!(" | saved {} in {:.0} ms", crate::mem::mib(self.saved_bytes as usize), self.save_ms));
         }
@@ -460,6 +466,9 @@ impl Index {
             }
         }
         let mut recs: Vec<(u64, RecSrc)> = Vec::new();
+        // Fresh records stream straight into the next snapshot instead of piling up here.
+        let mut spill = cache_cfg.as_ref().and_then(|c| store::Spill::create(&c.file(), store::fingerprint()).ok());
+        let mut spill_failed = false;
         let mut jobs: Vec<Job> = Vec::with_capacity(idx.cdb.entries.len());
         let mut seen: hashbrown::HashSet<u64, FxBuildHasher> = Default::default();
         for (i, e) in idx.cdb.entries.iter().enumerate() {
@@ -506,8 +515,20 @@ impl Index {
                     cs.decode_us += u64::from(a.decode_us);
                     cs.encode_us += enc;
                 }
-                if let Some(r) = a.rec.take() {
-                    recs.push(r);
+                if let Some((k, src)) = a.rec.take() {
+                    if let (RecSrc::Fresh(b), Some(cs)) = (&src, cstats.as_mut()) {
+                        cs.fresh_bytes += b.len() as u64;
+                        if b.len() as u64 > cs.biggest_rec.0 {
+                            cs.biggest_rec = (b.len() as u64, job.path.clone());
+                        }
+                    }
+                    match (src, spill.as_mut()) {
+                        (RecSrc::Fresh(b), Some(s)) => match s.push(&b) {
+                            Ok((off, len)) => recs.push((k, RecSrc::Written { off, len })),
+                            Err(_) => spill_failed = true,
+                        },
+                        (src, _) => recs.push((k, src)),
+                    }
                 }
                 let st = &mut idx.stats;
                 (st.load_us, st.preprocess_us, st.parse_us, st.lex_idents_us) = (st.load_us + l, st.preprocess_us + p, st.parse_us + s, st.lex_idents_us + x);
@@ -538,7 +559,11 @@ impl Index {
         idx.stats.flush_wall_ms = t.elapsed().as_secs_f64() * 1e3;
         if let (Some(c), Some(cs)) = (cache_cfg, cstats) {
             idx.stats.cache = Some(cs);
-            idx.save_cache(&c, snapshot, recs);
+            if spill_failed {
+                eprintln!("lightspeed: cache not saved: cannot write {}", c.file().display());
+            } else {
+                idx.save_cache(&c, snapshot, recs, spill);
+            }
         }
         idx.stats.slowest.sort_unstable_by(|a, b| b.cmp(a));
         idx.stats.slowest.truncate(8);
@@ -613,7 +638,7 @@ impl Index {
     /// Writes the next snapshot: records from this build, plus the content
     /// hash of every file any record depends on and the listing of every
     /// directory probed. Skipped when nothing changed.
-    fn save_cache(&mut self, cfg: &CacheConfig, snapshot: Option<Snapshot>, recs: Vec<(u64, RecSrc)>) {
+    fn save_cache(&mut self, cfg: &CacheConfig, snapshot: Option<Snapshot>, recs: Vec<(u64, RecSrc)>, spill: Option<store::Spill>) {
         let unchanged = snapshot.as_ref().is_some_and(|s| s.record_count() == recs.len())
             && self.stats.cache.as_ref().is_some_and(|c| c.hits as usize == recs.len());
         if unchanged {
@@ -643,6 +668,7 @@ impl Index {
             path: cfg.file(),
             fingerprint: store::fingerprint(),
             old: snapshot.map(Snapshot::into_map),
+            spill,
             recs,
             files: out,
             dirs,
