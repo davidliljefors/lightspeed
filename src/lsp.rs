@@ -398,7 +398,7 @@ impl Server {
         if let Some(w) = &warning {
             eprintln!("{w}");
         }
-        let cdb = match cdb_path.as_ref().map(CompileDb::load) {
+        let load = |p: Option<PathBuf>| match p.as_ref().map(CompileDb::load) {
             Some(Ok(mut db)) => {
                 let n = db.add_system_includes();
                 eprintln!("lightspeed: {n} built-in include dirs discovered");
@@ -416,7 +416,9 @@ impl Server {
             Some(tx) => {
                 let progress = Arc::new(Progress::default());
                 self.building = Some(progress.clone());
+                // Parsing a huge compile database must not delay the `initialize` reply.
                 let spawned = std::thread::Builder::new().name("lightspeed-index".into()).stack_size(16 << 20).spawn(move || {
+                    let cdb = load(cdb_path);
                     let idx = Index::build_with(cdb, cfg, Some(&progress));
                     let _ = tx.send(Msg::Indexed(Box::new(idx), t0.elapsed().as_secs_f64() * 1e3));
                 });
@@ -426,7 +428,7 @@ impl Server {
                 }
             }
             None => {
-                let idx = Index::build(cdb, cfg);
+                let idx = Index::build(load(cdb_path), cfg);
                 self.install_index(idx, t0.elapsed().as_secs_f64() * 1e3);
             }
         }
