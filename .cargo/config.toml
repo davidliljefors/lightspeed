@@ -1,0 +1,3 @@
+[env]
+# Default rayon/test threads get 1-2 MB on Windows; deep include trees can need more.
+RUST_MIN_STACK = "16777216"
