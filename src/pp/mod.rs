@@ -323,11 +323,15 @@ pub(super) struct HeaderEntry {
     text: String,
     toks: Vec<Token>,
     guard: Option<String>,
+    /// Where it was read from and the hash of the text that was read, so a
+    /// disk cache can tell later whether this header changed.
+    path: String,
+    hash: u64,
 }
 
 impl HeaderEntry {
     fn size(&self) -> usize {
-        self.text.len() + self.toks.len() * std::mem::size_of::<Token>() + 64
+        self.text.len() + self.toks.len() * std::mem::size_of::<Token>() + self.path.len() + 64
     }
 }
 
@@ -364,6 +368,17 @@ impl SharedHeaders {
             }
         }
         s
+    }
+
+    /// `(key, path, content hash)` of every header read so far.
+    pub fn files(&self) -> Vec<(u64, String, u64)> {
+        let mut out = Vec::new();
+        for sh in &self.shards {
+            if let Ok(m) = sh.read() {
+                out.extend(m.iter().map(|(&k, e)| (k, e.path.clone(), e.hash)));
+            }
+        }
+        out
     }
 
     fn get(&self, key: u64) -> Option<Arc<HeaderEntry>> {
@@ -667,7 +682,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 normalize_path(&mut self.path_buf);
                 let key = path_key(&self.path_buf);
                 self.deps.push(key);
-                if self.cfg.follow_includes && self.fs.exists(&self.path_buf) {
+                if self.cfg.follow_includes && self.fs.exists_keyed(&self.path_buf, key) {
                     self.enter_file(key, NONE, out);
                 }
             }
@@ -876,7 +891,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                         let mut toks = self.tok_pool.pop().unwrap_or_default();
                         lex_into(src, &mut toks);
                         let guard = directives::detect_guard(src, &toks).map(str::to_owned);
-                        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard };
+                        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::hash::hash_bytes(src.as_bytes()) };
                         directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
                         self.tok_pool.push(toks);
                         let e = Arc::new(e);
@@ -945,8 +960,9 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Include search. On success the normalized path is left in `path_buf`.
     /// Every candidate probed is recorded as a dependency.
     fn probe(&mut self) -> bool {
-        self.probes.push(path_key(&self.path_buf));
-        self.fs.exists(&self.path_buf)
+        let key = path_key(&self.path_buf);
+        self.probes.push(key);
+        self.fs.exists_keyed(&self.path_buf, key)
     }
     pub(super) fn resolve(&mut self, name: &str, quote: bool, next: bool) -> Option<Resolved> {
         let d = self.file_depth;

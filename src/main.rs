@@ -208,8 +208,18 @@ fn index_cmd(threads: usize, args: &[String]) -> i32 {
         println!("{} built-in include dirs", cdb.add_system_includes());
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20).build().expect("thread pool");
+    let mut cfg = lightspeed::index::IndexConfig::default();
+    if !args.iter().any(|a| a == "--no-cache") {
+        cfg.cache = match args.iter().position(|a| a == "--cache-dir").and_then(|i| args.get(i + 1)) {
+            Some(d) => Some(lightspeed::store::CacheConfig::at(d)),
+            None => lightspeed::store::CacheConfig::for_project(std::path::Path::new(path)),
+        };
+        if let Some(c) = cfg.cache.as_mut() {
+            c.background_save = false;
+        }
+    }
     let t0 = Instant::now();
-    let idx = pool.install(|| lightspeed::index::Index::build(cdb, Default::default()));
+    let idx = pool.install(|| lightspeed::index::Index::build(cdb, cfg));
     println!(
         "{} files ({} unreadable), {} symbols, {} families, {} bases resolved | build on {threads} threads {:.1} ms",
         idx.live_files().count(),

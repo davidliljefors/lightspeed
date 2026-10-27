@@ -35,3 +35,4 @@ pub mod index;
 pub mod query;
 pub mod lsp;
 pub mod sysinc;
+pub mod store;

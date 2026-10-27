@@ -12,6 +12,10 @@ use crate::source::SourceFile;
 /// many threads at once (no global locks on the hot path).
 pub trait FileProvider: Sync {
     fn exists(&self, path: &str) -> bool;
+    /// [`Self::exists`] when the caller already has `key == path_key(path)`.
+    fn exists_keyed(&self, path: &str, _key: u64) -> bool {
+        self.exists(path)
+    }
     fn load(&self, path: &str) -> Option<SourceFile>;
 }
 
@@ -24,7 +28,11 @@ pub struct DiskFs;
 
 impl FileProvider for DiskFs {
     fn exists(&self, path: &str) -> bool {
-        dir_cache::is_file(path)
+        dir_cache::is_file(path, path_key(path))
+    }
+
+    fn exists_keyed(&self, path: &str, key: u64) -> bool {
+        dir_cache::is_file(path, key)
     }
 
     fn load(&self, path: &str) -> Option<SourceFile> {
@@ -38,6 +46,28 @@ pub fn invalidate_dir_of(path: &str) {
     dir_cache::invalidate(path);
 }
 
+/// Forgets every cached directory listing, as a fresh process would start.
+pub fn clear_dir_cache() {
+    dir_cache::clear();
+}
+
+/// Every directory listed so far with the sorted [`path_key`]s of the files in
+/// it. Every `#include` candidate ever probed lies in one of these, so this is
+/// the world the preprocessor's include searches saw.
+pub fn dir_snapshot() -> Vec<(String, Vec<u64>)> {
+    dir_cache::snapshot()
+}
+
+/// Lists `dir` from disk now (bypassing the cache): sorted [`path_key`]s of its files.
+pub fn list_dir_keys(dir: &str) -> Vec<u64> {
+    dir_cache::list(dir).sorted_keys()
+}
+
+/// Replaces the cached listing of `dir` with `keys` (a fresh [`list_dir_keys`]).
+pub fn seed_dir(dir: &str, keys: &[u64]) {
+    dir_cache::seed(dir, keys);
+}
+
 mod dir_cache {
     use std::path::Path;
     use std::sync::{Arc, OnceLock, RwLock};
@@ -45,10 +75,24 @@ mod dir_cache {
     use hashbrown::{HashMap, HashSet};
     use rustc_hash::FxBuildHasher;
 
+    use super::path_key;
     use crate::hash::hash_bytes;
 
-    type Listing = HashSet<u64, FxBuildHasher>;
-    type Shard = RwLock<HashMap<u64, Arc<OnceLock<Listing>>, FxBuildHasher>>;
+    /// The files of one directory, as [`path_key`]s of their full paths.
+    pub struct Dir {
+        path: String,
+        keys: HashSet<u64, FxBuildHasher>,
+    }
+
+    impl Dir {
+        pub fn sorted_keys(&self) -> Vec<u64> {
+            let mut v: Vec<u64> = self.keys.iter().copied().collect();
+            v.sort_unstable();
+            v
+        }
+    }
+
+    type Shard = RwLock<HashMap<u64, Arc<OnceLock<Dir>>, FxBuildHasher>>;
 
     const SHARDS: usize = 64;
 
@@ -81,40 +125,74 @@ mod dir_cache {
         }
     }
 
-    fn list(dir: &str) -> Listing {
-        let mut out = Listing::default();
+    pub fn list(dir: &str) -> Dir {
+        let mut out = Dir { path: dir.to_owned(), keys: HashSet::default() };
         let p = match dir {
             "" => "/".to_owned(),
             d if d.ends_with(':') => format!("{d}/"),
             d => d.to_owned(),
         };
         let Ok(rd) = std::fs::read_dir(&p) else { return out };
+        let mut full = String::with_capacity(dir.len() + 64);
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             let is_file = ft.is_file() || (ft.is_symlink() && Path::new(&e.path()).is_file());
             if is_file && let Some(n) = e.file_name().to_str() {
-                out.insert(ci_hash(n));
+                full.clear();
+                full.push_str(dir);
+                full.push('/');
+                full.push_str(n);
+                out.keys.insert(path_key(&full));
             }
         }
         out
     }
 
-    pub fn is_file(path: &str) -> bool {
+    fn cell_of(dir: &str) -> Arc<OnceLock<Dir>> {
+        let key = ci_hash(dir);
+        let shard = &shards()[key as usize % SHARDS];
+        let cell = shard.read().unwrap().get(&key).cloned();
+        cell.unwrap_or_else(|| shard.write().unwrap().entry(key).or_default().clone())
+    }
+
+    pub fn is_file(path: &str, key: u64) -> bool {
         let (dir, name) = split(path);
         if name.is_empty() {
             return false;
         }
-        let key = ci_hash(dir);
-        let shard = &shards()[key as usize % SHARDS];
-        let cell = shard.read().unwrap().get(&key).cloned();
-        let cell = cell.unwrap_or_else(|| shard.write().unwrap().entry(key).or_default().clone());
         // One thread lists the directory; concurrent askers wait for it instead of repeating the I/O.
-        cell.get_or_init(|| list(dir)).contains(&ci_hash(name))
+        cell_of(dir).get_or_init(|| list(dir)).keys.contains(&key)
     }
 
     pub fn invalidate(path: &str) {
         let key = ci_hash(split(path).0);
         shards()[key as usize % SHARDS].write().unwrap().remove(&key);
+    }
+
+    pub fn seed(dir: &str, keys: &[u64]) {
+        let key = ci_hash(dir);
+        let cell = Arc::new(OnceLock::new());
+        let _ = cell.set(Dir { path: dir.to_owned(), keys: keys.iter().copied().collect() });
+        shards()[key as usize % SHARDS].write().unwrap().insert(key, cell);
+    }
+
+    pub fn clear() {
+        for sh in shards() {
+            sh.write().unwrap().clear();
+        }
+    }
+
+    pub fn snapshot() -> Vec<(String, Vec<u64>)> {
+        let mut out = Vec::new();
+        for sh in shards() {
+            for cell in sh.read().unwrap().values() {
+                if let Some(d) = cell.get() {
+                    out.push((d.path.clone(), d.sorted_keys()));
+                }
+            }
+        }
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 
@@ -189,10 +267,18 @@ pub fn normalize_path(p: &mut String) {
 /// Stable identity of a path for "already included" bookkeeping.
 /// Case-insensitive on Windows.
 pub fn path_key(p: &str) -> u64 {
-    if cfg!(windows) {
-        crate::hash::hash_bytes(p.to_ascii_lowercase().as_bytes())
+    let b = p.as_bytes();
+    if !cfg!(windows) {
+        return crate::hash::hash_bytes(b);
+    }
+    if b.len() <= 256 {
+        let mut buf = [0u8; 256];
+        for (d, c) in buf.iter_mut().zip(b) {
+            *d = c.to_ascii_lowercase();
+        }
+        crate::hash::hash_bytes(&buf[..b.len()])
     } else {
-        crate::hash::hash_bytes(p.as_bytes())
+        crate::hash::hash_bytes(&b.to_ascii_lowercase())
     }
 }
 

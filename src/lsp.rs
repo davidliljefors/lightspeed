@@ -411,12 +411,13 @@ impl Server {
             None => CompileDb::default(),
         };
         let t0 = std::time::Instant::now();
+        let cfg = IndexConfig { cache: cdb_path.as_deref().and_then(crate::store::CacheConfig::for_project), ..IndexConfig::default() };
         match self.events.clone().filter(|_| self.background) {
             Some(tx) => {
                 let progress = Arc::new(Progress::default());
                 self.building = Some(progress.clone());
                 let spawned = std::thread::Builder::new().name("lightspeed-index".into()).stack_size(16 << 20).spawn(move || {
-                    let idx = Index::build_with(cdb, IndexConfig::default(), Some(&progress));
+                    let idx = Index::build_with(cdb, cfg, Some(&progress));
                     let _ = tx.send(Msg::Indexed(Box::new(idx), t0.elapsed().as_secs_f64() * 1e3));
                 });
                 if let Err(e) = spawned {
@@ -425,7 +426,7 @@ impl Server {
                 }
             }
             None => {
-                let idx = Index::build(cdb, IndexConfig::default());
+                let idx = Index::build(cdb, cfg);
                 self.install_index(idx, t0.elapsed().as_secs_f64() * 1e3);
             }
         }
