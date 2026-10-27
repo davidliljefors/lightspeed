@@ -871,8 +871,24 @@ impl Index {
             };
             self.worker.pp.invalidate_path(&p);
             let (flags, hash) = flags_of(&self.cdb, flag_entry);
+            let t = std::time::Instant::now();
             let a = self.worker.analyze(&p, src, flags, hash, None);
+            let analyze_ms = t.elapsed().as_secs_f64() * 1e3;
+            let [_, pp_us, parse_us, lex_us, scope_us, _] = a.times;
+            let t = std::time::Instant::now();
+            let was_dirty = self.dirty;
             let inc = self.absorb(&p, flag_entry, is_tu, a);
+            if std::env::var_os("LIGHTSPEED_QUIET").is_none() {
+                eprintln!(
+                    "lightspeed: reindex {p}: analyze {analyze_ms:.1} ms (preprocess {:.1}, parse {:.1}, lex {:.1}, scopes {:.1}), absorb {:.1} ms, {}",
+                    pp_us as f64 / 1e3,
+                    parse_us as f64 / 1e3,
+                    lex_us as f64 / 1e3,
+                    scope_us as f64 / 1e3,
+                    t.elapsed().as_secs_f64() * 1e3,
+                    if self.dirty && !was_dirty { "shape changed (full index rebuild pending)" } else { "same shape or already dirty" },
+                );
+            }
             if self.cfg.index_headers {
                 pending.extend(inc.into_iter().map(|h| (h, flag_entry)));
             }
@@ -916,9 +932,15 @@ impl Index {
             }
             self.dead_symbols = 0;
         }
+        let t = std::time::Instant::now();
         self.db.rebuild_indexes();
+        let idx_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
         self.hier = Hierarchy::build(&mut self.db);
         self.dirty = false;
+        if std::env::var_os("LIGHTSPEED_QUIET").is_none() {
+            eprintln!("lightspeed: flush: indexes {idx_ms:.1} ms, hierarchy {:.1} ms ({} symbols)", t.elapsed().as_secs_f64() * 1e3, self.db.len());
+        }
     }
 
     /// Live symbols declared in file `fi`.
