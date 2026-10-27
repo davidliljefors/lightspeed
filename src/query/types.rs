@@ -103,17 +103,35 @@ enum Decl {
 
 impl Query<'_> {
     /// Records `ids` may denote, following type aliases (`typedef struct _X X`,
-    /// `using X = Y`) through their written target. Depth-limited.
+    /// `using X = Y`) through their written target. Depth-limited, and each alias
+    /// is expanded at most once with a small global budget: alias targets are
+    /// looked up by bare name, so a name like `type` or `T` fans out to thousands
+    /// of aliases and would otherwise explode (and read every file they live in).
     pub(super) fn resolve_records(&self, ids: impl IntoIterator<Item = SymbolId>) -> Vec<SymbolId> {
+        const MAX_ALIAS_EXPANSIONS: usize = 24;
+        const MAX_FANOUT: usize = 32;
         let db = &self.idx.db;
         let mut out = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut expansions = 0;
         let mut work: Vec<(SymbolId, u8)> = ids.into_iter().map(|i| (self.idx.hier.canonical(i), 0)).collect();
         while let Some((id, depth)) = work.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
             match db.symbol(id).kind {
                 k if k.is_record() => out.push(id),
-                SymbolKind::TypeAlias if depth < 6 => {
+                SymbolKind::TypeAlias if depth < 6 && expansions < MAX_ALIAS_EXPANSIONS => {
+                    expansions += 1;
                     if let Some(t) = self.alias_target(id) {
-                        work.extend(db.lookup(&t).iter().filter(|&&c| c != id).map(|&c| (c, depth + 1)));
+                        let cands = db.lookup(&t);
+                        // Records first: they end the chain, so aliases are only followed when none exist.
+                        let records: Vec<_> = cands.iter().copied().filter(|&c| db.symbol(c).kind.is_record()).collect();
+                        if !records.is_empty() {
+                            work.extend(records.into_iter().take(MAX_FANOUT).map(|c| (c, depth + 1)));
+                        } else if cands.len() <= MAX_FANOUT {
+                            work.extend(cands.iter().filter(|&&c| c != id).map(|&c| (c, depth + 1)));
+                        }
                     }
                 }
                 _ => {}

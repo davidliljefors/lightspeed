@@ -367,6 +367,24 @@ fn real_msvc_stl_containers() {
 }
 
 #[test]
+fn alias_cycles_with_many_same_named_aliases_terminate() {
+    let mut src = String::new();
+    for i in 0..300 {
+        src.push_str(&format!("namespace n{i} {{ using A = B; using B = A; }}\n"));
+    }
+    src.push_str("struct Foo { void run(); };\nvoid f() { A a; a.run(); Foo g; g.run(); }\n");
+    let ws = Ws::new(&[("a.cpp", &src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let t = std::time::Instant::now();
+    let off = (src.find("a.run").unwrap() + 2) as u32;
+    let _ = q.definition(&p, &src, off);
+    assert_eq!(names(&idx, &q.definition(&p, &src, (src.find("g.run").unwrap() + 2) as u32)), ["Foo::run"]);
+    assert!(t.elapsed().as_secs() < 5, "alias resolution blew up");
+}
+
+#[test]
 fn reserved_words_are_never_symbols() {
     let src = "struct static_cast_t {};\nint go(long x) { int y = static_cast<int>(x); return sizeof(y) + (this ? 1 : 0); }\n";
     let ws = Ws::new(&[("a.cpp", src)], &[]);
