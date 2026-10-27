@@ -31,6 +31,11 @@ const SMART_PTRS: &[&str] = &["unique_ptr", "shared_ptr", "weak_ptr", "intrusive
 const MAKE_SMART: &[&str] = &["make_unique", "make_shared", "make_intrusive", "allocate_shared", "make_optional"];
 /// Calls whose result has the type of their first argument.
 const PASS_THROUGH: &[&str] = &["move", "forward", "as_const", "addressof", "ref", "cref"];
+/// Built-in scalar type names, for telling `int` apart from a class when ranking overloads.
+const PRIMS: &[&str] = &[
+    "int", "unsigned", "long", "short", "char", "bool", "float", "double", "size_t", "ssize_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+    "uint32_t", "uint64_t", "wchar_t", "char8_t", "char16_t", "char32_t", "intptr_t", "uintptr_t", "ptrdiff_t",
+];
 
 /// A written type reduced to what member lookup needs: its leading name and,
 /// for templates, its arguments, each as normalized type text (`Foo`,
@@ -334,7 +339,8 @@ impl Query<'_> {
             let first = &args[..top_level(args, K::Comma).unwrap_or(args.len())];
             self.expr_ty(cx, prefix, first, depth + 1)?
         } else if called {
-            self.call_ty(cx, path.last().copied(), name, &targs)?
+            let args = (expr[open].kind == K::LParen).then(|| &expr[open + 1..i - 1]);
+            self.call_ty(cx, prefix, depth, path.last().copied(), name, &targs, args)?
         } else if let Some(q) = path.last() {
             let owners = self.resolve_records(self.idx.db.lookup(q).iter().copied());
             self.member_ty(cx, &owners, name, None)?
@@ -500,8 +506,11 @@ impl Query<'_> {
         None
     }
 
-    /// Result type of calling `name` (optionally qualified by `qual`).
-    fn call_ty(&self, cx: &Cx, qual: Option<&str>, name: &str, targs: &[String]) -> Option<Ty> {
+    /// Result type of calling `name` (optionally qualified by `qual`). With the
+    /// call's `args` (and the expression `prefix` they are evaluated in), the
+    /// overload whose parameter types fit the argument types best is chosen.
+    #[allow(clippy::too_many_arguments)]
+    fn call_ty(&self, cx: &Cx, prefix: &[Token], depth: u8, qual: Option<&str>, name: &str, targs: &[String], args: Option<&[Token]>) -> Option<Ty> {
         if name.ends_with("_cast") {
             return targs.first().and_then(|a| parse_ty(a));
         }
@@ -513,12 +522,90 @@ impl Query<'_> {
             return Some(Ty { head: name.to_owned(), args: targs.to_vec() });
         }
         let (in_scope, in_bases) = self.scope_set(cx.scopes);
-        let local = in_scope.into_iter().chain(in_bases).flat_map(|o| db.children(o).iter().copied());
-        local
-            .chain(db.lookup(name).iter().copied())
-            .filter(|&c| db.name(c) == name && matches!(db.symbol(c).kind, SymbolKind::Function | SymbolKind::Method))
-            .filter(|&c| qual.is_none_or(|q| db.symbol(c).parent.is_some_and(|p| db.name(p) == q)))
-            .find_map(|c| self.decl_ty(cx, c))
+        let is_fn = |c: SymbolId| db.name(c) == name && matches!(db.symbol(c).kind, SymbolKind::Function | SymbolKind::Method);
+        let qual_ok = |c: SymbolId| qual.is_none_or(|q| db.symbol(c).parent.is_some_and(|p| db.name(p) == q));
+        let mut cands: Vec<SymbolId> = in_scope.into_iter().chain(in_bases).flat_map(|o| db.children(o).iter().copied()).filter(|&c| is_fn(c) && qual_ok(c)).collect();
+        // Methods of unrelated classes are not candidates for an unqualified call.
+        let global = db.lookup(name).iter().copied().filter(|&c| is_fn(c) && qual_ok(c));
+        let global: Vec<SymbolId> = global.collect();
+        let free = |c: &SymbolId| qual.is_some() || db.symbol(*c).parent.is_none_or(|p| !db.symbol(p).kind.is_record());
+        cands.extend(global.iter().copied().filter(free));
+        if cands.is_empty() {
+            cands = global;
+        }
+        let Some(args) = args.filter(|_| cands.len() > 1) else {
+            return cands.into_iter().find_map(|c| self.decl_ty(cx, c));
+        };
+        let arg_tys: Vec<Option<Ty>> = split_call_args(args).into_iter().map(|a| self.expr_ty(cx, prefix, a, depth + 1)).collect();
+        let mut best: Option<((bool, i32, bool), Ty)> = None;
+        for c in cands {
+            let Some(ret) = self.decl_ty(cx, c) else { continue };
+            let (fits, score) = self.call_fit(cx, c, &arg_tys);
+            let key = (fits, score, ret.head != "void");
+            if best.as_ref().is_none_or(|(k, _)| key > *k) {
+                best = Some((key, ret));
+            }
+        }
+        best.map(|(_, t)| t)
+    }
+
+    /// Whether `c` accepts `args.len()` arguments and how well its parameter
+    /// types match the argument types (higher is better).
+    fn call_fit(&self, cx: &Cx, c: SymbolId, args: &[Option<Ty>]) -> (bool, i32) {
+        let db = &self.idx.db;
+        let s = db.symbol(c);
+        let Some((params, variadic)) = self.source_of(cx, s, |src| {
+            let head = src.get(s.name_offset as usize..(s.name_offset as usize + 600).min(s.extent_end as usize).min(src.len()))?;
+            let toks = sig_tokens(head);
+            let open = toks.iter().position(|t| t.kind == K::LParen)?;
+            let close = matching_fwd(&toks, open)?;
+            let inner = &toks[open + 1..close];
+            let mut out: Vec<(Option<Ty>, bool)> = Vec::new();
+            if !(inner.is_empty() || (inner.len() == 1 && inner[0].text(head) == "void")) {
+                for p in split_call_args(inner) {
+                    let def = top_level(p, K::Eq);
+                    let mut ty = &p[..def.unwrap_or(p.len())];
+                    let named = |t: &Token| matches!(t.kind, K::Ident | K::Gt | K::Star | K::Amp | K::AmpAmp);
+                    if ty.len() >= 2 && ty[ty.len() - 1].kind == K::Ident && named(&ty[ty.len() - 2]) {
+                        ty = &ty[..ty.len() - 1];
+                    }
+                    out.push((declared_type_tail(ty, head), def.is_some()));
+                }
+            }
+            Some((out, inner.iter().any(|t| t.kind == K::Ellipsis)))
+        }) else {
+            return (true, 0);
+        };
+        let n = args.len();
+        let required = params.iter().filter(|p| !p.1).count();
+        let fits = n >= required && (variadic || n <= params.len());
+        let mut score = 0;
+        for (a, (p, _)) in args.iter().zip(&params) {
+            let (Some(a), Some(p)) = (a, p) else { continue };
+            score += self.arg_fit(a, p);
+        }
+        (fits, score)
+    }
+
+    fn arg_fit(&self, arg: &Ty, param: &Ty) -> i32 {
+        if arg.head == param.head {
+            return 2;
+        }
+        let (ap, pp) = (PRIMS.contains(&arg.head.as_str()), PRIMS.contains(&param.head.as_str()));
+        let rec = |t: &Ty| self.resolve_records(self.idx.db.lookup(&t.head).iter().copied()).first().copied();
+        match (rec(arg), rec(param)) {
+            (Some(a), Some(p)) => {
+                if self.idx.hier.is_a(a, p) {
+                    1
+                } else {
+                    -3
+                }
+            }
+            (Some(_), None) if pp => -3,
+            (None, Some(_)) if ap => -3,
+            (None, None) if ap && pp => -1,
+            _ => 0,
+        }
     }
 
     /// Type of member `name` (field type or method return type) of `owners` or their bases.
@@ -760,6 +847,26 @@ fn operand_start(toks: &[Token], end: usize) -> Option<usize> {
     } else {
         None
     }
+}
+
+/// `toks` split on commas outside any brackets (angle brackets included).
+fn split_call_args(toks: &[Token]) -> Vec<&[Token]> {
+    let (mut out, mut depth, mut start) = (Vec::new(), 0i32, 0);
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind {
+            K::LParen | K::LBracket | K::LBrace | K::Lt => depth += 1,
+            K::RParen | K::RBracket | K::RBrace | K::Gt => depth = (depth - 1).max(0),
+            K::Comma if depth == 0 => {
+                out.push(&toks[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < toks.len() {
+        out.push(&toks[start..]);
+    }
+    out
 }
 
 /// First index in `toks` of a `kind` token outside any brackets.

@@ -405,6 +405,26 @@ fn auto_from_container_method_returns_substituted_element() {
 }
 
 #[test]
+fn free_function_overload_chosen_by_argument_type() {
+    let main = "struct Guid {};\nstruct Name {};\nstruct SubGuid : Guid {};\nstruct SA { void memberA(); };\nstruct SB { void memberB(); };\nstruct SC { void memberC(); };\n\
+         SA toString(const Name& n);\nSB toString(const Guid& g);\nSC toString(int a, int b);\nSA toString(float f);\n\
+         void f(Guid guid, Name name, SubGuid sub) {\n\
+          auto x = toString(guid);\n x.memberB();\n\
+          auto y = toString(name);\n y.memberA();\n\
+          auto z = toString(sub);\n z.memberB();\n\
+          auto w = toString(1, 2);\n w.memberC();\n}\n";
+    let ws = Ws::new(&[("a.cpp", main)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    for (v, want) in [("x", "SB::memberB"), ("y", "SA::memberA"), ("z", "SB::memberB"), ("w", "SC::memberC")] {
+        let stmt = format!("{v}.member");
+        let off = (main.find(&stmt).unwrap() + 3) as u32;
+        assert_eq!(names(&idx, &q.definition(&p, main, off)), [want], "{v}");
+    }
+}
+
+#[test]
 fn eastl_style_hashtable_iterators_and_compiler_gated_aliases() {
     let h = "#pragma once\n#if defined(__clang__) || defined(_MSC_VER) || defined(__GNUC__)\n#define HAS_ALIASES 1\n#endif\n\
         namespace eastl {\n template<bool B, class T, class F> struct conditional { typedef T type; };\n\
