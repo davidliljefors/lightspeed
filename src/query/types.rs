@@ -257,10 +257,14 @@ impl Query<'_> {
                     if expr.get(i).is_some_and(|t| t.kind == K::Lt) {
                         i = matching_fwd(expr, i)? + 1;
                     }
+                    let mut arity = None;
                     if expr.get(i).is_some_and(|t| t.kind == K::LParen) {
-                        i = matching_fwd(expr, i)? + 1;
+                        let close = matching_fwd(expr, i)?;
+                        let inner = &expr[i + 1..close];
+                        arity = Some(if inner.is_empty() { 0 } else { 1 + (0..inner.len()).filter(|&k| inner[k].kind == K::Comma && matching_back_depth0(inner, k)).count() });
+                        i = close + 1;
                     }
-                    ty = self.operator_ty(cx, &recv, cx.text_of(n))?;
+                    ty = self.operator_ty_n(cx, &recv, cx.text_of(n), arity)?;
                 }
                 K::LBracket => {
                     i = matching_fwd(expr, i)? + 1;
@@ -346,10 +350,14 @@ impl Query<'_> {
 
     /// Member `name` (usually an `operator…`) of the class `ty` names, or its bases.
     fn operator_ty(&self, cx: &Cx, ty: &Ty, name: &str) -> Option<Ty> {
+        self.operator_ty_n(cx, ty, name, None)
+    }
+
+    fn operator_ty_n(&self, cx: &Cx, ty: &Ty, name: &str, arity: Option<usize>) -> Option<Ty> {
         let ty = &self.expand_alias(cx, ty.clone());
         let mut owners = self.resolve_records(self.idx.db.lookup(&ty.head).iter().copied());
         self.choose_specialization(&mut owners, (!ty.args.is_empty()).then_some(&ty.args[..]));
-        self.member_ty(cx, &owners, name, Some(ty))
+        self.member_ty_n(cx, &owners, name, Some(ty), arity)
     }
 
     /// Replaces an alias used as a type (`using Vec = eastl::vector<Foo>;`,
@@ -517,6 +525,43 @@ impl Query<'_> {
     /// `recv` is the instantiated type the member is accessed on; template
     /// parameters in the member's type are replaced by its arguments.
     fn member_ty(&self, cx: &Cx, owners: &[SymbolId], name: &str, recv: Option<&Ty>) -> Option<Ty> {
+        self.member_ty_n(cx, owners, name, recv, None)
+    }
+
+    /// `(required, maximum)` argument counts of the function declared by `s`.
+    fn arity_range(&self, cx: &Cx, s: &crate::symbols::Symbol) -> Option<(usize, usize)> {
+        self.source_of(cx, s, |src| {
+            let head = src.get(s.name_offset as usize..(s.name_offset as usize + 600).min(s.extent_end as usize).min(src.len()))?;
+            let toks = sig_tokens(head);
+            let open = toks.iter().position(|t| t.kind == K::LParen)?;
+            let close = matching_fwd(&toks, open)?;
+            let inner = &toks[open + 1..close];
+            if inner.is_empty() || (inner.len() == 1 && inner[0].text(head) == "void") {
+                return Some((0, 0));
+            }
+            let (mut depth, mut total, mut defaulted, mut has_default) = (0i32, 1usize, 0usize, false);
+            for t in inner {
+                match t.kind {
+                    K::Lt | K::LParen | K::LBracket | K::LBrace => depth += 1,
+                    K::Gt | K::RParen | K::RBracket | K::RBrace => depth -= 1,
+                    K::Eq if depth == 0 => has_default = true,
+                    K::Comma if depth == 0 => {
+                        total += 1;
+                        defaulted += has_default as usize;
+                        has_default = false;
+                    }
+                    _ => {}
+                }
+            }
+            defaulted += has_default as usize;
+            let variadic = inner.iter().any(|t| t.kind == K::Ellipsis);
+            Some((total - defaulted, if variadic { usize::MAX } else { total }))
+        })
+    }
+
+    /// [`Self::member_ty`] for a call with `arity` arguments: among overloads
+    /// the one that accepts that many arguments and returns a value wins.
+    fn member_ty_n(&self, cx: &Cx, owners: &[SymbolId], name: &str, recv: Option<&Ty>, arity: Option<usize>) -> Option<Ty> {
         let db = &self.idx.db;
         // Each class to search with the type its template parameters are bound by
         // (bases get theirs from the arguments written in the derived class's base list).
@@ -533,17 +578,24 @@ impl Query<'_> {
             i += 1;
         }
         chain.iter().find_map(|(o, r)| {
-            db.children(*o)
-                .iter()
-                .copied()
-                .filter(|&m| db.name(m) == name && matches!(db.symbol(m).kind, SymbolKind::Field | SymbolKind::Variable | SymbolKind::Function | SymbolKind::Method))
-                .find_map(|m| {
-                    let ty = self.decl_ty(cx, m)?;
-                    Some(match r {
-                        Some(r) => self.instantiate(cx, ty, *o, r),
-                        None => ty,
-                    })
-                })
+            let mut best: Option<((bool, bool), Ty)> = None;
+            for m in db.children(*o).iter().copied().filter(|&m| db.name(m) == name && matches!(db.symbol(m).kind, SymbolKind::Field | SymbolKind::Variable | SymbolKind::Function | SymbolKind::Method)) {
+                let Some(ty) = self.decl_ty(cx, m) else { continue };
+                let ty = match r {
+                    Some(r) => self.instantiate(cx, ty, *o, r),
+                    None => ty,
+                };
+                let is_fn = matches!(db.symbol(m).kind, SymbolKind::Function | SymbolKind::Method);
+                let fits = match (arity, is_fn) {
+                    (Some(n), true) => self.arity_range(cx, db.symbol(m)).is_none_or(|(lo, hi)| (lo..=hi).contains(&n)),
+                    _ => true,
+                };
+                let key = (fits, ty.head != "void");
+                if best.as_ref().is_none_or(|(k, _)| key > *k) {
+                    best = Some((key, ty));
+                }
+            }
+            best.map(|(_, t)| t)
         })
     }
 
@@ -666,6 +718,19 @@ impl Query<'_> {
     }
 }
 
+/// Whether the token at `at` sits outside any bracket pair within `toks`.
+fn matching_back_depth0(toks: &[Token], at: usize) -> bool {
+    let mut depth = 0i32;
+    for t in &toks[..at] {
+        match t.kind {
+            K::Lt | K::LParen | K::LBracket | K::LBrace => depth += 1,
+            K::Gt | K::RParen | K::RBracket | K::RBrace => depth -= 1,
+            _ => {}
+        }
+    }
+    depth <= 0
+}
+
 /// Index of the first token of the receiver expression that ends `toks`.
 fn expr_start(toks: &[Token]) -> usize {
     let mut i = toks.len();
@@ -784,7 +849,27 @@ fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
         args = split_args(&toks[open + 1..i - 1], text);
         i = open;
     }
-    (i > 0 && toks[i - 1].kind == K::Ident).then(|| Ty { head: toks[i - 1].text(text).to_owned(), args })
+    // `conditional<B, X, Y>::type`: the trait's result.
+    if i >= 3 && args.is_empty() && toks[i - 1].kind == K::Ident && toks[i - 1].text(text) == "type" && toks[i - 2].kind == K::ColonColon && toks[i - 3].kind == K::Gt {
+        let inner = declared_type_tail(&toks[..i - 2], text)?;
+        return Some(trait_result(&inner).unwrap_or(inner));
+    }
+    let ty = (i > 0 && toks[i - 1].kind == K::Ident).then(|| Ty { head: toks[i - 1].text(text).to_owned(), args })?;
+    Some(trait_result(&ty).unwrap_or(ty))
+}
+
+/// What a type-trait application like `conditional_t<B, X, Y>` or
+/// `remove_reference<T>` stands for, when the choice doesn't depend on values.
+fn trait_result(ty: &Ty) -> Option<Ty> {
+    let name = ty.head.strip_suffix("_t").unwrap_or(&ty.head);
+    let pick = match name {
+        "conditional" => 2,
+        "enable_if" => 1,
+        "remove_reference" | "remove_const" | "remove_cv" | "remove_volatile" | "remove_pointer" | "remove_cvref" | "decay" | "add_pointer" | "add_const" | "add_lvalue_reference"
+        | "add_rvalue_reference" | "type_identity" | "identity" => 0,
+        _ => return None,
+    };
+    parse_ty(ty.args.get(pick)?)
 }
 
 /// The type written in `s`, e.g. `vector<Foo>`.

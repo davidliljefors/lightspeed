@@ -405,6 +405,24 @@ fn auto_from_container_method_returns_substituted_element() {
 }
 
 #[test]
+fn eastl_style_hashtable_iterators_and_compiler_gated_aliases() {
+    let h = "#pragma once\n#if defined(__clang__) || defined(_MSC_VER) || defined(__GNUC__)\n#define HAS_ALIASES 1\n#endif\n\
+        namespace eastl {\n template<bool B, class T, class F> struct conditional { typedef T type; };\n\
+         template<class A, class B> struct pair { A first; B second; };\n\
+         template<class V, bool C> struct hit { typedef typename conditional<C, const V*, V*>::type pointer;\n pointer operator->() const; };\n\
+         template<class K, class V> class hashtable { public: typedef pair<const K, V> value_type; typedef hit<value_type, false> iterator;\n iterator find(const K& k); };\n\
+         template<class K, class V> class hash_map : public hashtable<K, V> {};\n\
+         #if defined(HAS_ALIASES)\n template<class K, class V> using unordered_map = hash_map<K, V>;\n #endif\n}\n";
+    let main = "#include \"h.h\"\nstruct Thing { void memberFunction(); };\nstruct Other { void memberFunction(); };\n\
+        void f(eastl::unordered_map<int, Thing>& m) {\n auto p = m.find(1);\n p->second.memberFunction();\n}\n";
+    let ws = Ws::new(&[("h.h", h), ("a.cpp", main)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let off = (main.find("second.memberFunction").unwrap() + 8) as u32;
+    assert_eq!(names(&idx, &q.definition(&ws.path("a.cpp"), main, off)), ["Thing::memberFunction"]);
+}
+
+#[test]
 fn auto_from_container_variants() {
     let ev = "#pragma once\nnamespace eastl {\n template<class T> struct allocator {};\n\
         template<class T, class Alloc = allocator<T>> class vector {\n public:\n typedef T value_type;\n typedef value_type& reference;\n typedef T* iterator;\n\

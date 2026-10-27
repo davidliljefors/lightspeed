@@ -59,16 +59,35 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// The toolchain a compile command's `args[0]` implies (`None` for unknown wrappers).
+    pub fn detect(compiler: Option<&str>) -> Self {
+        let Some(c) = compiler else { return Profile::None };
+        let name = c.rsplit(['/', '\\']).next().unwrap_or(c).to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        if name == "cl" {
+            Profile::Msvc
+        } else if name.contains("clang-cl") {
+            Profile::ClangCl
+        } else if name.contains("clang") {
+            // clang targets the host ABI: on Windows that is MSVC's.
+            if cfg!(windows) { Profile::ClangCl } else { Profile::Clang }
+        } else if name.contains("gcc") || name.contains("g++") || name == "c++" || name == "cc" {
+            Profile::Gcc
+        } else {
+            Profile::None
+        }
+    }
+
     fn defines(self) -> &'static [&'static str] {
         const MSVC: &[&str] =
             &["_MSC_VER 1938", "_MSC_FULL_VER 193833130", "_WIN32 1", "_WIN64 1", "_M_X64 100", "_M_AMD64 100"];
         const CLANG_CL: &[&str] = &[
             "_MSC_VER 1938", "_WIN32 1", "_WIN64 1", "_M_X64 100", "_M_AMD64 100", "__clang__ 1",
-            "__clang_major__ 17", "__x86_64__ 1",
+            "__clang_major__ 17", "__clang_minor__ 0", "__x86_64__ 1",
         ];
         const GCC: &[&str] = &["__GNUC__ 13", "__GNUC_MINOR__ 2", "__linux__ 1", "__unix__ 1", "__x86_64__ 1", "__LP64__ 1"];
         const CLANG: &[&str] = &[
-            "__clang__ 1", "__clang_major__ 17", "__GNUC__ 4", "__GNUC_MINOR__ 2", "__linux__ 1", "__unix__ 1",
+            "__clang__ 1", "__clang_major__ 17", "__clang_minor__ 0", "__GNUC__ 4", "__GNUC_MINOR__ 2", "__linux__ 1", "__unix__ 1",
             "__x86_64__ 1", "__LP64__ 1",
         ];
         match self {
@@ -595,7 +614,8 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         for l in ["__STDC_HOSTED__ 1", "__DATE__ \"Jan  1 2025\"", "__TIME__ \"00:00:00\""] {
             self.define_line(l);
         }
-        for l in self.cfg.profile.defines() {
+        let profile = if self.cfg.profile == Profile::None { Profile::detect(flags.compiler.as_deref()) } else { self.cfg.profile };
+        for l in profile.defines() {
             self.define_line(l);
         }
         for m in &flags.macros {
