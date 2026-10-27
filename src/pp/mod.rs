@@ -215,6 +215,27 @@ pub struct PpOutput {
 }
 
 impl PpOutput {
+    /// Heap bytes retained by the buffers (kept between runs for reuse).
+    pub fn heap_bytes(&self) -> usize {
+        self.tokens.capacity() * std::mem::size_of::<PpToken>()
+            + self.pool.capacity()
+            + self.includes.capacity() * std::mem::size_of::<IncludeRecord>()
+            + self.defines.capacity() * std::mem::size_of::<DefineRecord>()
+            + self.skipped.capacity() * 8
+            + self.diagnostics.capacity() * std::mem::size_of::<PpDiag>()
+            + self.deps.capacity() * 8
+    }
+
+    /// Frees the buffers if a huge file inflated them, so one outlier doesn't
+    /// pin hundreds of MiB per worker thread.
+    pub fn trim(&mut self, limit_bytes: usize) {
+        if self.heap_bytes() > limit_bytes {
+            self.clear();
+            self.tokens.shrink_to(1 << 16);
+            self.pool.shrink_to(1 << 20);
+            self.deps.shrink_to(1 << 12);
+        }
+    }
     pub fn clear(&mut self) {
         self.deps.clear();
         self.tokens.clear();
@@ -412,6 +433,7 @@ struct Snapshot {
 }
 
 const MAX_SNAPSHOTS: usize = 16;
+const RESOLVE_CACHE_ENTRIES: usize = 50_000;
 
 /// Per-worker preprocessor. See the module docs.
 pub struct Preprocessor<'fs, P: FileProvider> {
@@ -578,6 +600,26 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         self.probes.clear();
     }
 
+    /// Frees the include-resolution memo once it grows past `RESOLVE_CACHE_ENTRIES`
+    /// (it is keyed by flag set and includer directory, so across many modules it
+    /// otherwise only grows).
+    fn bound_resolve_cache(&mut self) {
+        if self.resolve_cache.len() > RESOLVE_CACHE_ENTRIES || self.probes.len() > RESOLVE_CACHE_ENTRIES * 8 {
+            self.clear_resolve_cache();
+            self.resolve_cache.shrink_to(1 << 12);
+            self.resolved_paths.shrink_to(1 << 16);
+            self.probes.shrink_to(1 << 14);
+        }
+    }
+
+    /// Approximate retained heap bytes: `(resolve cache, macro tables, header/guard caches)`.
+    pub fn heap_breakdown(&self) -> (usize, usize, usize) {
+        let resolve = self.resolve_cache.capacity() * (8 + std::mem::size_of::<ResolveEntry>() + 1) + self.resolved_paths.capacity() + self.probes.capacity() * 8;
+        let macros = self.t.heap_bytes() + self.base.heap_bytes() + self.snapshots.values().map(|s| s.t.heap_bytes() + s.pool.capacity()).sum::<usize>();
+        let caches = self.header_cache.capacity() * 17 + self.guards.capacity() * 21 + self.guard_text.capacity() + self.tok_pool.iter().map(|v| v.capacity() * std::mem::size_of::<Token>()).sum::<usize>();
+        (resolve, macros, caches)
+    }
+
     /// Number of live macros in the last finished TU (diagnostics/tests).
     pub fn macro_count(&self) -> usize {
         self.t.len()
@@ -591,6 +633,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
 
     /// Preprocesses `src` (the text of `path`) into `out`.
     pub fn run(&mut self, path: &str, src: &str, out: &mut PpOutput) {
+        self.bound_resolve_cache();
         out.clear();
         self.t.reset_from(&self.base);
         self.ctx.clear();

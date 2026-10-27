@@ -82,6 +82,10 @@ fn filter_pos(h: u64) -> (usize, u64) {
 }
 
 impl MacroTable {
+    pub fn heap_bytes(&self) -> usize {
+        self.arena.capacity() + self.defs.capacity() * std::mem::size_of::<Macro>() + self.body.capacity() * std::mem::size_of::<BodyTok>() + self.index.capacity() * 5 + FILTER_WORDS * 8
+    }
+
     pub fn new() -> Self {
         Self {
             arena: String::from("01"),

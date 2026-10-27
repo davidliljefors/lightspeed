@@ -168,6 +168,25 @@ struct Worker {
     pres: ParseOutput,
     toks: Vec<Token>,
     last_flags: Option<u64>,
+    /// What this worker last added to [`WORKER_MEM`].
+    published: [usize; 5],
+}
+
+/// Retained heap bytes summed over all live workers: include-resolution memo,
+/// macro tables, header/guard caches, preprocessor output buffers, scratch tokens.
+static WORKER_MEM: [std::sync::atomic::AtomicUsize; 5] = [const { std::sync::atomic::AtomicUsize::new(0) }; 5];
+const WORKER_MEM_LABELS: [&str; 5] = ["include-resolve memo", "macro tables", "header/guard caches", "pp output buffers", "token scratch"];
+
+/// A worker whose preprocessor output buffers grew past this after a file frees them.
+const OUTPUT_TRIM_BYTES: usize = 48 << 20;
+static OUTPUT_TRIMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        for (m, p) in WORKER_MEM.iter().zip(self.published) {
+            m.fetch_sub(p, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl Worker {
@@ -180,6 +199,21 @@ impl Worker {
             pres: ParseOutput::default(),
             toks: Vec::new(),
             last_flags: None,
+            published: [0; 5],
+        }
+    }
+
+    fn publish_memory(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (resolve, macros, caches) = self.pp.heap_breakdown();
+        let now = [resolve, macros, caches, self.out.heap_bytes(), self.toks.capacity() * std::mem::size_of::<Token>()];
+        for ((m, p), n) in WORKER_MEM.iter().zip(&mut self.published).zip(now) {
+            if n >= *p {
+                m.fetch_add(n - *p, Relaxed);
+            } else {
+                m.fetch_sub(*p - n, Relaxed);
+            }
+            *p = n;
         }
     }
 
@@ -231,7 +265,16 @@ impl Worker {
         let mut decls = crate::scope_decls::scan(&self.toks, text, self.toks.len(), true);
         decls.normalize();
         let t_scope = t.elapsed().as_micros() as u32;
-        Analysis { shard, idents, includes, decls, content_hash, times: [0, t_pp, t_parse, t_lex, t_scope] }
+        let a = Analysis { shard, idents, includes, decls, content_hash, times: [0, t_pp, t_parse, t_lex, t_scope] };
+        if self.out.heap_bytes() > OUTPUT_TRIM_BYTES {
+            OUTPUT_TRIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.out.trim(OUTPUT_TRIM_BYTES);
+        }
+        if self.toks.capacity() > 1 << 22 {
+            self.toks = Vec::new();
+        }
+        self.publish_memory();
+        a
     }
 }
 
@@ -486,6 +529,11 @@ impl Index {
             s.push_str(&format!(" {label} {},", mib(b)));
         }
         s.push_str(&format!("\n  hierarchy {} | per-file info {} ({} files, {idents} ident hashes)", mib(self.hier.heap_bytes()), mib(files), self.files.len()));
+        s.push_str("\n  workers (all threads):");
+        for (label, m) in WORKER_MEM_LABELS.iter().zip(&WORKER_MEM) {
+            s.push_str(&format!(" {label} {},", mib(m.load(std::sync::atomic::Ordering::Relaxed))));
+        }
+        s.push_str(&format!(" output trims {}", OUTPUT_TRIMS.load(std::sync::atomic::Ordering::Relaxed)));
         s
     }
 
