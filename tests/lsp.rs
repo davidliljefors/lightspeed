@@ -538,6 +538,7 @@ fn stdio_smoke_test() {
     for n in 0..200 {
         write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 100 + n, "method": "workspace/symbol", "params": {"query": "widget"}})).unwrap();
         r = next();
+        assert!(r.get("error").is_none(), "requests during startup must not error: {r}");
         if r["result"][0]["name"] == "Widget" {
             break;
         }

@@ -575,7 +575,25 @@ impl Server {
             }
             (m, Some(id)) => {
                 if self.index.is_none() {
-                    out.push(error(&id, -32002, "server not initialized"));
+                    // While the index builds, answer with an empty result instead of an error popup.
+                    let result = if self.building.is_some() {
+                        match m {
+                            "textDocument/definition" | "textDocument/hover" | "textDocument/prepareRename" => Some(Value::Null),
+                            "textDocument/references" | "textDocument/documentSymbol" | "workspace/symbol" => Some(json!([])),
+                            "textDocument/completion" => Some(json!({"isIncomplete": true, "items": []})),
+                            "textDocument/rename" => {
+                                out.push(error(&id, -32803, "Lightspeed is still indexing; try again in a moment"));
+                                return;
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    out.push(match result {
+                        Some(r) => respond(&id, r),
+                        None => error(&id, -32002, "server not initialized"),
+                    });
                     return;
                 }
                 self.apply_pending();
