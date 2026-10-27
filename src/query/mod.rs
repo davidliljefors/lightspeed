@@ -13,6 +13,7 @@ mod completion;
 mod hover;
 mod locals;
 mod refs;
+mod search;
 mod types;
 
 pub use hover::Hover;

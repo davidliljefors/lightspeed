@@ -34,6 +34,8 @@ mod expr;
 pub(crate) mod macros;
 pub mod vfs;
 
+use std::sync::Arc;
+
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
@@ -295,14 +297,55 @@ impl<'a> Input<'a> {
 }
 
 /// A header reduced to its directive lines, owned so no file stays mapped.
+/// Depends only on the file's content, so workers can share it.
 pub(super) struct HeaderEntry {
     text: String,
     toks: Vec<Token>,
+    guard: Option<String>,
 }
 
 impl HeaderEntry {
     fn size(&self) -> usize {
         self.text.len() + self.toks.len() * std::mem::size_of::<Token>() + 64
+    }
+}
+
+const SHARED_SHARDS: usize = 64;
+
+/// Header directive streams shared by every worker, so each header is read and
+/// lexed once per build instead of once per thread. Sharded; lookups are read
+/// locks and workers keep a private first-level cache in front of it.
+pub struct SharedHeaders {
+    shards: Vec<std::sync::RwLock<HashMap<u64, Arc<HeaderEntry>, FxBuildHasher>>>,
+}
+
+impl Default for SharedHeaders {
+    fn default() -> Self {
+        Self { shards: (0..SHARED_SHARDS).map(|_| std::sync::RwLock::new(HashMap::with_hasher(FxBuildHasher))).collect() }
+    }
+}
+
+impl SharedHeaders {
+    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, Arc<HeaderEntry>, FxBuildHasher>> {
+        &self.shards[(key >> 7) as usize % SHARED_SHARDS]
+    }
+
+    fn get(&self, key: u64) -> Option<Arc<HeaderEntry>> {
+        self.shard(key).read().ok()?.get(&key).cloned()
+    }
+
+    fn insert(&self, key: u64, e: Arc<HeaderEntry>) -> Arc<HeaderEntry> {
+        match self.shard(key).write() {
+            Ok(mut m) => m.entry(key).or_insert(e).clone(),
+            Err(_) => e,
+        }
+    }
+
+    /// Forgets one file (it changed on disk).
+    pub fn invalidate(&self, key: u64) {
+        if let Ok(mut m) = self.shard(key).write() {
+            m.remove(&key);
+        }
     }
 }
 
@@ -390,8 +433,9 @@ pub struct Preprocessor<'fs, P: FileProvider> {
     /// File key -> include-guard macro name (span in `guard_text`), if any.
     /// Depends only on file content, so it survives across TUs.
     guards: HashMap<u64, Option<(u32, u32)>, FxBuildHasher>,
-    header_cache: HashMap<u64, HeaderEntry, FxBuildHasher>,
+    header_cache: HashMap<u64, Arc<HeaderEntry>, FxBuildHasher>,
     header_cache_bytes: usize,
+    shared: Option<Arc<SharedHeaders>>,
     guard_text: String,
     resolve_cache: HashMap<u64, ResolveEntry, FxBuildHasher>,
     resolved_paths: String,
@@ -451,6 +495,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             guards: HashMap::with_hasher(FxBuildHasher),
             header_cache: HashMap::with_hasher(FxBuildHasher),
             header_cache_bytes: 0,
+            shared: None,
             guard_text: String::new(),
             resolve_cache: HashMap::with_hasher(FxBuildHasher),
             resolved_paths: String::new(),
@@ -462,6 +507,11 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             tmp_toks: Vec::new(),
             param_scratch: Vec::new(),
         }
+    }
+
+    /// Shares lexed header directive streams with other workers.
+    pub fn set_shared(&mut self, shared: Arc<SharedHeaders>) {
+        self.shared = Some(shared);
     }
 
     /// Selects the flag set for the following [`run`](Self::run)s. Cheap when
@@ -755,22 +805,37 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 e
             }
             None => {
-                let fs = self.fs;
-                let Some(sf) = fs.load(&self.path_buf) else { return };
-                let src = sf.text();
-                let mut toks = self.tok_pool.pop().unwrap_or_default();
-                lex_into(src, &mut toks);
+                let shared = self.shared.as_ref().and_then(|s| s.get(key));
+                let e = match shared {
+                    Some(e) => {
+                        out.stats.header_cache_hits += 1;
+                        e
+                    }
+                    None => {
+                        let fs = self.fs;
+                        let Some(sf) = fs.load(&self.path_buf) else { return };
+                        let src = sf.text();
+                        let mut toks = self.tok_pool.pop().unwrap_or_default();
+                        lex_into(src, &mut toks);
+                        let guard = directives::detect_guard(src, &toks).map(str::to_owned);
+                        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard };
+                        directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
+                        self.tok_pool.push(toks);
+                        let e = Arc::new(e);
+                        match &self.shared {
+                            Some(s) => s.insert(key, e),
+                            None => e,
+                        }
+                    }
+                };
                 if !self.guards.contains_key(&key) {
-                    let g = directives::detect_guard(src, &toks).map(|name| {
+                    let g = e.guard.as_deref().map(|name| {
                         let o = self.guard_text.len() as u32;
                         self.guard_text.push_str(name);
                         (o, name.len() as u32)
                     });
                     self.guards.insert(key, g);
                 }
-                let mut e = HeaderEntry { text: String::new(), toks: Vec::new() };
-                directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
-                self.tok_pool.push(toks);
                 e
             }
         };
@@ -800,6 +865,9 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     pub fn invalidate_file(&mut self, key: u64) {
         if let Some(e) = self.header_cache.remove(&key) {
             self.header_cache_bytes -= e.size();
+        }
+        if let Some(s) = &self.shared {
+            s.invalidate(key);
         }
         self.guards.remove(&key);
         self.snapshots.retain(|&k, s| k == key || !s.deps.contains(&key));

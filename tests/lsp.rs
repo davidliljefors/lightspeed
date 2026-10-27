@@ -533,9 +533,21 @@ fn stdio_smoke_test() {
     let init = next();
     assert!(init["result"]["capabilities"]["referencesProvider"].as_bool().unwrap());
     write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": path_to_uri(&a), "text": "struct Widget {};\n"}}})).unwrap();
-    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 2, "method": "workspace/symbol", "params": {"query": "widget"}})).unwrap();
+    // Indexing runs in the background; requests answer empty until it lands.
+    let mut r = Value::Null;
+    for n in 0..200 {
+        write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 100 + n, "method": "workspace/symbol", "params": {"query": "widget"}})).unwrap();
+        r = next();
+        if r["result"][0]["name"] == "Widget" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert_eq!(r["result"][0]["name"], "Widget", "{r}");
+    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 7}})).unwrap();
+    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 7, "method": "workspace/symbol", "params": {"query": "widget"}})).unwrap();
     let r = next();
-    assert_eq!(r["result"][0]["name"], "Widget");
+    assert_eq!(r["error"]["code"], -32800, "{r}");
     write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"})).unwrap();
     let _ = next();
     write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "method": "exit"})).unwrap();

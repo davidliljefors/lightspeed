@@ -460,6 +460,32 @@ Mode m = Mode::Fast; Plain p = Fast; int g(Mode x) { switch (x) { case Mode::Slo
 }
 
 #[test]
+fn symbol_search_matches_terms_in_any_order() {
+    let src = "namespace gfx { struct Renderer { void draw_mesh(); void keyword(); }; }\n\
+void key_word(); void KeyWord(); void word_key(); void keyboard(); void unrelated();\n\
+struct RigidBody { int mass; };\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let found = |s: &str| q.search_symbols(s, 20).iter().map(|&i| idx.db.qualified_name(i)).collect::<Vec<_>>();
+
+    // Joined spellings rank first, then the same words in other orders / positions.
+    let r = found("key word");
+    assert_eq!(r.len(), 4, "{r:?}");
+    assert!(r[..3].iter().all(|n| n.ends_with("keyword") || n.ends_with("key_word") || n.ends_with("KeyWord")), "{r:?}");
+    assert_eq!(r[3], "word_key", "{r:?}");
+    assert_eq!(found("word key")[0], "word_key");
+
+    // Case-insensitive, any order, container terms.
+    assert_eq!(found("MESH draw"), ["gfx::Renderer::draw_mesh"]);
+    assert_eq!(found("renderer mesh"), ["gfx::Renderer::draw_mesh"]);
+    assert_eq!(found("gfx keyword"), ["gfx::Renderer::keyword"]);
+    assert!(found("mesh nothing").is_empty() && found("   ").is_empty());
+    assert_eq!(found("rigid"), ["RigidBody"]);
+    assert_eq!(q.search_symbols("key", 2).len(), 2);
+}
+
+#[test]
 fn hover_reports_declaration_docs_and_hierarchy() {
     let src = "// Base of all things.\n// Second line.\nstruct Base { virtual void tick(int dt); };\n\
                /** Derived thing. */\nstruct Thing : Base { void tick(int dt) override; int count; };\n\

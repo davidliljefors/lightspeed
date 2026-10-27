@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::compile_commands::CompileDb;
 use crate::hash::hash_bytes;
-use crate::index::{Index, IndexConfig};
+use crate::index::{Index, IndexConfig, Progress};
 use crate::pp::vfs::{normalize_path, path_key};
 use crate::query::{DiskText, Location, Query, Text, TextSource, identifier_at};
 use crate::source::LineIndex;
@@ -33,8 +33,12 @@ const WORKSPACE_SYMBOL_LIMIT: usize = 200;
 pub enum Msg {
     Rpc(Value),
     Fs(PathBuf),
+    /// Background build finished: the index and how long it took (ms).
+    Indexed(Box<Index>, f64),
     Eof,
 }
+
+const PROGRESS_TOKEN: &str = "lightspeed/index";
 
 struct Doc {
     path: String,
@@ -64,6 +68,14 @@ pub struct Server {
     _watcher: Option<notify::RecommendedWatcher>,
     /// Workspace root (forward slashes); rename refuses to touch files outside it.
     root: Option<String>,
+    /// Build the index on a background thread (set by [`Self::run`]); requests answer
+    /// empty until it lands. Tests drive `handle` directly and index synchronously.
+    background: bool,
+    building: Option<Arc<Progress>>,
+    /// The client accepts `window/workDoneProgress/create`.
+    progress_ok: bool,
+    progress_started: bool,
+    last_progress: ((u32, u32), std::time::Instant),
     shutdown: bool,
     pub exit_code: Option<i32>,
 }
@@ -228,6 +240,11 @@ impl Server {
             events: None,
             _watcher: None,
             root: None,
+            background: false,
+            building: None,
+            progress_ok: false,
+            progress_started: false,
+            last_progress: ((0, 0), std::time::Instant::now()),
             shutdown: false,
             exit_code: None,
         }
@@ -241,6 +258,7 @@ impl Server {
     pub fn run(mut self, input: impl BufRead + Send + 'static, mut output: impl Write) -> i32 {
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.events = Some(tx.clone());
+        self.background = true;
         let reader_tx = tx;
         std::thread::spawn(move || {
             let mut input = input;
@@ -263,17 +281,39 @@ impl Server {
         });
 
         let mut out = Vec::new();
+        // Messages already read from the client, so stale requests can be cancelled before they run.
+        let mut queue: std::collections::VecDeque<Msg> = std::collections::VecDeque::new();
+        let mut cancelled: Vec<Value> = Vec::new();
+        let note = |m: &Msg, cancelled: &mut Vec<Value>| {
+            if let Msg::Rpc(v) = m
+                && v["method"] == "$/cancelRequest"
+            {
+                cancelled.push(v["params"]["id"].clone());
+                if cancelled.len() > 256 {
+                    cancelled.remove(0);
+                }
+            }
+        };
         loop {
-            match rx.recv_timeout(IDLE_FLUSH) {
+            self.tick_progress(&mut out);
+            let wait = if self.building.is_some() { Duration::from_millis(100) } else { IDLE_FLUSH };
+            let next = match queue.pop_front() {
+                Some(m) => Ok(m),
+                None => rx.recv_timeout(wait).inspect(|m| note(m, &mut cancelled)),
+            };
+            if next.is_ok() {
+                for m in rx.try_iter() {
+                    note(&m, &mut cancelled);
+                    queue.push_back(m);
+                }
+            }
+            match next {
                 Ok(Msg::Rpc(v)) => {
-                    self.handle(v, &mut out);
-                    for m in out.drain(..) {
-                        if write_frame(&mut output, &m).is_err() {
-                            return 1;
-                        }
-                    }
-                    if let Some(code) = self.exit_code {
-                        return code;
+                    if let Some(pos) = v.get("id").and_then(|id| cancelled.iter().position(|c| c == id)) {
+                        cancelled.swap_remove(pos);
+                        out.push(error(&v["id"], -32800, "request cancelled"));
+                    } else {
+                        self.handle(v, &mut out);
                     }
                 }
                 Ok(Msg::Fs(p)) => {
@@ -283,10 +323,53 @@ impl Server {
                         self.fs_dirty.insert(p);
                     }
                 }
+                Ok(Msg::Indexed(idx, ms)) => {
+                    self.install_index(*idx, ms);
+                    self.building = None;
+                    if std::mem::take(&mut self.progress_started) {
+                        out.push(json!({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": PROGRESS_TOKEN, "value": {"kind": "end", "message": "done"}}}));
+                    }
+                    // Buffers opened while the build ran.
+                    self.apply_pending();
+                    if let Some(idx) = self.index.as_mut() {
+                        for d in self.docs.values() {
+                            idx.warm(&d.path, &d.text);
+                        }
+                    }
+                }
                 Ok(Msg::Eof) | Err(RecvTimeoutError::Disconnected) => return i32::from(!self.shutdown),
                 Err(RecvTimeoutError::Timeout) => self.apply_pending(),
             }
+            for m in out.drain(..) {
+                if write_frame(&mut output, &m).is_err() {
+                    return 1;
+                }
+            }
+            if let Some(code) = self.exit_code {
+                return code;
+            }
         }
+    }
+
+    /// Publishes build progress (`x/y` in the status bar) at most every 100 ms.
+    fn tick_progress(&mut self, out: &mut Vec<Value>) {
+        let Some(p) = self.building.as_ref().filter(|_| self.progress_started) else { return };
+        let snap = p.snapshot();
+        if snap == self.last_progress.0 || self.last_progress.1.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        self.last_progress = (snap, std::time::Instant::now());
+        out.push(json!({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": PROGRESS_TOKEN, "value": {
+            "kind": "report",
+            "message": format!("{}/{}", snap.0, snap.1),
+            "percentage": if snap.1 > 0 { u64::from(snap.0) * 100 / u64::from(snap.1) } else { 0 },
+        }}}));
+    }
+
+    fn install_index(&mut self, idx: Index, ms: f64) {
+        eprintln!("lightspeed: indexed {} files, {} symbols in {:.0} ms", idx.live_files().count(), idx.db.len(), ms);
+        eprintln!("{}", idx.stats.report(rayon::current_num_threads()));
+        self.index = Some(idx);
     }
 
     /// Returns a user-facing warning when no usable compile database was found.
@@ -327,16 +410,24 @@ impl Server {
             None => CompileDb::default(),
         };
         let t0 = std::time::Instant::now();
-        let idx = Index::build(cdb, IndexConfig::default());
-        eprintln!(
-            "lightspeed: indexed {} files, {} symbols in {:.0} ms",
-            idx.live_files().count(),
-            idx.db.len(),
-            t0.elapsed().as_secs_f64() * 1e3
-        );
-        eprintln!("{}", idx.stats.report(rayon::current_num_threads()));
-        self.index = Some(idx);
-
+        match self.events.clone().filter(|_| self.background) {
+            Some(tx) => {
+                let progress = Arc::new(Progress::default());
+                self.building = Some(progress.clone());
+                let spawned = std::thread::Builder::new().name("lightspeed-index".into()).stack_size(16 << 20).spawn(move || {
+                    let idx = Index::build_with(cdb, IndexConfig::default(), Some(&progress));
+                    let _ = tx.send(Msg::Indexed(Box::new(idx), t0.elapsed().as_secs_f64() * 1e3));
+                });
+                if let Err(e) = spawned {
+                    eprintln!("lightspeed: cannot start indexing thread: {e}");
+                    self.building = None;
+                }
+            }
+            None => {
+                let idx = Index::build(cdb, IndexConfig::default());
+                self.install_index(idx, t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
         if let (Some(root), Some(tx)) = (root, self.events.clone()) {
             use notify::{EventKind, RecursiveMode, Watcher};
             let w = notify::recommended_watcher(move |ev: notify::Result<notify::Event>| {
@@ -410,7 +501,9 @@ impl Server {
                     .or_else(|| {
                         params.pointer("/workspaceFolders/0/uri").and_then(Value::as_str).and_then(uri_to_path)
                     });
-                // Index before replying so the first request never races the build.
+                // Index before replying so the first request never races the build
+                // (unless indexing runs in the background, see `Server::background`).
+                self.progress_ok = params["capabilities"]["window"]["workDoneProgress"].as_bool() == Some(true);
                 let warning = self.start_index(root.as_deref());
                 if let Some(w) = warning {
                     out.push(json!({"jsonrpc": "2.0", "method": "window/showMessage", "params": {"type": 2, "message": w}}));
@@ -438,6 +531,15 @@ impl Server {
                 out.push(respond(&id, Value::Null));
             }
             ("exit", _) => self.exit_code = Some(i32::from(!self.shutdown)),
+            ("initialized", _) => {
+                if self.building.is_some() && self.progress_ok {
+                    self.progress_started = true;
+                    out.push(json!({"jsonrpc": "2.0", "id": PROGRESS_TOKEN, "method": "window/workDoneProgress/create", "params": {"token": PROGRESS_TOKEN}}));
+                    out.push(json!({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": PROGRESS_TOKEN, "value": {
+                        "kind": "begin", "title": "Lightspeed indexing", "message": "starting", "percentage": 0,
+                    }}}));
+                }
+            }
             ("textDocument/didOpen", _) => {
                 let td = &params["textDocument"];
                 if let (Some(uri), Some(text)) = (td["uri"].as_str(), td["text"].as_str())
@@ -718,42 +820,47 @@ impl Server {
         Some(json!({"isIncomplete": truncated, "items": items}))
     }
 
-    fn symbol_info(&self, s: SymbolId) -> Option<Value> {
-        let idx = self.index.as_ref()?;
+    /// `SymbolInformation` for each symbol; files are loaded and line-indexed once per call.
+    fn symbol_infos(&self, ids: impl IntoIterator<Item = SymbolId>) -> Value {
+        let Some(idx) = self.index.as_ref() else { return Value::Array(Vec::new()) };
         let overlay = Overlay(&self.docs);
-        let loc = Query::new(idx, &overlay).location(s)?;
-        let sym = idx.db.symbol(s);
-        let container = sym.parent.map(|p| idx.db.qualified_name(p)).unwrap_or_default();
-        Some(json!({
-            "name": idx.db.name(s),
-            "kind": lsp_symbol_kind(sym.kind),
-            "containerName": container,
-            "location": self.locations_json(&[loc]).get(0).cloned()?,
-        }))
+        let q = Query::new(idx, &overlay);
+        let mut cache: HashMap<u32, Option<(Text, LineIndex, Value)>> = HashMap::new();
+        let mut arr = Vec::new();
+        for s in ids {
+            let Some(loc) = q.location(s) else { continue };
+            let entry = cache.entry(loc.file).or_insert_with(|| {
+                let path = &idx.files[loc.file as usize].path;
+                let t = self.text_of(path)?;
+                let li = LineIndex::new(t.as_str());
+                Some((t, li, Value::String(path_to_uri(path))))
+            });
+            let Some((t, li, uri)) = entry else { continue };
+            let sym = idx.db.symbol(s);
+            let container = sym.parent.map(|p| idx.db.qualified_name(p)).unwrap_or_default();
+            arr.push(json!({
+                "name": idx.db.name(s),
+                "kind": lsp_symbol_kind(sym.kind),
+                "containerName": container,
+                "location": {"uri": uri, "range": Self::range_json(t.as_str(), li, (loc.start, loc.end))},
+            }));
+        }
+        Value::Array(arr)
     }
 
     fn document_symbols(&self, params: &Value) -> Option<Value> {
         let path = uri_to_path(params["textDocument"]["uri"].as_str()?)?;
         let idx = self.index.as_ref()?;
         let fi = idx.file_index(&path)?;
-        Some(Value::Array(idx.file_symbols(fi).filter_map(|s| self.symbol_info(s)).collect()))
+        Some(self.symbol_infos(idx.file_symbols(fi)))
     }
 
     fn workspace_symbols(&self, params: &Value) -> Option<Value> {
-        let q = params["query"].as_str()?.to_ascii_lowercase();
+        let q = params["query"].as_str()?;
         let idx = self.index.as_ref()?;
-        let mut hits: Vec<(bool, SymbolId)> = Vec::new();
-        for (n, s) in idx.db.names.iter() {
-            let l = s.to_ascii_lowercase();
-            if !l.contains(&q) {
-                continue;
-            }
-            let prefix = l.starts_with(&q);
-            hits.extend(idx.db.lookup_id(n).iter().map(|&id| (!prefix, id)));
-        }
-        hits.sort_unstable();
-        hits.truncate(WORKSPACE_SYMBOL_LIMIT);
-        Some(Value::Array(hits.into_iter().filter_map(|(_, s)| self.symbol_info(s)).collect()))
+        let overlay = Overlay(&self.docs);
+        let hits = Query::new(idx, &overlay).search_symbols(q, WORKSPACE_SYMBOL_LIMIT);
+        Some(self.symbol_infos(hits))
     }
 }
 
@@ -761,4 +868,44 @@ impl Server {
 pub fn serve_stdio(cdb: Option<PathBuf>) -> i32 {
     let stdin = std::io::BufReader::new(std::io::stdin());
     Server::new(cdb).run(stdin, std::io::stdout().lock())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_indexing_reports_progress_and_delivers_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().replace('\\', "/");
+        std::fs::write(format!("{root}/a.cpp"), "struct A {};\n").unwrap();
+        std::fs::write(
+            format!("{root}/compile_commands.json"),
+            serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+        )
+        .unwrap();
+        let (tx, rx) = channel();
+        let mut s = Server::new(None);
+        s.background = true;
+        s.events = Some(tx);
+        let mut out = Vec::new();
+        let params = json!({"rootUri": path_to_uri(&root), "capabilities": {"window": {"workDoneProgress": true}}});
+        s.handle(json!({"id": 1, "method": "initialize", "params": params}), &mut out);
+        assert!(s.index().is_none() && s.building.is_some());
+        out.clear();
+        s.handle(json!({"method": "initialized", "params": {}}), &mut out);
+        assert_eq!(out[0]["method"], "window/workDoneProgress/create");
+        assert_eq!(out[1]["params"]["value"]["kind"], "begin");
+        loop {
+            match rx.recv_timeout(Duration::from_secs(30)).unwrap() {
+                Msg::Indexed(idx, _) => {
+                    assert!(idx.live_files().count() >= 1);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        let (done, total) = s.building.as_ref().unwrap().snapshot();
+        assert!(done >= 1 && done <= total, "{done}/{total}");
+    }
 }

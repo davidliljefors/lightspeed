@@ -25,6 +25,21 @@ use crate::symbols::{SymbolDb, SymbolId};
 
 static DISK: DiskFs = DiskFs;
 
+/// Live indexing progress, readable from another thread while [`Index::build_with`] runs.
+/// `total` grows as `#include`d headers are discovered.
+#[derive(Debug, Default)]
+pub struct Progress {
+    pub done: std::sync::atomic::AtomicU32,
+    pub total: std::sync::atomic::AtomicU32,
+}
+
+impl Progress {
+    pub fn snapshot(&self) -> (u32, u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.done.load(Relaxed), self.total.load(Relaxed))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct IndexConfig {
     /// Parse headers reached through `#include` (standalone, with the flags
@@ -138,9 +153,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn new() -> Self {
+    fn new(shared: &std::sync::Arc<crate::pp::SharedHeaders>) -> Self {
+        let mut pp = Preprocessor::new(&DISK, PpConfig::default());
+        pp.set_shared(shared.clone());
         Self {
-            pp: Preprocessor::new(&DISK, PpConfig::default()),
+            pp,
             out: PpOutput::default(),
             pres: ParseOutput::default(),
             toks: Vec::new(),
@@ -210,6 +227,7 @@ pub struct Index {
     cfg: IndexConfig,
     by_path: HashMap<u64, u32, FxBuildHasher>,
     worker: Worker,
+    shared: std::sync::Arc<crate::pp::SharedHeaders>,
     dirty: bool,
     dead_symbols: usize,
     /// Files that could not be read during the last build.
@@ -224,9 +242,11 @@ impl Index {
         let mut db = SymbolDb::new();
         let hier = Hierarchy::build(&mut db);
         let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let mut worker = Worker::new();
+        let shared = std::sync::Arc::new(crate::pp::SharedHeaders::default());
+        let mut worker = Worker::new(&shared);
         worker.pp.set_snapshotting(true);
         Self {
+            shared,
             db,
             hier,
             files: Vec::new(),
@@ -244,6 +264,12 @@ impl Index {
 
     /// Indexes every compile entry and the headers they include, in parallel.
     pub fn build(cdb: CompileDb, cfg: IndexConfig) -> Self {
+        Self::build_with(cdb, cfg, None)
+    }
+
+    /// [`Self::build`] that publishes how many files are done out of those known so far.
+    pub fn build_with(cdb: CompileDb, cfg: IndexConfig, progress: Option<&Progress>) -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut idx = Self::empty(cdb, cfg);
         let mut jobs: Vec<Job> = Vec::with_capacity(idx.cdb.entries.len());
         let mut seen: hashbrown::HashSet<u64, FxBuildHasher> = Default::default();
@@ -254,9 +280,12 @@ impl Index {
                 jobs.push(Job { path: p, flag_entry: Some(i as u32), is_tu: true });
             }
         }
+        if let Some(p) = progress {
+            p.total.store(jobs.len() as u32, Relaxed);
+        }
         while !jobs.is_empty() {
             let t = std::time::Instant::now();
-            let results = idx.analyze_jobs(&jobs);
+            let results = idx.analyze_jobs(&jobs, progress);
             idx.stats.parallel_wall_ms += t.elapsed().as_secs_f64() * 1e3;
             idx.stats.waves += 1;
             let t = std::time::Instant::now();
@@ -279,6 +308,9 @@ impl Index {
                     for h in inc {
                         if seen.insert(path_key(&h)) {
                             next.push(Job { path: h, flag_entry: job.flag_entry, is_tu: false });
+                            if let Some(p) = progress {
+                                p.total.fetch_add(1, Relaxed);
+                            }
                         }
                     }
                 }
@@ -294,7 +326,7 @@ impl Index {
         idx
     }
 
-    fn analyze_jobs(&self, jobs: &[Job]) -> Vec<Option<Analysis>> {
+    fn analyze_jobs(&self, jobs: &[Job], progress: Option<&Progress>) -> Vec<Option<Analysis>> {
         use std::cell::RefCell;
         // One long-lived worker per pool thread (rayon's `map_init` would create
         // one per work split and throw the header caches away). A new build
@@ -303,25 +335,31 @@ impl Index {
             static WORKER: RefCell<Option<(u64, Worker)>> = const { RefCell::new(None) };
         }
         let generation = self.generation;
+        let shared = &self.shared;
         let cdb = &self.cdb;
         jobs.par_iter()
             .map(|j| {
-                let t = std::time::Instant::now();
-                let src = SourceFile::load(&j.path).ok()?;
-                let load = t.elapsed().as_micros() as u32;
-                let (flags, hash) = flags_of(cdb, j.flag_entry);
-                WORKER.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    let (g, w) = slot.get_or_insert_with(|| (generation, Worker::new()));
-                    if *g != generation {
-                        w.pp.clear_caches();
-                        w.last_flags = None;
-                        *g = generation;
-                    }
-                    let mut a = w.analyze(&j.path, src.text(), flags, hash);
-                    a.times[0] = load;
-                    Some(a)
-                })
+                let r = (|| {
+                    let t = std::time::Instant::now();
+                    let src = SourceFile::load(&j.path).ok()?;
+                    let load = t.elapsed().as_micros() as u32;
+                    let (flags, hash) = flags_of(cdb, j.flag_entry);
+                    WORKER.with(|cell| {
+                        let mut slot = cell.borrow_mut();
+                        let (g, w) = slot.get_or_insert_with(|| (generation, Worker::new(shared)));
+                        if *g != generation {
+                            *w = Worker::new(shared);
+                            *g = generation;
+                        }
+                        let mut a = w.analyze(&j.path, src.text(), flags, hash);
+                        a.times[0] = load;
+                        Some(a)
+                    })
+                })();
+                if let Some(p) = progress {
+                    p.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                r
             })
             .collect()
     }
@@ -406,6 +444,7 @@ impl Index {
         let mut pending: Vec<(String, Option<u32>)> = vec![(root, None)];
         let mut first = true;
         while let Some((p, inherited)) = pending.pop() {
+            crate::pp::vfs::invalidate_dir_of(&p);
             let loaded;
             let src = match text.filter(|_| first) {
                 Some(t) => t,
