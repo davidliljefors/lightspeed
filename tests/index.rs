@@ -381,6 +381,73 @@ fn alias_targets_resolve_in_their_enclosing_scope() {
 }
 
 #[test]
+fn auto_from_container_method_returns_substituted_element() {
+    let ev = "#pragma once\nnamespace eastl {\n template<class T> struct allocator {};\n\
+        template<class T, class Alloc = allocator<T>> class vector {\n public:\n typedef T value_type;\n typedef T* pointer;\n typedef value_type& reference;\n typedef const value_type& const_reference;\n\
+         reference push_back();\n void push_back(const value_type& v);\n void push_back(value_type&& v);\n reference emplace_back();\n\
+         reference pushBack();\n T& popBack();\n reference at(unsigned i);\n};\n}\n";
+    let main = "#include \"ev.h\"\nstruct SomeClass { void memberFunction(); };\nstruct Other { void memberFunction(); };\n\
+        void f(eastl::vector<SomeClass>& vector, eastl::vector<SomeClass> v2) {\n\
+         auto x = vector.pushBack();\n x.memberFunction();\n\
+         auto& y = v2.push_back();\n y.memberFunction();\n\
+         auto z = vector.emplace_back();\n z.memberFunction();\n\
+         auto w = v2.popBack();\n w.memberFunction();\n\
+         auto a = vector.at(0);\n a.memberFunction();\n}\n";
+    let ws = Ws::new(&[("ev.h", ev), ("a.cpp", main)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    for v in ["x", "y", "z", "w", "a"] {
+        let stmt = format!("{v}.memberFunction");
+        let off = (main.find(&stmt).unwrap() + 3) as u32;
+        assert_eq!(names(&idx, &q.definition(&p, main, off)), ["SomeClass::memberFunction"], "{v}");
+    }
+}
+
+#[test]
+fn auto_from_container_variants() {
+    let ev = "#pragma once\nnamespace eastl {\n template<class T> struct allocator {};\n\
+        template<class T, class Alloc = allocator<T>> class vector {\n public:\n typedef T value_type;\n typedef value_type& reference;\n typedef T* iterator;\n\
+         reference pushBack();\n iterator begin();\n T& front();\n};\n\
+        template<class T, unsigned N, bool O = true, class A = allocator<T>> class fixed_vector : public vector<T, A> {\n public:\n};\n\
+        template<class T> using small_vec = vector<T>;\n}\n";
+    let main = "#include \"ev.h\"\nnamespace game { struct SomeClass { void memberFunction(); }; }\nstruct Other { void memberFunction(); };\n\
+        using namespace game;\nusing Vec = eastl::vector<game::SomeClass>;\ntypedef eastl::vector<SomeClass> Vec2;\n\
+        struct Holder { eastl::vector<SomeClass> items; Vec alias; eastl::fixed_vector<SomeClass, 8> fixed; eastl::small_vec<SomeClass> sv; void run(); };\n\
+        void Holder::run() {\n\
+         auto m1 = items.pushBack();\n m1.memberFunction();\n\
+         auto m2 = this->items.pushBack();\n m2.memberFunction();\n\
+         auto m3 = alias.pushBack();\n m3.memberFunction();\n\
+         auto m4 = fixed.pushBack();\n m4.memberFunction();\n\
+         auto m5 = sv.pushBack();\n m5.memberFunction();\n\
+         auto m6 = items.begin();\n m6->memberFunction();\n\
+         auto m7 = items.front();\n m7.memberFunction();\n\
+         auto& m8 = items.front();\n m8.memberFunction();\n\
+         const auto& m9 = items.pushBack();\n m9.memberFunction();\n}\n\
+        void g(Vec2& v, eastl::vector<game::SomeClass>* p, const Vec& cv) {\n\
+         auto n1 = v.pushBack();\n n1.memberFunction();\n\
+         auto n2 = p->pushBack();\n n2.memberFunction();\n\
+         auto n3 = cv.pushBack();\n n3.memberFunction();\n\
+         eastl::vector<SomeClass> loc;\n auto n4 = loc.pushBack();\n n4.memberFunction();\n\
+         auto n5 = eastl::vector<SomeClass>().pushBack();\n n5.memberFunction();\n}\n";
+    let ws = Ws::new(&[("ev.h", ev), ("a.cpp", main)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let mut bad = vec![];
+    for v in ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "n1", "n2", "n3", "n4", "n5"] {
+        let stmt = format!("{v}.memberFunction");
+        let stmt2 = format!("{v}->memberFunction");
+        let at = main.find(&stmt).or_else(|| main.find(&stmt2)).unwrap();
+        let got = names(&idx, &q.definition(&p, main, (at + 4) as u32));
+        if got != ["game::SomeClass::memberFunction"] {
+            bad.push(format!("{v}: {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+#[test]
 fn alias_cycles_with_many_same_named_aliases_terminate() {
     let mut src = String::new();
     for i in 0..300 {

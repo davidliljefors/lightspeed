@@ -346,9 +346,33 @@ impl Query<'_> {
 
     /// Member `name` (usually an `operator…`) of the class `ty` names, or its bases.
     fn operator_ty(&self, cx: &Cx, ty: &Ty, name: &str) -> Option<Ty> {
+        let ty = &self.expand_alias(cx, ty.clone());
         let mut owners = self.resolve_records(self.idx.db.lookup(&ty.head).iter().copied());
         self.choose_specialization(&mut owners, (!ty.args.is_empty()).then_some(&ty.args[..]));
         self.member_ty(cx, &owners, name, Some(ty))
+    }
+
+    /// Replaces an alias used as a type (`using Vec = eastl::vector<Foo>;`,
+    /// `typedef ... Vec2;`) by what it spells, so its template arguments survive.
+    fn expand_alias(&self, cx: &Cx, mut ty: Ty) -> Ty {
+        let db = &self.idx.db;
+        for _ in 0..4 {
+            if !ty.args.is_empty() {
+                break;
+            }
+            let cands = db.lookup(&ty.head);
+            if cands.iter().any(|&c| db.symbol(c).kind.is_record()) {
+                break;
+            }
+            let aliases = cands.iter().copied().filter(|&c| db.symbol(c).kind == SymbolKind::TypeAlias);
+            let preferred = aliases.clone().find(|c| db.symbol(*c).parent.is_some_and(|p| cx.scopes.contains(&p)));
+            let next = preferred.into_iter().chain(aliases.take(8)).find_map(|a| self.alias_full_ty(cx, a).filter(|t| t.head != ty.head));
+            match next {
+                Some(t) => ty = t,
+                None => break,
+            }
+        }
+        ty
     }
 
     /// The type reached through `->`.
@@ -369,6 +393,7 @@ impl Query<'_> {
 
     /// Element type when iterating over a value of type `ty` in a range-for.
     fn element_ty(&self, cx: &Cx, ty: Ty) -> Option<Ty> {
+        let ty = self.expand_alias(cx, ty);
         if ty.head.contains("map") && ty.args.len() >= 2 {
             return container_alias("value_type", &ty);
         }
@@ -399,6 +424,7 @@ impl Query<'_> {
 
     /// Type of the `n`th name in `auto [a, b, ...] = <value of type ty>`.
     fn binding_ty(&self, cx: &Cx, ty: &Ty, n: usize) -> Option<Ty> {
+        let ty = &self.expand_alias(cx, ty.clone());
         if matches!(ty.head.as_str(), "pair" | "tuple") {
             return ty.args.get(n).and_then(|a| parse_ty(a));
         }
@@ -476,7 +502,7 @@ impl Query<'_> {
         }
         let db = &self.idx.db;
         if !self.resolve_records(db.lookup(name).iter().copied()).is_empty() {
-            return Some(Ty::plain(name));
+            return Some(Ty { head: name.to_owned(), args: targs.to_vec() });
         }
         let (in_scope, in_bases) = self.scope_set(cx.scopes);
         let local = in_scope.into_iter().chain(in_bases).flat_map(|o| db.children(o).iter().copied());
@@ -492,23 +518,51 @@ impl Query<'_> {
     /// parameters in the member's type are replaced by its arguments.
     fn member_ty(&self, cx: &Cx, owners: &[SymbolId], name: &str, recv: Option<&Ty>) -> Option<Ty> {
         let db = &self.idx.db;
-        let mut chain = Vec::new();
-        for &o in owners {
-            chain.push(o);
-            self.idx.hier.all_bases(o, &mut chain);
-        }
-        chain
-            .iter()
-            .flat_map(|&o| db.children(o).iter().copied())
-            .filter(|&m| db.name(m) == name && matches!(db.symbol(m).kind, SymbolKind::Field | SymbolKind::Variable | SymbolKind::Function | SymbolKind::Method))
-            .find_map(|m| {
-                let ty = self.decl_ty(cx, m)?;
-                // Only the receiver's own members map onto its arguments, not those of bases.
-                match (recv, db.symbol(m).parent) {
-                    (Some(r), Some(p)) if owners.contains(&p) => Some(self.instantiate(cx, ty, p, r)),
-                    _ => Some(ty),
+        // Each class to search with the type its template parameters are bound by
+        // (bases get theirs from the arguments written in the derived class's base list).
+        let mut chain: Vec<(SymbolId, Option<Ty>)> = owners.iter().map(|&o| (o, recv.cloned())).collect();
+        let mut i = 0;
+        while i < chain.len() && chain.len() < 64 {
+            let (o, r) = chain[i].clone();
+            for &b in self.idx.hier.bases(o) {
+                if !chain.iter().any(|(c, _)| *c == b) {
+                    let bty = r.as_ref().and_then(|r| self.base_ty(cx, o, r, b));
+                    chain.push((b, bty));
                 }
-            })
+            }
+            i += 1;
+        }
+        chain.iter().find_map(|(o, r)| {
+            db.children(*o)
+                .iter()
+                .copied()
+                .filter(|&m| db.name(m) == name && matches!(db.symbol(m).kind, SymbolKind::Field | SymbolKind::Variable | SymbolKind::Function | SymbolKind::Method))
+                .find_map(|m| {
+                    let ty = self.decl_ty(cx, m)?;
+                    Some(match r {
+                        Some(r) => self.instantiate(cx, ty, *o, r),
+                        None => ty,
+                    })
+                })
+        })
+    }
+
+    /// `base` as written in the base list of `derived` (`: public vector<T, A>`),
+    /// with `derived`'s template parameters replaced from `recv`.
+    fn base_ty(&self, cx: &Cx, derived: SymbolId, recv: &Ty, base: SymbolId) -> Option<Ty> {
+        let db = &self.idx.db;
+        let s = db.symbol(derived);
+        let bname = db.name(base);
+        let written = self.source_of(cx, s, |src| {
+            let head = src.get(s.name_offset as usize..(s.name_offset as usize + 600).min(s.extent_end as usize).min(src.len()))?;
+            let toks = sig_tokens(head);
+            let colon = toks.iter().position(|t| t.kind == K::Colon)?;
+            let end = toks.iter().position(|t| t.kind == K::LBrace).unwrap_or(toks.len());
+            let i = (colon..end).find(|&i| toks[i].kind == K::Ident && toks[i].text(head) == bname && toks.get(i + 1).is_some_and(|t| t.kind == K::Lt))?;
+            let close = matching_fwd(&toks, i + 1)?;
+            Some(split_args(&toks[i + 2..close], head))
+        })?;
+        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written }, derived, recv))
     }
 
     /// `ty`, written inside template `owner`, as seen from `recv = owner<args>`.
