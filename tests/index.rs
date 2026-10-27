@@ -74,7 +74,13 @@ fn observable(idx: &Index) -> Vec<String> {
         let canon = label(idx.hier.canonical(id));
         let fam = sorted(idx.hier.family_members(&idx.db, id));
         let defs = sorted(idx.hier.out_of_line_defs(id));
-        out.push(format!("{} {:?} | named [{same_name}] | children [{children}] | canonical {canon} | family [{fam}] | defs [{defs}] | {}", label(id), s.kind, s.family.is_some()));
+        let (mut ab, mut ad) = (Vec::new(), Vec::new());
+        idx.hier.all_bases(id, &mut ab);
+        idx.hier.all_derived(id, &mut ad);
+        let bases = sorted(idx.hier.bases(id));
+        let derived = sorted(idx.hier.derived(id));
+        let (ab, ad) = (sorted(&ab), sorted(&ad));
+        out.push(format!("{} {:?} | named [{same_name}] | children [{children}] | canonical {canon} | family [{fam}] | defs [{defs}] | bases [{bases}] derived [{derived}] all [{ab}] [{ad}] | {}", label(id), s.kind, s.family.is_some()));
     }
     out.sort();
     out
@@ -659,9 +665,10 @@ fn update_replaces_file_symbols_and_removes_stale_ones() {
 
 #[test]
 fn offset_only_edits_patch_in_place_but_real_changes_do_not() {
+    let pad: String = (0..300).map(|i| format!("int pad{i};\n")).collect();
     let base = "struct B { virtual void f(int); };\nstruct D : B { void f(int) override; int v; };\nvoid g(int a) { }\n";
-    let ws = Ws::new(&[("a.cpp", base)], &[]);
-    let mut idx = ws.index(&["a.cpp"]);
+    let ws = Ws::new(&[("a.cpp", base), ("pad.cpp", &pad)], &[]);
+    let mut idx = ws.index(&["a.cpp", "pad.cpp"]);
     let a = ws.path("a.cpp");
 
     // Moving declarations only: patched, still clean, offsets follow.
@@ -670,7 +677,7 @@ fn offset_only_edits_patch_in_place_but_real_changes_do_not() {
     let g = idx.db.lookup("g")[0];
     assert_eq!(idx.db.symbol(g).name_offset as usize, format!("// pad\n\n{base}").find("g(int").unwrap());
 
-    // Each of these changes the shape and must go through the full path.
+    // Each of these changes the shape, and is still patched in place.
     let changes = [
         ("struct B { virtual void f(int); };\nstruct D : B { void f(int) override; int v; };\nvoid g(int a, int b) { }\n", "arity"),
         ("struct B { virtual void f(int); };\nstruct D { void f(int) override; int v; };\nvoid g(int a) { }\n", "base removed"),
@@ -678,14 +685,61 @@ fn offset_only_edits_patch_in_place_but_real_changes_do_not() {
         ("struct B { void f(int); };\nstruct D : B { void f(int) override; int v; };\nvoid g(int a) { }\n", "virtual flag"),
         ("struct B { virtual void f(int); };\nstruct D : B { void f(int) override; };\nint v; void g(int a) { }\n", "moved out of struct"),
         ("struct B { virtual void f(long); };\nstruct D : B { void f(int) override; int v; };\nvoid g(int a) { }\n", "param type"),
+        ("struct B { virtual void f(int); };\nstruct C : B { void f(int); };\nstruct D : C { void f(int) override; int v; };\nvoid g(int a) { }\n", "class inserted"),
+        ("struct D : B { void f(int) override; int v; };\nvoid g(int a) { }\n", "base removed entirely"),
+        ("struct B { virtual void f(int); virtual ~B(); };\nstruct D : B { void f(int) override; ~D(); };\nvoid B::f(int) {}\nvoid D::f(int) {}\nB::~B() {}\n", "dtors and defs"),
     ];
     for (src, what) in changes {
-        let mut idx = ws.index(&["a.cpp"]);
+        let mut idx = ws.index(&["a.cpp", "pad.cpp"]);
         idx.update(&a, Some(src));
-        assert!(idx.is_dirty(), "{what}: was patched in place");
-        idx.flush();
-        let fresh = Ws::new(&[("a.cpp", src)], &[]).index(&["a.cpp"]);
-        assert_eq!(idx.db.len() - idx.db.dead_count(), fresh.db.len(), "{what}");
+        assert!(!idx.is_dirty(), "{what}: fell back to a full rebuild");
+        let fresh = Ws::new(&[("a.cpp", src), ("pad.cpp", &pad)], &[]).index(&["a.cpp", "pad.cpp"]);
+        assert_eq!(observable(&idx), observable(&fresh), "{what}");
+    }
+}
+
+#[test]
+fn header_edits_patch_class_hierarchy_across_files() {
+    let pad: String = (0..300).map(|i| format!("int pad{i};\n")).collect();
+    let base = "#pragma once\n".to_string();
+    let h = |body: &str| format!("{base}{body}");
+    let v0 = "struct A { virtual void f(); virtual void g(int); };\nstruct B : A { void f() override; };\n";
+    let ws = Ws::new(
+        &[
+            ("pad.h", &format!("#pragma once\n{pad}")),
+            ("h.h", &h(v0)),
+            ("d.h", "#pragma once\n#include \"h.h\"\nstruct C : B { void f() override; void g(int) override; };\nstruct E : A { void g(int) override; };\n"),
+            ("a.cpp", "#include \"pad.h\"\n#include \"d.h\"\nvoid A::f() {}\nvoid B::f() {}\nvoid C::f() {}\nvoid E::g(int) {}\n"),
+        ],
+        &[],
+    );
+    let mut idx = ws.index(&["a.cpp"]);
+    let p = ws.path("h.h");
+    let edits = [
+        "struct A { virtual void f(); virtual void g(int); virtual void h(); };\nstruct B : A { void f() override; };\n",
+        "struct A { virtual void f(); void g(int); };\nstruct B : A { void f() override; };\n",
+        "struct A { virtual void f(); virtual void g(int); };\nstruct B { void f() override; };\n",
+        "struct A { virtual void f(); virtual void g(int); };\nstruct B : A { void f() override; };\nstruct B2 : B {};\n",
+        "struct A2 { virtual void f(); };\nstruct A : A2 { void f() override; virtual void g(int); };\nstruct B : A { void f() override; };\n",
+        "struct B : A { void f() override; };\n",
+        v0,
+    ];
+    for (i, body) in edits.iter().enumerate() {
+        idx.update(&p, Some(&h(body)));
+        assert!(!idx.is_dirty(), "edit {i} fell back to a full rebuild");
+        let fresh_ws = Ws::new(
+            &[
+                ("pad.h", &format!("#pragma once\n{pad}")),
+                ("h.h", &h(body)),
+                ("d.h", "#pragma once\n#include \"h.h\"\nstruct C : B { void f() override; void g(int) override; };\nstruct E : A { void g(int) override; };\n"),
+                ("a.cpp", "#include \"pad.h\"\n#include \"d.h\"\nvoid A::f() {}\nvoid B::f() {}\nvoid C::f() {}\nvoid E::g(int) {}\n"),
+            ],
+            &[],
+        );
+        let fresh = fresh_ws.index(&["a.cpp"]);
+        let (l, r) = (observable(&idx), observable(&fresh));
+        let diff = |a: &[String], b: &[String]| a.iter().filter(|x| !b.contains(x)).cloned().collect::<Vec<_>>();
+        assert!(l == r, "edit {i}\nincremental only: {:#?}\nfresh only: {:#?}", diff(&l, &r), diff(&r, &l));
     }
 }
 

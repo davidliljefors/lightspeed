@@ -758,7 +758,8 @@ impl Index {
             return false;
         }
         self.db.patch_indexes(old.clone(), new.clone());
-        self.hier.patch(&mut self.db, old, new)
+        self.hier.patch(&mut self.db, old, new);
+        true
     }
 
     fn kill(&mut self, slot: usize) {
