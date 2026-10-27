@@ -637,7 +637,11 @@ impl Index {
         };
         if cfg.background_save {
             self.saver = Some(std::thread::spawn(move || {
-                let _ = store::save(job);
+                let t = std::time::Instant::now();
+                match store::save(job) {
+                    Ok(b) => eprintln!("lightspeed: cache saved, {} in {:.0} ms", crate::mem::mib(b as usize), t.elapsed().as_secs_f64() * 1e3),
+                    Err(e) => eprintln!("lightspeed: cache save failed: {e}"),
+                }
             }));
         } else {
             let t = std::time::Instant::now();
