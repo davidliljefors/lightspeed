@@ -869,7 +869,7 @@ impl Index {
                     (entry, self.cdb.get(&p).is_some())
                 }
             };
-            self.worker.pp.invalidate_file(path_key(&p));
+            self.worker.pp.invalidate_path(&p);
             let (flags, hash) = flags_of(&self.cdb, flag_entry);
             let a = self.worker.analyze(&p, src, flags, hash, None);
             let inc = self.absorb(&p, flag_entry, is_tu, a);

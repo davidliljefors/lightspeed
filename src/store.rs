@@ -54,7 +54,7 @@ use rustc_hash::FxBuildHasher;
 
 use crate::cache::{DecodeError, ShardKey, decode_shard, encode_shard};
 use crate::hash::{FieldHasher, hash_bytes};
-use crate::pp::vfs::{list_dir_keys, seed_dir};
+use crate::pp::vfs::{list_dir_entries, seed_dir};
 use crate::scope_decls::ScopeDecls;
 use crate::source::SourceFile;
 use crate::symbols::SymbolDb;
@@ -419,9 +419,14 @@ impl Snapshot {
         let dir_dirty: Vec<Vec<u64>> = dirs
             .par_iter()
             .map(|d| {
-                let now = list_dir_keys(d.path);
+                let ents = list_dir_entries(d.path);
+                let now: Vec<u64> = ents.iter().map(|e| e.0).collect();
                 seed_dir(d.path, &now);
-                sym_diff(d.keys, &now)
+                let mut changed = sym_diff(d.keys, &now);
+                // A file that appeared also dirties every record that missed an include of that name.
+                let names: Vec<u64> = changed.iter().filter_map(|k| ents.binary_search_by_key(k, |e| e.0).ok().map(|i| ents[i].1)).collect();
+                changed.extend(names);
+                changed
             })
             .collect();
         // Contents: hash everything that was read.

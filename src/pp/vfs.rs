@@ -63,6 +63,21 @@ pub fn list_dir_keys(dir: &str) -> Vec<u64> {
     dir_cache::list(dir).sorted_keys()
 }
 
+/// What a missed `#include` candidate records as its dependency: the file name
+/// alone, so one entry covers the candidate in every search directory. A file of
+/// that name appearing anywhere later invalidates it (never wrongly the reverse).
+pub fn name_key(path: &str) -> u64 {
+    path_key(path.rsplit('/').next().unwrap_or(path)) ^ 0x6e61_6d65_6b65_7931
+}
+
+/// Lists `dir` from disk now: `(path_key, name_key)` of its files, sorted by `path_key`.
+pub fn list_dir_entries(dir: &str) -> Vec<(u64, u64)> {
+    let mut v = Vec::new();
+    dir_cache::each_file(dir, |full| v.push((path_key(full), name_key(full))));
+    v.sort_unstable();
+    v
+}
+
 /// Replaces the cached listing of `dir` with `keys` (a fresh [`list_dir_keys`]).
 pub fn seed_dir(dir: &str, keys: &[u64]) {
     dir_cache::seed(dir, keys);
@@ -125,14 +140,14 @@ mod dir_cache {
         }
     }
 
-    pub fn list(dir: &str) -> Dir {
-        let mut out = Dir { path: dir.to_owned(), keys: HashSet::default() };
+    /// Calls `f` with the full path of every file in `dir`.
+    pub fn each_file(dir: &str, mut f: impl FnMut(&str)) {
         let p = match dir {
             "" => "/".to_owned(),
             d if d.ends_with(':') => format!("{d}/"),
             d => d.to_owned(),
         };
-        let Ok(rd) = std::fs::read_dir(&p) else { return out };
+        let Ok(rd) = std::fs::read_dir(&p) else { return };
         let mut full = String::with_capacity(dir.len() + 64);
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
@@ -142,9 +157,16 @@ mod dir_cache {
                 full.push_str(dir);
                 full.push('/');
                 full.push_str(n);
-                out.keys.insert(path_key(&full));
+                f(&full);
             }
         }
+    }
+
+    pub fn list(dir: &str) -> Dir {
+        let mut out = Dir { path: dir.to_owned(), keys: HashSet::default() };
+        each_file(dir, |full| {
+            out.keys.insert(path_key(full));
+        });
         out
     }
 

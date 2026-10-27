@@ -952,6 +952,14 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         }
     }
 
+    /// [`Self::invalidate_file`] for a path, also dropping state that only
+    /// depended on a file of that name being absent.
+    pub fn invalidate_path(&mut self, path: &str) {
+        let name = vfs::name_key(path);
+        self.snapshots.retain(|_, s| !s.deps.contains(&name));
+        self.invalidate_file(path_key(path));
+    }
+
     /// Forgets everything cached about the file with `key` (after it changed
     /// on disk). Resolutions are dropped wholesale because a created or
     /// deleted file can change any include search.
@@ -981,8 +989,10 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Every candidate probed is recorded as a dependency.
     fn probe(&mut self) -> bool {
         let key = path_key(&self.path_buf);
-        self.probes.push(key);
-        self.fs.exists_keyed(&self.path_buf, key)
+        let hit = self.fs.exists_keyed(&self.path_buf, key);
+        // A hit depends on that exact file; a miss only on a file of that name appearing.
+        self.probes.push(if hit { key } else { vfs::name_key(&self.path_buf) });
+        hit
     }
     pub(super) fn resolve(&mut self, name: &str, quote: bool, next: bool) -> Option<Resolved> {
         let d = self.file_depth;

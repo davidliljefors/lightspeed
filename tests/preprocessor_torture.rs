@@ -634,11 +634,16 @@ fn deps_record_hits_misses_and_cached_resolutions() {
         }
         assert_eq!(out.deps, first, "cached resolution must report the same deps");
         assert!(out.deps.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
-        for p in [MAIN, "/t/a.h", "/t/b.h", "/t/u/b.h", "/t/nope.h", "/t/u/nope.h", "/t/maybe.h", "/t/pre.h"] {
+        // Hits depend on the exact file, misses on a file of that name appearing.
+        for p in [MAIN, "/t/a.h", "/t/u/b.h", "/t/pre.h"] {
             assert!(out.deps.contains(&key(p)), "missing dep {p}");
+        }
+        for p in ["/t/b.h", "/t/nope.h", "/t/u/nope.h", "/t/maybe.h"] {
+            assert!(out.deps.contains(&lightspeed::pp::vfs::name_key(p)), "missing name dep {p}");
         }
         // Probing stops at the first hit.
         assert!(!out.deps.contains(&key("/t/u/a.h")));
+        assert!(!out.deps.contains(&key("/t/nope.h")), "misses are not recorded per directory");
     }
 }
 
@@ -663,6 +668,11 @@ fn depgraph_invalidates_on_modify_delete_and_create() {
     let q = |p: &str| {
         let mut v = Vec::new();
         g.dependents(key(p), &mut v);
+        let mut w = Vec::new();
+        g.dependents(lightspeed::pp::vfs::name_key(p), &mut w);
+        v.extend(w);
+        v.sort_unstable();
+        v.dedup();
         v
     };
     assert_eq!(q("/t/shared.h"), [0, 1]);
