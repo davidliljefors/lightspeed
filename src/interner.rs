@@ -36,6 +36,11 @@ impl<I: Idx> Interner<I> {
         Self::default()
     }
 
+    /// Approximate heap bytes: arena, offsets and hash table.
+    pub fn heap_bytes(&self) -> usize {
+        self.arena.capacity() + self.ends.capacity() * 4 + self.table.capacity() * (std::mem::size_of::<I>() + 1)
+    }
+
     pub fn with_capacity(strings: usize, bytes: usize) -> Self {
         Self {
             arena: String::with_capacity(bytes),

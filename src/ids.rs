@@ -77,6 +77,10 @@ impl<I: Idx, T> IndexVec<I, T> {
         Self::default()
     }
 
+    pub fn heap_bytes(&self) -> usize {
+        self.raw.capacity() * std::mem::size_of::<T>()
+    }
+
     pub fn with_capacity(cap: usize) -> Self {
         Self { raw: Vec::with_capacity(cap), _marker: PhantomData }
     }

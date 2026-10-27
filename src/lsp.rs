@@ -369,6 +369,7 @@ impl Server {
     fn install_index(&mut self, idx: Index, ms: f64) {
         eprintln!("lightspeed: indexed {} files, {} symbols in {:.0} ms", idx.live_files().count(), idx.db.len(), ms);
         eprintln!("{}", idx.stats.report(rayon::current_num_threads()));
+        eprintln!("{}", idx.memory_report());
         self.index = Some(idx);
     }
 

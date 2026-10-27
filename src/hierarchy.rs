@@ -45,6 +45,12 @@ pub struct Hierarchy {
     pub stats: HierarchyStats,
 }
 
+impl Hierarchy {
+    pub fn heap_bytes(&self) -> usize {
+        self.bases.heap_bytes() + self.derived.heap_bytes() + self.families.heap_bytes() + self.defs.heap_bytes() + self.canonical.capacity() * std::mem::size_of::<Option<SymbolId>>()
+    }
+}
+
 struct Dsu(Vec<u32>);
 
 impl Dsu {

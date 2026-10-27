@@ -373,6 +373,22 @@ impl SymbolDb {
         Self::default()
     }
 
+    /// Approximate heap bytes per table: `(label, bytes)`.
+    pub fn heap_breakdown(&self) -> Vec<(&'static str, usize)> {
+        let cap = |n: usize, sz: usize| n * sz;
+        vec![
+            ("names", self.names.heap_bytes()),
+            ("file paths", self.files.paths.heap_bytes() + self.files.hashes.heap_bytes()),
+            ("symbols", self.symbols.heap_bytes()),
+            ("bases/out-of-line/sigs", cap(self.bases.capacity(), std::mem::size_of::<BaseEdge>()) + cap(self.out_of_line.capacity(), 8) + cap(self.sigs.capacity(), std::mem::size_of::<Signature>())),
+            ("by_name+children", self.by_name.heap_bytes() + self.children.heap_bytes()),
+        ]
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.heap_breakdown().iter().map(|e| e.1).sum()
+    }
+
     pub fn intern(&mut self, name: &str) -> NameId {
         self.names.intern(name)
     }

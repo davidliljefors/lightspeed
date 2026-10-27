@@ -330,6 +330,21 @@ impl SharedHeaders {
         &self.shards[(key >> 7) as usize % SHARED_SHARDS]
     }
 
+    /// `(entries, text bytes, token bytes)` currently cached.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let mut s = (0, 0, 0);
+        for sh in &self.shards {
+            if let Ok(m) = sh.read() {
+                for e in m.values() {
+                    s.0 += 1;
+                    s.1 += e.text.capacity();
+                    s.2 += e.toks.capacity() * std::mem::size_of::<Token>();
+                }
+            }
+        }
+        s
+    }
+
     fn get(&self, key: u64) -> Option<Arc<HeaderEntry>> {
         self.shard(key).read().ok()?.get(&key).cloned()
     }

@@ -19,6 +19,12 @@ impl<K, V> Default for Csr<K, V> {
     }
 }
 
+impl<K, V> Csr<K, V> {
+    pub fn heap_bytes(&self) -> usize {
+        self.offsets.capacity() * 4 + self.items.capacity() * std::mem::size_of::<V>()
+    }
+}
+
 impl<K: Idx, V: Copy> Csr<K, V> {
     /// Builds from `(key, value)` pairs; `pairs` is iterated twice, so it
     /// should be cheap to clone. Order within a bucket follows input order.

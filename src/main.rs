@@ -220,6 +220,7 @@ fn index_cmd(threads: usize, args: &[String]) -> i32 {
         t0.elapsed().as_secs_f64() * 1e3
     );
     println!("{}", idx.stats.report(threads));
+    println!("{}", idx.memory_report());
     0
 }
 

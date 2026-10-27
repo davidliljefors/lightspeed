@@ -18,6 +18,10 @@ pub struct ScopeDecls {
 }
 
 impl ScopeDecls {
+    pub fn heap_bytes(&self) -> usize {
+        self.names.iter().map(|s| s.capacity() + 24).sum::<usize>() + self.aliases.iter().map(|(a, b)| a.capacity() + b.capacity() + 48).sum::<usize>()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.names.is_empty() && self.aliases.is_empty()
     }

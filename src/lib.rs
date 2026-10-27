@@ -18,6 +18,7 @@ pub mod hash;
 pub mod ids;
 pub mod interner;
 pub mod lexer;
+pub mod mem;
 pub mod pp;
 pub mod source;
 pub mod symbols;

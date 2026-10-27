@@ -111,6 +111,10 @@ pub struct BuildStats {
     pub parse_us: u64,
     pub lex_idents_us: u64,
     pub scope_us: u64,
+    /// Largest sum of per-file results held at once between a wave and its absorb.
+    pub peak_wave_bytes: usize,
+    /// Resident bytes right after the parallel phase of the last wave.
+    pub rss_after_analyze: usize,
     pub waves: u32,
     pub parallel_wall_ms: f64,
     pub absorb_wall_ms: f64,
@@ -148,6 +152,13 @@ struct Analysis {
     decls: crate::scope_decls::ScopeDecls,
     content_hash: u64,
     times: [u32; 5],
+}
+
+impl Analysis {
+    /// Approximate heap bytes held until this result is absorbed.
+    fn heap_bytes(&self) -> usize {
+        self.shard.heap_bytes() + self.idents.capacity() * 4 + self.includes.iter().map(|s| s.capacity() + 24).sum::<usize>() + self.decls.heap_bytes()
+    }
 }
 
 /// Per-thread analysis state. Nothing here is shared between workers.
@@ -301,6 +312,9 @@ impl Index {
             let results = idx.analyze_jobs(&jobs, progress);
             idx.stats.parallel_wall_ms += t.elapsed().as_secs_f64() * 1e3;
             idx.stats.waves += 1;
+            let wave_bytes: usize = results.iter().flatten().map(Analysis::heap_bytes).sum();
+            idx.stats.peak_wave_bytes = idx.stats.peak_wave_bytes.max(wave_bytes);
+            idx.stats.rss_after_analyze = crate::mem::process_bytes().0.max(idx.stats.rss_after_analyze);
             let t = std::time::Instant::now();
             let mut next: Vec<Job> = Vec::new();
             for (job, res) in jobs.iter().zip(results) {
@@ -447,6 +461,34 @@ impl Index {
 
     /// Using-directives and namespace aliases that files included (directly
     /// or not) by `file` bring into scope. Cached until any file changes.
+    /// Approximate memory held by each part of the index, plus process RSS.
+    pub fn memory_report(&self) -> String {
+        use crate::mem::{mib, process_bytes};
+        let (hn, htext, htoks) = self.shared.stats();
+        let files: usize = self
+            .files
+            .iter()
+            .map(|f| f.path.capacity() + f.idents.capacity() * 4 + f.includes.capacity() * 8 + f.decls.heap_bytes() + std::mem::size_of::<FileInfo>())
+            .sum();
+        let idents: usize = self.files.iter().map(|f| f.idents.len()).sum();
+        let (rss, peak) = process_bytes();
+        let mut s = format!(
+            "  memory: rss {} (peak {}, after analyze {}) | peak wave results {}\n  header cache: {hn} entries, text {}, tokens {}\n  symbol db {}:",
+            mib(rss),
+            mib(peak),
+            mib(self.stats.rss_after_analyze),
+            mib(self.stats.peak_wave_bytes),
+            mib(htext),
+            mib(htoks),
+            mib(self.db.heap_bytes()),
+        );
+        for (label, b) in self.db.heap_breakdown() {
+            s.push_str(&format!(" {label} {},", mib(b)));
+        }
+        s.push_str(&format!("\n  hierarchy {} | per-file info {} ({} files, {idents} ident hashes)", mib(self.hier.heap_bytes()), mib(files), self.files.len()));
+        s
+    }
+
     pub fn included_decls(&self, file: usize) -> std::sync::Arc<crate::scope_decls::ScopeDecls> {
         if let Ok(c) = self.scope_cache.read()
             && let Some(d) = c.get(&file)
