@@ -642,22 +642,36 @@ impl Server {
 
     fn locations_json(&self, locs: &[Location]) -> Value {
         let idx = self.index.as_ref().unwrap();
-        let mut cache: HashMap<u32, Option<(Text, LineIndex)>> = HashMap::new();
-        let mut arr = Vec::with_capacity(locs.len());
-        for l in locs {
-            let entry = cache.entry(l.file).or_insert_with(|| {
-                let t = self.text_of(&idx.files[l.file as usize].path)?;
-                let li = LineIndex::new(t.as_str());
-                Some((t, li))
+        use rayon::prelude::*;
+        // Group by file (first-seen order) so each file is read once, in parallel.
+        let mut groups: Vec<(u32, Vec<usize>)> = Vec::new();
+        let mut slot: HashMap<u32, usize> = HashMap::new();
+        for (i, l) in locs.iter().enumerate() {
+            let g = *slot.entry(l.file).or_insert_with(|| {
+                groups.push((l.file, Vec::new()));
+                groups.len() - 1
             });
-            let Some((t, li)) = entry else { continue };
-            let (s, e) = (offset_to_position(t.as_str(), li, l.start), offset_to_position(t.as_str(), li, l.end));
-            arr.push(json!({
-                "uri": path_to_uri(&idx.files[l.file as usize].path),
-                "range": {"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}},
-            }));
+            groups[g].1.push(i);
         }
-        Value::Array(arr)
+        let done: Vec<Vec<(usize, Value)>> = groups
+            .par_iter()
+            .map(|(file, ids)| {
+                let path = &idx.files[*file as usize].path;
+                let Some(t) = self.text_of(path) else { return Vec::new() };
+                let li = LineIndex::new(t.as_str());
+                let uri = path_to_uri(path);
+                ids.iter()
+                    .map(|&i| {
+                        let l = &locs[i];
+                        let (s, e) = (offset_to_position(t.as_str(), &li, l.start), offset_to_position(t.as_str(), &li, l.end));
+                        (i, json!({"uri": uri, "range": {"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}}}))
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut flat: Vec<(usize, Value)> = done.into_iter().flatten().collect();
+        flat.sort_unstable_by_key(|p| p.0);
+        Value::Array(flat.into_iter().map(|p| p.1).collect())
     }
 
     fn range_json(text: &str, li: &LineIndex, (a, b): (u32, u32)) -> Value {
