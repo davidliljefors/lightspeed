@@ -160,6 +160,8 @@ pub struct BuildStats {
     pub scope_us: u64,
     /// Largest sum of per-file results held at once between a wave and its absorb.
     pub peak_wave_bytes: usize,
+    /// Largest single file result (bytes, path) seen in any wave.
+    pub biggest_result: (usize, String),
     /// Resident bytes right after the parallel phase of the last wave.
     pub rss_after_analyze: usize,
     pub waves: u32,
@@ -249,6 +251,8 @@ const WORKER_MEM_LABELS: [&str; 5] = ["include-resolve memo", "macro tables", "h
 
 /// A worker whose preprocessor output buffers grew past this after a file frees them.
 const OUTPUT_TRIM_BYTES: usize = 48 << 20;
+/// Files analyzed per wave: enough to keep 64+ cores busy through the tail, small enough to cap held results.
+const WAVE_JOBS: usize = 4096;
 static OUTPUT_TRIMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl Drop for Worker {
@@ -469,12 +473,19 @@ impl Index {
             p.total.store(jobs.len() as u32, Relaxed);
         }
         while !jobs.is_empty() {
+            // Bound the results held between analyze and absorb.
+            let mut rest = jobs.split_off(jobs.len().min(WAVE_JOBS));
             let t = std::time::Instant::now();
             let results = idx.analyze_jobs(&jobs, progress, snapshot.as_ref(), cache_cfg.is_some());
             idx.stats.parallel_wall_ms += t.elapsed().as_secs_f64() * 1e3;
             idx.stats.waves += 1;
             let wave_bytes: usize = results.iter().flatten().map(Analysis::heap_bytes).sum();
             idx.stats.peak_wave_bytes = idx.stats.peak_wave_bytes.max(wave_bytes);
+            if let Some((b, j)) = results.iter().zip(&jobs).filter_map(|(r, j)| Some((r.as_ref()?.heap_bytes(), j))).max_by_key(|x| x.0)
+                && b > idx.stats.biggest_result.0
+            {
+                idx.stats.biggest_result = (b, j.path.clone());
+            }
             idx.stats.rss_after_analyze = crate::mem::process_bytes().0.max(idx.stats.rss_after_analyze);
             let t = std::time::Instant::now();
             let mut next: Vec<Job> = Vec::new();
@@ -519,7 +530,8 @@ impl Index {
                 }
             }
             idx.stats.absorb_wall_ms += t.elapsed().as_secs_f64() * 1e3;
-            jobs = next;
+            rest.append(&mut next);
+            jobs = rest;
         }
         let t = std::time::Instant::now();
         idx.flush();
@@ -734,11 +746,13 @@ impl Index {
         let idents: usize = self.files.iter().map(|f| f.idents.len()).sum();
         let (rss, peak) = process_bytes();
         let mut s = format!(
-            "  memory: rss {} (peak {}, after analyze {}) | peak wave results {}\n  header cache: {hn} entries, text {}, tokens {}\n  symbol db {}:",
+            "  memory: rss {} (peak {}, after analyze {}) | peak wave results {} (biggest file {}: {})\n  header cache: {hn} entries, text {}, tokens {}\n  symbol db {}:",
             mib(rss),
             mib(peak),
             mib(self.stats.rss_after_analyze),
             mib(self.stats.peak_wave_bytes),
+            mib(self.stats.biggest_result.0),
+            self.stats.biggest_result.1,
             mib(htext),
             mib(htoks),
             mib(self.db.heap_bytes()),
