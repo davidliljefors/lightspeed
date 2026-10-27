@@ -124,7 +124,7 @@ impl Query<'_> {
                 SymbolKind::TypeAlias if depth < 6 && expansions < MAX_ALIAS_EXPANSIONS => {
                     expansions += 1;
                     if let Some(t) = self.alias_target(id) {
-                        let cands = db.lookup(&t);
+                        let cands = self.scoped_candidates(id, &t);
                         // Records first: they end the chain, so aliases are only followed when none exist.
                         let records: Vec<_> = cands.iter().copied().filter(|&c| db.symbol(c).kind.is_record()).collect();
                         if !records.is_empty() {
@@ -140,6 +140,36 @@ impl Query<'_> {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// What `name`, written inside the declaration of `from`, can refer to: the
+    /// symbols named `name` in the innermost enclosing scope that has any
+    /// (`n::Foo::name`, then `n::name`, then `name`). Falls back to every symbol
+    /// of that name when no enclosing scope declares it (using-directives, ADL).
+    fn scoped_candidates(&self, from: SymbolId, name: &str) -> Vec<SymbolId> {
+        const MAX_SCAN: usize = 4096;
+        let db = &self.idx.db;
+        let all = db.lookup(name);
+        if all.len() <= 1 || all.len() > MAX_SCAN {
+            return all.to_vec();
+        }
+        let qualified = db.qualified_name(from);
+        let mut scope = qualified.rfind("::").map_or("", |i| &qualified[..i]);
+        let parents: Vec<(SymbolId, String)> = all.iter().filter(|&&c| c != from).map(|&c| (c, db.qualified_name(c))).collect();
+        loop {
+            let hits: Vec<SymbolId> = parents
+                .iter()
+                .filter(|(_, q)| q.rfind("::").map_or("", |i| &q[..i]) == scope)
+                .map(|&(c, _)| c)
+                .collect();
+            if !hits.is_empty() {
+                return hits;
+            }
+            if scope.is_empty() {
+                return all.to_vec();
+            }
+            scope = scope.rfind("::").map_or("", |i| &scope[..i]);
+        }
     }
 
     /// The type name an alias is written in terms of, read from its declaration.

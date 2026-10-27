@@ -367,6 +367,20 @@ fn real_msvc_stl_containers() {
 }
 
 #[test]
+fn alias_targets_resolve_in_their_enclosing_scope() {
+    let src = "namespace a { struct Impl { void one(); }; using Alias = Impl; }\n\
+               namespace b { struct Impl { void two(); }; using Alias = Impl; }\n\
+               void f() { a::Alias x; x.one(); b::Alias y; y.two(); }\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let at = |s: &str| (src.find(s).unwrap() + 2) as u32;
+    assert_eq!(names(&idx, &q.definition(&p, src, at("x.one"))), ["a::Impl::one"]);
+    assert_eq!(names(&idx, &q.definition(&p, src, at("y.two"))), ["b::Impl::two"]);
+}
+
+#[test]
 fn alias_cycles_with_many_same_named_aliases_terminate() {
     let mut src = String::new();
     for i in 0..300 {
