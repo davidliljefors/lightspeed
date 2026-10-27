@@ -9,6 +9,7 @@
 use crate::csr::Csr;
 use crate::ids::{Idx, IndexVec};
 use crate::interner::Interner;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 use std::ops::{BitOr, BitOrAssign};
 
@@ -354,6 +355,10 @@ pub struct SymbolDb {
     sigs: Vec<Signature>,
     by_name: Csr<NameId, SymbolId>,
     children: Csr<SymbolId, SymbolId>,
+    /// Lists that replace the CSR bucket of a name / parent touched by
+    /// [`Self::patch_indexes`] since the last full rebuild.
+    by_name_ovr: FxHashMap<NameId, Vec<SymbolId>>,
+    children_ovr: FxHashMap<SymbolId, Vec<SymbolId>>,
     indexed_symbols: usize,
 }
 
@@ -652,7 +657,48 @@ impl SymbolDb {
             syms.len(),
             syms.iter_enumerated().filter(|(_, s)| live(s)).filter_map(|(id, s)| s.parent.map(|p| (p, id))),
         );
+        self.by_name_ovr.clear();
+        self.children_ovr.clear();
         self.indexed_symbols = syms.len();
+    }
+
+    /// Brings fresh indexes up to date after the file whose symbols were
+    /// `old` was tombstoned ([`Self::kill_range`]) and re-merged as `new`.
+    /// Only the buckets of touched names and parents are rewritten, so the
+    /// cost is the size of those buckets rather than the database. The caller
+    /// guarantees the indexes were fresh before the kill.
+    pub fn patch_indexes(&mut self, old: std::ops::Range<usize>, new: std::ops::Range<usize>) {
+        let dead = |syms: &IndexVec<SymbolId, Symbol>, id: SymbolId| syms[id].flags.contains(SymbolFlags::DEAD);
+        let mut names: FxHashSet<NameId> = FxHashSet::default();
+        let mut parents: FxHashSet<SymbolId> = FxHashSet::default();
+        for i in old {
+            let s = &self.symbols[SymbolId::from_usize(i)];
+            names.insert(s.name);
+            if let Some(p) = s.parent {
+                parents.insert(p);
+            }
+        }
+        for n in names {
+            let list = self.by_name_ovr.entry(n).or_insert_with(|| self.by_name.get(n).to_vec());
+            list.retain(|&id| !dead(&self.symbols, id));
+        }
+        for p in parents {
+            if dead(&self.symbols, p) {
+                continue;
+            }
+            let list = self.children_ovr.entry(p).or_insert_with(|| self.children.get(p).to_vec());
+            list.retain(|&id| !dead(&self.symbols, id));
+        }
+        for i in new.clone() {
+            let id = SymbolId::from_usize(i);
+            let s = &self.symbols[id];
+            let (n, parent) = (s.name, s.parent);
+            self.by_name_ovr.entry(n).or_insert_with(|| self.by_name.get(n).to_vec()).push(id);
+            if let Some(p) = parent {
+                self.children_ovr.entry(p).or_insert_with(|| self.children.get(p).to_vec()).push(id);
+            }
+        }
+        self.indexed_symbols = self.symbols.len();
     }
 
     /// False if symbols were added since the last [`Self::rebuild_indexes`].
@@ -664,20 +710,26 @@ impl SymbolDb {
     pub fn lookup(&self, name: &str) -> &[SymbolId] {
         debug_assert!(self.indexes_fresh(), "stale indexes");
         match self.names.lookup(name) {
-            Some(n) => self.by_name.get(n),
+            Some(n) => self.lookup_id(n),
             None => &[],
         }
     }
 
     pub fn lookup_id(&self, name: NameId) -> &[SymbolId] {
         debug_assert!(self.indexes_fresh(), "stale indexes");
-        self.by_name.get(name)
+        match self.by_name_ovr.get(&name) {
+            Some(l) => l,
+            None => self.by_name.get(name),
+        }
     }
 
     /// Direct children of a scope, in insertion order. Needs fresh indexes.
     pub fn children(&self, id: SymbolId) -> &[SymbolId] {
         debug_assert!(self.indexes_fresh(), "stale indexes");
-        self.children.get(id)
+        match self.children_ovr.get(&id) {
+            Some(l) => l,
+            None => self.children.get(id),
+        }
     }
 }
 

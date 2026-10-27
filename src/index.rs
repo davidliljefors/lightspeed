@@ -716,8 +716,14 @@ impl Index {
                 return a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect();
             }
         }
+        let was_clean = !self.dirty;
+        let mut old_range = 0..0;
         let slot = match self.by_path.get(&key) {
             Some(&i) => {
+                let f = &self.files[i as usize];
+                if f.alive {
+                    old_range = f.syms.0 as usize..f.syms.1 as usize;
+                }
                 self.kill(i as usize);
                 i as usize
             }
@@ -728,6 +734,7 @@ impl Index {
             }
         };
         let base = self.db.merge(&a.shard);
+        let n_new = a.shard.len();
         let f = &mut self.files[slot];
         f.path = path.to_owned();
         f.flag_entry = flag_entry;
@@ -738,9 +745,20 @@ impl Index {
         f.content_hash = a.content_hash;
         f.includes = a.includes.iter().map(|p| path_key(p)).collect();
         f.decls = a.decls;
-        self.dirty = true;
+        self.dirty = !(was_clean && self.patch_in_place(old_range, base..base + n_new));
         self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect()
+    }
+
+    /// Updates the side indexes and hierarchy for one re-merged file without
+    /// a global rebuild. False when that is not possible (the caller then
+    /// marks the index dirty for a full [`Self::flush`]).
+    fn patch_in_place(&mut self, old: std::ops::Range<usize>, new: std::ops::Range<usize>) -> bool {
+        if self.dead_symbols * 100 > self.db.len() * self.cfg.compact_percent {
+            return false;
+        }
+        self.db.patch_indexes(old.clone(), new.clone());
+        self.hier.patch(&mut self.db, old, new)
     }
 
     fn kill(&mut self, slot: usize) {

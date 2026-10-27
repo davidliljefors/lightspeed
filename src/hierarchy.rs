@@ -20,8 +20,8 @@
 
 use crate::csr::Csr;
 use crate::ids::Idx;
-use crate::symbols::{FamilyId, SymbolDb, SymbolFlags, SymbolId, SymbolKind};
-use rustc_hash::FxHashSet;
+use crate::symbols::{FamilyId, NameId, SymbolDb, SymbolFlags, SymbolId, SymbolKind};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HierarchyStats {
@@ -36,12 +36,79 @@ pub struct HierarchyStats {
     pub out_of_line_unresolved: usize,
 }
 
+/// Reused buffers for [`match_out_of_line`].
+#[derive(Default)]
+struct OutOfLineScratch {
+    /// Class a qualifier (`A::B`) names; many definitions share one.
+    classes: FxHashMap<NameId, Option<SymbolId>>,
+    qname: String,
+}
+
+/// The in-class declaration that the out-of-line definition `def` (qualified
+/// by `q`, e.g. `A::B`) implements. Best match: same signature, then same
+/// arity, then name only; an unclaimed declaration beats a claimed one of
+/// equal quality.
+fn match_out_of_line(
+    db: &SymbolDb,
+    def: SymbolId,
+    q: NameId,
+    scratch: &mut OutOfLineScratch,
+    sig: impl Fn(SymbolId) -> Option<(u16, u32)>,
+    claimed: impl Fn(SymbolId) -> bool,
+) -> Option<SymbolId> {
+    let class = (*scratch.classes.entry(q).or_insert_with(|| {
+        let qual = db.names.get(q);
+        let last = qual.rsplit("::").next().unwrap_or(qual);
+        let ln = db.names.lookup(last)?;
+        let mut best: Option<(u32, SymbolId)> = None;
+        for &c in db.lookup_id(ln) {
+            if !db.symbol(c).kind.is_record() {
+                continue;
+            }
+            let qname = &mut scratch.qname;
+            qname.clear();
+            db.write_qualified_name(c, qname);
+            let suffix_ok = qname == qual || (qname.len() >= qual.len() + 2 && qname.ends_with(qual) && qname[..qname.len() - qual.len()].ends_with("::"));
+            if !suffix_ok {
+                continue;
+            }
+            let key = u32::from(is_definition(db, c)) + 1;
+            if best.is_none_or(|(k, _)| key > k) {
+                best = Some((key, c));
+            }
+        }
+        best.map(|(_, c)| c)
+    }))?;
+    let name = db.symbol(def).name;
+    let want = sig(def);
+    let mut best: Option<(u32, SymbolId)> = None;
+    for &m in db.children(class) {
+        if m == def || db.symbol(m).name != name || db.symbol(m).kind == SymbolKind::TypeAlias {
+            continue;
+        }
+        let tier = match (want, sig(m)) {
+            (Some(a), Some(b)) if a == b => 3,
+            (Some(a), Some(b)) if a.0 == b.0 => 2,
+            (Some(_), Some(_)) => 1,
+            _ => 3,
+        };
+        let score = tier * 2 + u32::from(!claimed(m));
+        if best.is_none_or(|(s, _)| score > s) {
+            best = Some((score, m));
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
 pub struct Hierarchy {
     bases: Csr<SymbolId, SymbolId>,
     derived: Csr<SymbolId, SymbolId>,
     families: Csr<FamilyId, SymbolId>,
     canonical: Vec<Option<SymbolId>>,
     defs: Csr<SymbolId, SymbolId>,
+    /// Buckets of `defs` / `families` rewritten by [`Hierarchy::patch`].
+    defs_ovr: FxHashMap<SymbolId, Vec<SymbolId>>,
+    families_ovr: FxHashMap<FamilyId, Vec<SymbolId>>,
     pub stats: HierarchyStats,
 }
 
@@ -184,6 +251,8 @@ impl Hierarchy {
             }
         }
         let mut mark = vec![0u32; n];
+        // Virtual methods found so far, by name: an override candidate is one of these.
+        let mut eff_by_name: FxHashMap<NameId, Vec<SymbolId>> = FxHashMap::default();
         let (mut stamp, mut anc, mut stack) = (0u32, Vec::<SymbolId>::new(), Vec::<SymbolId>::new());
         for &c in &order {
             stamp += 1;
@@ -224,10 +293,7 @@ impl Hierarchy {
                         // exactly (typedef vs. alias), fall back to equal arity.
                         arity_cands.clear();
                         let mine = sig[m.index()];
-                        for &o in db.lookup_id(s.name) {
-                            if o == m || !eff[o.index()] {
-                                continue;
-                            }
+                        for &o in eff_by_name.get(&s.name).map_or(&[][..], |v| &v[..]) {
                             let os = db.symbol(o);
                             if os.kind == SymbolKind::Method
                                 && let Some(p) = os.parent
@@ -258,6 +324,9 @@ impl Hierarchy {
                     _ => continue,
                 }
                 eff[m.index()] = declared || found;
+                if eff[m.index()] {
+                    eff_by_name.entry(s.name).or_default().push(m);
+                }
             }
         }
 
@@ -280,53 +349,9 @@ impl Hierarchy {
         // 4. Out-of-line definitions -> in-class declarations.
         let mut canonical: Vec<Option<SymbolId>> = vec![None; n];
         let mut claimed = vec![false; n];
-        let mut qname = String::new();
+        let mut scratch = OutOfLineScratch::default();
         for &(def, q) in db.out_of_line() {
-            let qual = db.names.get(q);
-            let last = qual.rsplit("::").next().unwrap_or(qual);
-            let class = db.names.lookup(last).and_then(|ln| {
-                let mut best: Option<(u32, SymbolId)> = None;
-                for &c in db.lookup_id(ln) {
-                    if !db.symbol(c).kind.is_record() {
-                        continue;
-                    }
-                    qname.clear();
-                    db.write_qualified_name(c, &mut qname);
-                    let suffix_ok = qname == qual
-                        || (qname.len() >= qual.len() + 2 && qname.ends_with(qual) && qname[..qname.len() - qual.len()].ends_with("::"));
-                    if !suffix_ok {
-                        continue;
-                    }
-                    let key = u32::from(is_definition(db, c)) + 1;
-                    if best.is_none_or(|(k, _)| key > k) {
-                        best = Some((key, c));
-                    }
-                }
-                best.map(|(_, c)| c)
-            });
-            let name = db.symbol(def).name;
-            let want = sig[def.index()];
-            let member = class.and_then(|c| {
-                // Best match: same signature, then same arity, then name only;
-                // an unclaimed declaration beats a claimed one of equal quality.
-                let mut best: Option<(u32, SymbolId)> = None;
-                for &m in db.children(c) {
-                    if m == def || db.symbol(m).name != name || db.symbol(m).kind == SymbolKind::TypeAlias {
-                        continue;
-                    }
-                    let tier = match (want, sig[m.index()]) {
-                        (Some(a), Some(b)) if a == b => 3,
-                        (Some(a), Some(b)) if a.0 == b.0 => 2,
-                        (Some(_), Some(_)) => 1,
-                        _ => 3,
-                    };
-                    let score = tier * 2 + u32::from(!claimed[m.index()]);
-                    if best.is_none_or(|(s, _)| score > s) {
-                        best = Some((score, m));
-                    }
-                }
-                best.map(|(_, m)| m)
-            });
+            let member = match_out_of_line(db, def, q, &mut scratch, |x| sig[x.index()], |m| claimed[m.index()]);
             match member {
                 Some(m) => {
                     claimed[m.index()] = true;
@@ -344,12 +369,57 @@ impl Hierarchy {
         }
 
         let defs = Csr::build(n, canonical.iter().enumerate().filter_map(|(i, c)| c.map(|c| (c, SymbolId::from_usize(i)))));
-        Self { bases, derived, families, canonical, defs, stats }
+        Self { bases, derived, families, canonical, defs, defs_ovr: FxHashMap::default(), families_ovr: FxHashMap::default(), stats }
+    }
+
+    /// Updates the hierarchy after the file whose symbols were `old` was
+    /// tombstoned and re-merged as `new` (indexes already patched).
+    /// Only files without classes, destructors or virtual methods qualify:
+    /// those only add or drop out-of-line definitions, which are re-matched
+    /// individually. Returns `false`, changing nothing, for anything else; the
+    /// caller then rebuilds with [`Self::build`].
+    pub fn patch(&mut self, db: &mut SymbolDb, old: std::ops::Range<usize>, new: std::ops::Range<usize>) -> bool {
+        let sym = |i: usize| db.symbol(SymbolId::from_usize(i));
+        let structural = |s: &crate::symbols::Symbol| s.kind.is_record() || s.kind == SymbolKind::Destructor || s.flags.is_virtual_like();
+        let canonical_of = |i: usize| self.canonical.get(i).copied().flatten();
+        // A family on an old symbol is fine only if it was copied from a declaration.
+        if old.clone().any(|i| structural(sym(i)) || (sym(i).family.is_some() && canonical_of(i).is_none())) || new.clone().any(|i| structural(sym(i))) {
+            return false;
+        }
+        for i in old {
+            let def = SymbolId::from_usize(i);
+            let Some(m) = self.canonical.get(i).copied().flatten() else { continue };
+            self.canonical[i] = None;
+            let defs = self.defs_ovr.entry(m).or_insert_with(|| self.defs.get(m).to_vec());
+            defs.retain(|&d| d != def);
+            if let Some(f) = db.symbol(def).family {
+                let fam = self.families_ovr.entry(f).or_insert_with(|| self.families.get(f).to_vec());
+                fam.retain(|&d| d != def);
+            }
+        }
+        self.canonical.resize(db.len(), None);
+        let first = db.out_of_line().partition_point(|e| e.0.index() < new.start);
+        let added: Vec<(SymbolId, crate::symbols::NameId)> = db.out_of_line()[first..].to_vec();
+        let mut scratch = OutOfLineScratch::default();
+        for (def, q) in added {
+            let found = match_out_of_line(db, def, q, &mut scratch, |x| db.signature(x).map(|s| (s.arity, s.hash)), |m| !self.out_of_line_defs(m).is_empty());
+            let Some(m) = found else { continue };
+            self.canonical[def.index()] = Some(m);
+            self.defs_ovr.entry(m).or_insert_with(|| self.defs.get(m).to_vec()).push(def);
+            if let Some(f) = db.symbol(m).family {
+                db.symbol_mut(def).family = Some(f);
+                self.families_ovr.entry(f).or_insert_with(|| self.families.get(f).to_vec()).push(def);
+            }
+        }
+        true
     }
 
     /// Out-of-line definitions of the in-class declaration `decl`.
     pub fn out_of_line_defs(&self, decl: SymbolId) -> &[SymbolId] {
-        if decl.index() < self.defs.num_keys() { self.defs.get(decl) } else { &[] }
+        match self.defs_ovr.get(&decl) {
+            Some(l) => l,
+            None => self.defs.get(decl),
+        }
     }
 
     /// Direct, resolved base classes.
@@ -402,11 +472,14 @@ impl Hierarchy {
     /// Every method in the same virtual family as `m` (including `m` and its
     /// out-of-line definitions). Empty if `m` is not virtual. O(1).
     pub fn family_members(&self, db: &SymbolDb, m: SymbolId) -> &[SymbolId] {
-        db.symbol(m).family.map_or(&[], |f| self.families.get(f))
+        db.symbol(m).family.map_or(&[], |f| self.family(f))
     }
 
     pub fn family(&self, family: FamilyId) -> &[SymbolId] {
-        self.families.get(family)
+        match self.families_ovr.get(&family) {
+            Some(l) => l,
+            None => self.families.get(family),
+        }
     }
 
     /// For an out-of-line definition, the in-class declaration; otherwise `sym`.

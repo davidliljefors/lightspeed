@@ -51,6 +51,72 @@ fn names(idx: &Index, ids: &[SymbolId]) -> Vec<String> {
     ids.iter().map(|&i| idx.db.qualified_name(i)).collect()
 }
 
+/// Everything the indexes and hierarchy answer, keyed by names and source
+/// offsets (not IDs), so an incrementally patched index can be compared with a fresh one.
+fn observable(idx: &Index) -> Vec<String> {
+    let label = |id: SymbolId| {
+        let s = idx.db.symbol(id);
+        let file = idx.db.file_path(id).rsplit('/').next().unwrap().to_owned();
+        format!("{}@{file}:{}", idx.db.qualified_name(id), s.name_offset)
+    };
+    let sorted = |ids: &[SymbolId]| {
+        let mut v: Vec<String> = ids.iter().map(|&i| label(i)).collect();
+        v.sort();
+        v.join(",")
+    };
+    let mut out = Vec::new();
+    for (id, s) in idx.db.symbols().iter_enumerated() {
+        if idx.db.is_dead(id) {
+            continue;
+        }
+        let same_name = sorted(idx.db.lookup(idx.db.name(id)));
+        let children = sorted(idx.db.children(id));
+        let canon = label(idx.hier.canonical(id));
+        let fam = sorted(idx.hier.family_members(&idx.db, id));
+        let defs = sorted(idx.hier.out_of_line_defs(id));
+        out.push(format!("{} {:?} | named [{same_name}] | children [{children}] | canonical {canon} | family [{fam}] | defs [{defs}] | {}", label(id), s.kind, s.family.is_some()));
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn edits_to_files_without_classes_patch_indexes_and_hierarchy_incrementally() {
+    let pad: String = (0..300).map(|i| format!("int pad{i};\n")).collect();
+    let h = format!("#pragma once\n{pad}struct Foo {{ virtual void f(); void g(int); void run(); int h(); }};\nstruct Bar : Foo {{ void f() override; }};\n");
+    let h = h.as_str();
+    let a = |body: &str| format!("#include \"h.h\"\n{body}");
+    let ws = Ws::new(&[("h.h", h), ("a.cpp", &a("void Foo::f() {}\nvoid Foo::g(int a) {}\nvoid Foo::run() {}\nvoid free1() {}\n"))], &[]);
+    let mut idx = ws.index(&["a.cpp"]);
+    let p = ws.path("a.cpp");
+    let edits = [
+        "void Foo::f() {}\nvoid Foo::g(int a) {}\nvoid Foo::ru\nn() {}\nvoid free1() {}\n",
+        "void Foo::f() {}\nvoid Foo::g(float a) {}\nvoid Foo::g(int a) {}\nvoid Foo::run() {}\nvoid free1() {}\nvoid free2() {}\n",
+        "int Foo::h() { return 1; }\nvoid Bar::f() {}\nvoid Foo::f() {}\n",
+        "",
+        "void Foo::f() {}\nvoid Foo::g(int a) {}\nvoid Foo::run() {}\nvoid free1() {}\n",
+        "namespace n { void free1() {} }\nvoid Foo::run() {}\n",
+    ];
+    for (i, body) in edits.iter().enumerate() {
+        idx.update(&p, Some(&a(body)));
+        assert!(!idx.is_dirty(), "edit {i} fell back to a full rebuild");
+        let fresh_ws = Ws::new(&[("h.h", h), ("a.cpp", &a(body))], &[]);
+        let fresh = fresh_ws.index(&["a.cpp"]);
+        assert_eq!(observable(&idx), observable(&fresh), "edit {i}");
+    }
+    // Many more edits: dead symbols pile up until a compaction forces a full rebuild.
+    let mut rebuilt = 0;
+    for i in 0..120 {
+        let body = edits[i % edits.len()];
+        idx.update(&p, Some(&a(&format!("{body}int tick{i};\n"))));
+        rebuilt += usize::from(idx.is_dirty());
+        idx.flush();
+        let fresh = Ws::new(&[("h.h", h), ("a.cpp", &a(&format!("{body}int tick{i};\n")))], &[]).index(&["a.cpp"]);
+        assert_eq!(observable(&idx), observable(&fresh), "churn edit {i}");
+    }
+    assert!(rebuilt > 0 && rebuilt < 40, "{rebuilt} full rebuilds");
+}
+
 #[test]
 fn headers_are_discovered_and_indexed() {
     let ws = Ws::new(
