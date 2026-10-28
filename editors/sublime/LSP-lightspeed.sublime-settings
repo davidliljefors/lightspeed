@@ -1,0 +1,5 @@
+{
+  "command": ["lightspeed", "lsp"],
+  "selector": "source.c | source.c++",
+  "enabled": true
+}

@@ -6,3 +6,9 @@
 .idea/
 .DS_Store
 
+node_modules/
+*.vsix
+/editors/vscode/out
+/editors/vscode/bin
+/editors/zed/target
+/editors/zed/Cargo.lock

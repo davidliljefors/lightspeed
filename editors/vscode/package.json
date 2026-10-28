@@ -1,0 +1,42 @@
+{
+  "name": "lightspeed",
+  "displayName": "lightspeed",
+  "description": "Fast C++ navigation, rename, hover and completion driven by compile_commands.json",
+  "version": "0.1.0",
+  "publisher": "davidliljefors",
+  "repository": "https://github.com/davidliljefors/lightspeed",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:c", "onLanguage:cpp"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "lightspeed",
+      "properties": {
+        "lightspeed.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the lightspeed executable. Empty uses the bundled binary, then `lightspeed` on PATH."
+        },
+        "lightspeed.compileCommands": {
+          "type": "string",
+          "default": "",
+          "description": "Path to compile_commands.json. Empty lets the server look in the workspace."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "package": "vsce package --skip-license"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.4.0"
+  }
+}

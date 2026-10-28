@@ -20,7 +20,7 @@ Cold full index, no cache, using every hardware thread.
 | Serial merge | 1.1 s | 0.05 s |
 | Indexes + hierarchy | 1.6 s | 0.05 s |
 | **Total** | **62.1 s** | **3.85 s** |
-| Peak RSS | 15.0 GiB | 411 MiB |
+| Peak memory | 15.0 GiB | 411 MiB |
 | Symbol DB | 394 MiB | 41 MiB |
 
 CPU time by phase, summed over all threads:
