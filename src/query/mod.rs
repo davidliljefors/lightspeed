@@ -15,12 +15,14 @@ mod hover;
 mod locals;
 mod refs;
 mod search;
+mod semantic;
 mod templates;
 mod types;
 
 pub use hover::Hover;
 pub use locals::{Local, LocalKind};
 pub use refs::SymbolRefs;
+pub use semantic::{MODIFIERS as SEMANTIC_MODIFIERS, SemTok, TOKEN_TYPES as SEMANTIC_TYPES};
 pub use types::signature::{SigHelp, SigInfo};
 
 use std::sync::Arc;

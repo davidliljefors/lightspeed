@@ -274,6 +274,84 @@ fn declaration_implementation_and_type_definition_over_rpc() {
     assert_eq!(places(c.request("textDocument/typeDefinition", at("Circle& c", 0, 0))), ["h.h:2"]);
 }
 
+/// Decodes `semanticTokens` data into `(line, col, len, type name, modifier bits)`.
+fn decode_tokens(r: &Value) -> Vec<(u32, u32, u32, String, u32)> {
+    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable"];
+    let d: Vec<u32> = r["result"]["data"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let (mut line, mut col) = (0, 0);
+    d.chunks(5)
+        .map(|c| {
+            line += c[0];
+            col = if c[0] == 0 { col + c[1] } else { c[1] };
+            (line, col, c[2], legend[c[3] as usize].to_owned(), c[4])
+        })
+        .collect()
+}
+
+#[test]
+fn semantic_tokens_over_rpc() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    let txt = "#define LIMIT 4\nnamespace N { struct S { static int count; virtual void run() = 0; int v; }; enum E { One }; }\nint f(N::S& s) {\n  /* é */ int x = LIMIT + N::One;\n  s.run(); s.v = f(s); return N::S::count;\n}\n";
+    std::fs::write(&a, txt).unwrap();
+    std::fs::write(
+        format!("{root}/compile_commands.json"),
+        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+    )
+    .unwrap();
+    let mut c = Client::new(&root);
+    let caps = c.request("initialize", json!({"rootUri": path_to_uri(&root), "capabilities": {}}));
+    assert_eq!(caps["result"]["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"][5], "function");
+    c.open(&a, txt);
+    let doc = json!({"uri": path_to_uri(&a)});
+    let all = decode_tokens(&c.request("textDocument/semanticTokens/full", json!({"textDocument": doc})));
+    let find = |line: u32, col: u32| all.iter().find(|t| t.0 == line && t.1 == col).unwrap_or_else(|| panic!("no token at {line}:{col}: {all:?}"));
+    assert_eq!(find(1, 10).3, "namespace");
+    assert_eq!(find(1, 21).3, "struct");
+    assert_eq!((find(1, 36).3.as_str(), find(1, 36).4), ("variable", 1)); // static data member `count`
+    assert_eq!((find(1, 56).3.as_str(), find(1, 56).4), ("method", 4)); // pure virtual run
+    assert_eq!(find(3, 18).3, "macro"); // after the multi-byte comment, still the right UTF-16 column
+    assert_eq!(find(3, 29).3, "enumMember");
+    assert_eq!(find(4, 4).3, "method");
+    assert_eq!(find(4, 13).3, "property");
+    assert_eq!(find(4, 17).3, "function");
+    assert!(all.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)), "tokens must be ordered");
+
+    let part = decode_tokens(&c.request("textDocument/semanticTokens/range", json!({"textDocument": doc, "range": {"start": {"line": 4, "character": 0}, "end": {"line": 5, "character": 0}}})));
+    assert!(!part.is_empty() && part.iter().all(|t| t.0 == 4), "{part:?}");
+}
+
+/// Full-document latency on real files. Run with `cargo test --release --test lsp semantic_tokens_real -- --nocapture`.
+#[test]
+fn semantic_tokens_real_world_timing() {
+    let root = "C:/dev/shiki";
+    let cdb = format!("{root}/compile_commands.json");
+    if !std::path::Path::new(&cdb).is_file() {
+        return;
+    }
+    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
+    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
+    c.server.apply_pending();
+    let mut files: Vec<(u64, String)> = ["runtime/coff_module.cpp", "runtime/stress.cpp", "src/node_editor.cpp"]
+        .iter()
+        .map(|f| format!("{root}/{f}"))
+        .chain(std::fs::read_dir("C:/Program Files (x86)/Windows Kits/10/Include").ok().and_then(|d| d.flatten().next()).map(|v| format!("{}/um/winnt.h", v.path().display().to_string().replace('\\', "/"))))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.len(), p)))
+        .collect();
+    files.sort();
+    for (len, file) in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        c.open(&file, &text);
+        let doc = json!({"uri": path_to_uri(&file)});
+        let t0 = std::time::Instant::now();
+        let r = c.request("textDocument/semanticTokens/full", json!({"textDocument": doc}));
+        let dt = t0.elapsed();
+        let n = decode_tokens(&r).len();
+        eprintln!("semantic tokens: {file} ({len} bytes): {n} tokens in {dt:?}");
+        assert!(dt.as_millis() < 200, "{file}: {dt:?}");
+    }
+}
+
 #[test]
 fn completion_over_rpc_and_unknown_method() {
     let (_d, root) = tmp();

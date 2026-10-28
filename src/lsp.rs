@@ -543,6 +543,11 @@ impl Server {
                             "completionProvider": {"triggerCharacters": [".", ":", ">"]},
                             "signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [","]},
                             "documentSymbolProvider": true,
+                            "semanticTokensProvider": {
+                                "legend": {"tokenTypes": crate::query::SEMANTIC_TYPES, "tokenModifiers": crate::query::SEMANTIC_MODIFIERS},
+                                "full": true,
+                                "range": true,
+                            },
                             "workspaceSymbolProvider": true,
                         },
                         "serverInfo": {"name": "lightspeed", "version": env!("CARGO_PKG_VERSION")},
@@ -600,7 +605,7 @@ impl Server {
                     // While the index builds, answer with an empty result instead of an error popup.
                     let result = if self.building.is_some() {
                         match m {
-                            "textDocument/definition" | "textDocument/declaration" | "textDocument/implementation" | "textDocument/typeDefinition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" | "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes" | "typeHierarchy/subtypes" | "lightspeed/inheritanceGraph" => Some(Value::Null),
+                            "textDocument/definition" | "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range" | "textDocument/declaration" | "textDocument/implementation" | "textDocument/typeDefinition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" | "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes" | "typeHierarchy/subtypes" | "lightspeed/inheritanceGraph" => Some(Value::Null),
                             "textDocument/references" | "textDocument/documentSymbol" | "workspace/symbol" => Some(json!([])),
                             "textDocument/completion" => Some(json!({"isIncomplete": true, "items": []})),
                             "textDocument/rename" => {
@@ -646,6 +651,8 @@ impl Server {
                     "textDocument/references" => self.references(&params),
                     "textDocument/completion" => self.completion(&params),
                     "textDocument/documentSymbol" => self.document_symbols(&params),
+                    "textDocument/semanticTokens/full" => self.semantic_tokens(&params, false),
+                    "textDocument/semanticTokens/range" => self.semantic_tokens(&params, true),
                     "workspace/symbol" => self.workspace_symbols(&params),
                     _ => {
                         out.push(error(&id, -32601, "method not found"));
@@ -1054,6 +1061,29 @@ impl Server {
             }));
         }
         Value::Array(arr)
+    }
+
+    fn semantic_tokens(&self, params: &Value, ranged: bool) -> Option<Value> {
+        let path = uri_to_path(params["textDocument"]["uri"].as_str()?)?;
+        let text = self.text_of(&path)?;
+        let text = text.as_str();
+        let idx = self.index.as_ref()?;
+        let li = LineIndex::new(text);
+        let range = ranged.then(|| {
+            let at = |p: &Value| position_to_offset(text, &li, p["line"].as_u64().unwrap_or(0) as u32, p["character"].as_u64().unwrap_or(0) as u32);
+            (at(&params["range"]["start"]), at(&params["range"]["end"]))
+        });
+        let overlay = Overlay(&self.docs);
+        let toks = Query::new(idx, &overlay).semantic_tokens(text, range);
+        let mut data = Vec::with_capacity(toks.len() * 5);
+        let (mut pl, mut pc) = (0u32, 0u32);
+        for t in toks {
+            let (line, col) = offset_to_position(text, &li, t.start);
+            let end = offset_to_position(text, &li, t.start + t.len);
+            data.extend([line - pl, if line == pl { col - pc } else { col }, end.1.saturating_sub(col), t.ty as u32, t.mods as u32]);
+            (pl, pc) = (line, col);
+        }
+        Some(json!({"data": data}))
     }
 
     fn document_symbols(&self, params: &Value) -> Option<Value> {
