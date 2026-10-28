@@ -152,6 +152,210 @@ fn definition_on_the_definition_itself_returns_nothing() {
     assert_eq!(def("local;", 0).as_array().unwrap().len(), 1);
 }
 
+/// What "find references" of `Example::create` must and must not return in ordinary code.
+/// Every body line ending in `//=` is an expected hit; any other line is an expected miss.
+/// Bodies are checked once with `std` and once with `eastl` standing in for `NS`.
+mod ref_precision {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const STUBS: &str = r#"
+namespace NS {
+template<class T> struct vector {
+  T* begin(); T* end(); T& back(); T& front(); T& operator[](int i); T& at(int i);
+  void push_back(const T& v); T& emplace_back(); int size();
+};
+template<class A, class B> struct pair { A first; B second; };
+template<class K, class V> struct map {
+  struct iterator { pair<const K, V>& operator*(); pair<const K, V>* operator->(); iterator& operator++(); bool operator!=(const iterator& o); };
+  iterator begin(); iterator end(); iterator find(const K& k); V& operator[](const K& k); V& at(const K& k);
+};
+template<class T> struct unique_ptr { T* operator->(); T& operator*(); T* get(); };
+template<class T> struct shared_ptr { T* operator->(); T& operator*(); T* get(); };
+template<class T> struct optional { T* operator->(); T& operator*(); T& value(); };
+template<class T, class... A> unique_ptr<T> make_unique(A... a);
+template<class T, class... A> shared_ptr<T> make_shared(A... a);
+}
+struct Other { static Other* create(); Other* self(); int create_count; };
+"#;
+
+    fn check(body: &str, cursor: &str) {
+        let mut errors = Vec::new();
+        for ns in ["std", "eastl"] {
+            let src = format!("{}{}", STUBS.replace("NS", ns), body.replace("NS", ns));
+            let (_d, root) = tmp();
+            let a = format!("{root}/a.cpp");
+            std::fs::write(&a, &src).unwrap();
+            write_cdb_for(&root, &["a.cpp"]);
+            let mut c = Client::new(&root);
+            c.open(&a, &src);
+            let at = src.find(cursor).unwrap() + cursor.find("create").unwrap();
+            let (line, character) = offset_to_position(&src, &LineIndex::new(&src), at as u32);
+            let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&a)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}}));
+            let got: BTreeSet<usize> = r["result"].as_array().unwrap().iter().map(|l| l["range"]["start"]["line"].as_u64().unwrap() as usize).collect();
+            let lines: Vec<&str> = src.lines().collect();
+            let want: BTreeSet<usize> = (0..lines.len()).filter(|&i| lines[i].trim_end().ends_with("//=")).collect();
+            for &i in want.difference(&got) {
+                errors.push(format!("[{ns}] missing: {}", lines[i].trim()));
+            }
+            for &i in got.difference(&want) {
+                errors.push(format!("[{ns}] extra:   {}", lines[i].trim()));
+            }
+        }
+        assert!(errors.is_empty(), "\n{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn receivers_through_containers() {
+        check(
+            r#"
+struct Example { static Example* create();  //=
+  Example* self(); };
+Example& get();
+Other& other();
+void t(NS::vector<Example> xs, NS::vector<Example*> ps, NS::vector<Other> os, NS::map<int, Example> m, NS::pair<int, Example> pr, Example* p, Example& r, const Example& cr) {
+  Example::create();  //=
+  Other::create();
+  xs[0].create();  //=
+  xs.back().create();  //=
+  xs.at(1).create();  //=
+  xs.emplace_back().create();  //=
+  auto x = xs.back(); x.create();  //=
+  auto& y = xs.front(); y.create();  //=
+  auto it = xs.begin(); it->create();  //=
+  ps[0]->create();  //=
+  for (auto e : ps) e->create();  //=
+  for (auto& e : xs) e.create();  //=
+  for (const auto& e : xs) e.create();  //=
+  for (auto& o : os) o.create();
+  os[0].create();
+  m[1].create();  //=
+  m.at(1).create();  //=
+  m.find(1)->second.create();  //=
+  auto f = m.find(1); f->second.create();  //=
+  pr.second.create();  //=
+  p->create();  //=
+  r.create();  //=
+  cr.create();  //=
+  get().create();  //=
+  other().create();
+  p->self()->create();  //=
+  auto z = os.back(); z.create();
+  auto q = Example::create(); q->create();  //=
+}
+"#,
+            "Example* create(",
+        );
+    }
+
+    #[test]
+    fn structured_bindings_and_lambdas() {
+        check(
+            r#"
+struct Example { static Example* create();  //=
+};
+void t(NS::map<int, Example> m, NS::map<int, Other> mo, NS::vector<Example> xs, NS::pair<int, Example> pr) {
+  for (auto& [k, v] : m) v.create();  //=
+  for (const auto& [k, v] : m) v.create();  //=
+  for (auto& [k, v] : mo) v.create();
+  auto [a, b] = pr; b.create();  //=
+  auto& [c, d] = pr; d.create();  //=
+  auto cb = [](Example& e) { e.create(); };  //=
+  auto cb2 = [&](int i) { xs[i].create(); };  //=
+  auto cb3 = [&]() { for (auto& [k, v] : m) v.create(); };  //=
+  if (auto it = m.find(2); it != m.end()) it->second.create();  //=
+  if (auto* e = &xs[0]) e->create();  //=
+}
+"#,
+            "Example* create(",
+        );
+    }
+
+    #[test]
+    fn smart_pointers_and_factories() {
+        check(
+            r#"
+struct Example { static Example* create();  //=
+  static NS::unique_ptr<Example> make(); };
+void t(NS::unique_ptr<Example> up, NS::shared_ptr<Example> sp, NS::optional<Example> op, NS::unique_ptr<Other> uo) {
+  up->create();  //=
+  sp->create();  //=
+  op->create();  //=
+  op.value().create();  //=
+  (*up).create();  //=
+  up.get()->create();  //=
+  uo->create();
+  auto mu = NS::make_unique<Example>(); mu->create();  //=
+  auto ms = NS::make_shared<Example>(); ms->create();  //=
+  auto mo = NS::make_unique<Other>(); mo->create();
+  Example::make()->create();  //=
+  auto f = Example::make(); f->create();  //=
+}
+"#,
+            "Example* create(",
+        );
+    }
+
+    #[test]
+    fn overloads_by_arguments() {
+        check(
+            r#"
+struct Example { static Example* create(int n);  //=
+  static Example* create(const char* s);
+  static Example* create(); };
+void t(int n, const char* s, long l) {
+  Example::create(1);  //=
+  Example::create(n);  //=
+  Example::create(n + 1);  //=
+  Example::create(l);  //=
+  Example::create("x");
+  Example::create(s);
+  Example::create();
+}
+"#,
+            "create(int",
+        );
+    }
+
+    #[test]
+    fn scopes_inheritance_and_aliases() {
+        check(
+            r#"
+namespace a { struct Example { static Example* create();  //=
+  void run() { create(); }  //=
+  void run2() { Example::create(); }  //=
+  void run3() { this->create(); }  //=
+}; }
+namespace b { struct Example { static Example* create(); void run() { create(); } }; void f(Example e) { e.create(); } }
+namespace a { void f(Example e) { e.create(); }  //=
+}
+struct Derived : a::Example { void go() { create(); }  //=
+};
+struct Unrelated { void create(); void go() { create(); } };
+using Alias = a::Example;
+typedef a::Example Typedef;
+namespace c { using a::Example; void f() { Example::create(); } }  //=
+void t(Derived d, Alias al, Typedef td, b::Example be, Unrelated u) {
+  a::Example::create();  //=
+  b::Example::create();
+  Derived::create();  //=
+  d.create();  //=
+  Alias::create();  //=
+  al.create();  //=
+  Typedef::create();  //=
+  td.create();  //=
+  be.create();
+  u.create();
+  a::Example e; e.create();  //=
+  b::Example f; f.create();
+  Other::create();
+}
+"#,
+            "Example* create(",
+        );
+    }
+}
+
 /// Like `common::write_cdb`, but lists every given translation unit.
 fn write_cdb_for(root: &str, files: &[&str]) {
     let cdb: Vec<Value> = files.iter().map(|f| json!({"directory": root, "file": f, "arguments": ["clang++", "-c", f, "-I", root]})).collect();
@@ -530,6 +734,19 @@ mod godot {
         c.change(&file, &edited);
         let r = definition(&mut c, &file, &edited, edited.find("ClassDB::bind_method").unwrap());
         assert!(r["result"][0]["uri"].as_str().unwrap().ends_with("class_db.h"), "{r}");
+    }
+
+    #[test]
+    #[ignore = "needs a Godot checkout and --release"]
+    fn godot_references_latency() {
+        let (mut c, file, text) = open();
+        for needle in ["ClassDB::bind_method", "RefCounted::reference", "RefCounted::unreference", "RefCounted::get_reference_count", "RefCounted::RefCounted", "init_ref"] {
+            let at = text.find(needle).unwrap() + needle.find("::").map_or(0, |i| i + 2);
+            let (line, character) = offset_to_position(&text, &LineIndex::new(&text), at as u32);
+            let t0 = std::time::Instant::now();
+            let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&file)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}}));
+            eprintln!("references {needle}: {} locations in {:?}", r["result"].as_array().map_or(0, Vec::len), t0.elapsed());
+        }
     }
 
     #[test]

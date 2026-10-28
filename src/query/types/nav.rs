@@ -95,7 +95,7 @@ impl Query<'_> {
             }
         }
         for t in tys {
-            let found = db.lookup(&t.head).to_vec();
+            let found = self.lookup_ty(&t);
             let recs = self.resolve_records(found.iter().copied());
             if recs.is_empty() {
                 for f in found.into_iter().filter(|&f| db.symbol(f).kind.is_type()) {

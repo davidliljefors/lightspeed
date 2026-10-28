@@ -40,23 +40,40 @@ const PRIMS: &[&str] = &[
     "uint32_t", "uint64_t", "wchar_t", "char8_t", "char16_t", "char32_t", "intptr_t", "uintptr_t", "ptrdiff_t",
 ];
 
+/// Coarse class of a built-in type: arguments convert freely within one.
+fn prim_family(name: &str) -> u8 {
+    match name {
+        "bool" => 0,
+        "char" | "wchar_t" | "char8_t" | "char16_t" | "char32_t" => 1,
+        "float" | "double" => 2,
+        _ => 3,
+    }
+}
+
 /// A written type reduced to what member lookup needs: its leading name and,
 /// for templates, its arguments, each as normalized type text (`Foo`,
-/// `vector<Foo>`; qualifiers, `const` and `*`/`&` dropped) so they can be
-/// parsed again with [`parse_ty`] when substituted into a member's type.
-#[derive(Clone)]
+/// `vector<Foo>`; `const` and `*`/`&` dropped) so they can be parsed again
+/// with [`parse_ty`] when substituted into a member's type.
+///
+/// `qual` is the scope the name lives in, so `a::Foo` and `b::Foo` stay apart:
+/// either as written (`a`, matched against the end of a qualified name) or,
+/// with a leading `::`, a full path (`::a::b`, `::` for the global scope) that
+/// [`Query::qualify`] filled in for a name written unqualified.
+#[derive(Clone, Default)]
 struct Ty {
     head: String,
     args: Vec<String>,
+    qual: String,
 }
 
 impl Ty {
-    fn plain(head: &str) -> Self {
-        Self { head: head.to_owned(), args: Vec::new() }
-    }
-
     fn text(&self) -> String {
-        if self.args.is_empty() { self.head.clone() } else { format!("{}<{}>", self.head, self.args.join(", ")) }
+        let name = match self.qual.as_str() {
+            "" => self.head.clone(),
+            "::" => format!("::{}", self.head),
+            q => format!("{q}::{}", self.head),
+        };
+        if self.args.is_empty() { name } else { format!("{name}<{}>", self.args.join(", ")) }
     }
 
     /// The type reached through `->` or `*` on a smart pointer.
@@ -77,7 +94,7 @@ fn container_alias(name: &str, recv: &Ty) -> Option<Ty> {
         | "const_reverse_iterator" | "local_iterator" | "const_local_iterator"
             if is_map && recv.args.len() >= 2 =>
         {
-            Some(Ty { head: "pair".to_owned(), args: recv.args[..2].to_vec() })
+            Some(Ty { head: "pair".to_owned(), args: recv.args[..2].to_vec(), ..Ty::default() })
         }
         "value_type" | "reference" | "const_reference" | "pointer" | "const_pointer" | "iterator" | "const_iterator" | "reverse_iterator"
         | "const_reverse_iterator" | "local_iterator" | "const_local_iterator" => arg(0),
@@ -110,6 +127,81 @@ enum Decl {
 }
 
 impl Query<'_> {
+    /// Symbols the type `ty` may name: those called `ty.head` that sit in the
+    /// scope it was written with. An unmatched qualifier (namespace alias,
+    /// inline namespace) is ignored rather than trusted.
+    fn lookup_ty(&self, ty: &Ty) -> Vec<SymbolId> {
+        const MAX_SCAN: usize = 4096;
+        let db = &self.idx.db;
+        let all = db.lookup(&ty.head);
+        if ty.qual.is_empty() || all.len() <= 1 || all.len() > MAX_SCAN {
+            return all.to_vec();
+        }
+        let (rooted, path) = ty.qual.strip_prefix("::").map_or((false, ty.qual.as_str()), |p| (true, p));
+        let want = if path.is_empty() { ty.head.clone() } else { format!("{path}::{}", ty.head) };
+        let tail = format!("::{want}");
+        let hits: Vec<SymbolId> = all
+            .iter()
+            .copied()
+            .filter(|&c| {
+                let q = db.qualified_name(c);
+                q == want || (!rooted && q.ends_with(&tail))
+            })
+            .collect();
+        if hits.is_empty() { all.to_vec() } else { hits }
+    }
+
+    /// Pins an unqualified type name that several scopes declare to the one
+    /// visible from `scope` (innermost enclosing scope first, as C++ looks
+    /// names up), including inside its template arguments. Names declared in
+    /// one place only are left alone: nothing to tell apart.
+    fn qualify(&self, mut ty: Ty, scope: &dyn Fn() -> String) -> Ty {
+        const MAX_CANDS: usize = 256;
+        let db = &self.idx.db;
+        let parent_of = |q: &str| q.rfind("::").map_or(String::new(), |i| q[..i].to_owned());
+        let all = db.lookup(&ty.head);
+        if ty.qual.is_empty() && all.len() > 1 && all.len() <= MAX_CANDS {
+            let homes: Vec<String> = all
+                .iter()
+                .filter(|&&c| db.symbol(c).kind.is_record() || db.symbol(c).kind == SymbolKind::TypeAlias)
+                .map(|&c| parent_of(&db.qualified_name(c)))
+                .collect();
+            if homes.iter().any(|h| *h != homes[0]) {
+                let mut s = scope();
+                loop {
+                    if homes.contains(&s) {
+                        ty.qual = format!("::{s}");
+                        break;
+                    }
+                    if s.is_empty() {
+                        break;
+                    }
+                    s = parent_of(&s);
+                }
+            }
+        }
+        for a in &mut ty.args {
+            let stars = a.len() - a.trim_end_matches('*').len();
+            if let Some(t) = parse_ty(&a[..a.len() - stars]) {
+                *a = self.qualify(t, scope).text() + &"*".repeat(stars);
+            }
+        }
+        ty
+    }
+
+    /// [`Self::qualify`] for a type written in the declaration of `id`.
+    fn qualify_in(&self, ty: Ty, id: SymbolId) -> Ty {
+        self.qualify(ty, &|| {
+            let q = self.idx.db.qualified_name(id);
+            q.rfind("::").map_or(String::new(), |i| q[..i].to_owned())
+        })
+    }
+
+    /// [`Self::qualify`] for a type written at the use site described by `cx`.
+    fn qualify_at(&self, cx: &Cx, ty: Ty) -> Ty {
+        self.qualify(ty, &|| cx.scopes.iter().map(|&s| self.idx.db.qualified_name(s)).max_by_key(String::len).unwrap_or_default())
+    }
+
     /// Records `ids` may denote, following type aliases (`typedef struct _X X`,
     /// `using X = Y`) through their written target. Depth-limited, and each alias
     /// is expanded at most once with a small global budget: alias targets are
@@ -233,7 +325,7 @@ impl Query<'_> {
         if text[end..].starts_with("->") {
             ty = self.arrow_ty(&cx, ty);
         }
-        self.resolve_records(db.lookup(&ty.head).iter().copied())
+        self.resolve_records(self.lookup_ty(&ty))
     }
 
     /// Type of the expression `expr`; `prefix` are the tokens before it, in
@@ -290,14 +382,22 @@ impl Query<'_> {
         let Some(t) = expr.get(i) else { return Some(ty) };
         match t.kind {
             K::Eq | K::Comma | K::Semi => Some(ty),
-            // Binary operator: only overloaded ones on class types yield members.
-            _ => self.operator_ty(cx, &ty, &format!("operator{}", cx.text_of(t))),
+            // Binary operator: only overloaded ones on class types yield members; arithmetic keeps the left type.
+            _ => self.operator_ty(cx, &ty, &format!("operator{}", cx.text_of(t))).or_else(|| PRIMS.contains(&ty.head.as_str()).then_some(ty)),
         }
     }
 
     /// A primary expression at `expr[i..]` and the index just after it.
     fn primary_ty(&self, cx: &Cx, prefix: &[Token], expr: &[Token], mut i: usize, depth: u8) -> Option<(Ty, usize)> {
         let tx = |t: &Token| t.text(cx.text);
+        if let Some(t) = expr.get(i).filter(|t| matches!(t.kind, K::String | K::Char | K::Number)) {
+            let head = match t.kind {
+                K::Number if tx(t).starts_with("0x") || !tx(t).contains(['.', 'e']) => "int",
+                K::Number => "double",
+                _ => "char",
+            };
+            return Some((Ty { head: head.to_owned(), ..Ty::default() }, i + 1));
+        }
         if expr.get(i).is_some_and(|t| t.kind == K::LParen) {
             let j = matching_fwd(expr, i)?;
             let inner = &expr[i + 1..j];
@@ -336,7 +436,7 @@ impl Query<'_> {
             i = matching_fwd(expr, i)? + 1;
         }
         let ty = if is_new {
-            Ty { head: name.to_owned(), args: targs }
+            self.qualify_at(cx, Ty { head: name.to_owned(), args: targs, qual: path.last().map(|q| q.to_string()).unwrap_or_default() })
         } else if called && PASS_THROUGH.contains(&name) {
             let args = &expr[open + 1..i - 1];
             let first = &args[..top_level(args, K::Comma).unwrap_or(args.len())];
@@ -354,7 +454,7 @@ impl Query<'_> {
     }
 
     fn resolves(&self, ty: &Ty) -> bool {
-        !self.resolve_records(self.idx.db.lookup(&ty.head).iter().copied()).is_empty()
+        !self.resolve_records(self.lookup_ty(ty)).is_empty()
     }
 
     /// Member `name` (usually an `operator…`) of the class `ty` names, or its bases.
@@ -364,7 +464,7 @@ impl Query<'_> {
 
     fn operator_ty_n(&self, cx: &Cx, ty: &Ty, name: &str, arity: Option<usize>) -> Option<Ty> {
         let ty = &self.expand_alias(cx, ty.clone());
-        let mut owners = self.resolve_records(self.idx.db.lookup(&ty.head).iter().copied());
+        let mut owners = self.resolve_records(self.lookup_ty(ty));
         self.choose_specialization(&mut owners, (!ty.args.is_empty()).then_some(&ty.args[..]));
         self.member_ty_n(cx, &owners, name, Some(ty), arity)
     }
@@ -377,7 +477,7 @@ impl Query<'_> {
             if !ty.args.is_empty() {
                 break;
             }
-            let cands = db.lookup(&ty.head);
+            let cands = self.lookup_ty(&ty);
             if cands.iter().any(|&c| db.symbol(c).kind.is_record()) {
                 break;
             }
@@ -426,7 +526,7 @@ impl Query<'_> {
     /// Type of a name declared with `auto` (possibly as one element of a structured binding).
     fn auto_decl_ty(&self, cx: &Cx, prefix: &[Token], d: Decl, depth: u8) -> Option<Ty> {
         match d {
-            Decl::Ty(t) => Some(t),
+            Decl::Ty(t) => Some(self.qualify_at(cx, t)),
             Decl::Auto { decl, start, end } => self.expr_ty(cx, &prefix[..decl], &prefix[start..end], depth + 1),
             Decl::Range { decl, start, end } => {
                 let container = self.expr_ty(cx, &prefix[..decl], &prefix[start..end], depth + 1)?;
@@ -449,7 +549,7 @@ impl Query<'_> {
             return ty.args.first().and_then(|a| parse_ty(a));
         }
         let db = &self.idx.db;
-        let mut owners = self.resolve_records(db.lookup(&ty.head).iter().copied());
+        let mut owners = self.resolve_records(self.lookup_ty(ty));
         self.choose_specialization(&mut owners, (!ty.args.is_empty()).then_some(&ty.args[..]));
         let owner = *owners.first()?;
         let field = db.children(owner).iter().copied().filter(|&m| db.symbol(m).kind == SymbolKind::Field && !db.symbol(m).flags.contains(crate::symbols::SymbolFlags::STATIC)).nth(n)?;
@@ -491,10 +591,10 @@ impl Query<'_> {
         let db = &self.idx.db;
         if name == "this" {
             let c = cx.scopes.iter().copied().find(|&c| db.symbol(c).kind.is_record())?;
-            return Some(Ty::plain(db.name(c)));
+            return Some(self.ty_of(c));
         }
         match declared_before(prefix, cx.text, name) {
-            Some(Decl::Ty(t)) => return Some(t),
+            Some(Decl::Ty(t)) => return Some(self.qualify_at(cx, t)),
             Some(d) => return self.auto_decl_ty(cx, prefix, d, depth),
             None => {}
         }
@@ -518,11 +618,11 @@ impl Query<'_> {
             return targs.first().and_then(|a| parse_ty(a));
         }
         if MAKE_SMART.contains(&name) {
-            return targs.first().map(|a| Ty { head: "unique_ptr".to_owned(), args: vec![a.clone()] });
+            return targs.first().map(|a| Ty { head: "unique_ptr".to_owned(), args: vec![a.clone()], ..Ty::default() });
         }
         let db = &self.idx.db;
         if !self.resolve_records(db.lookup(name).iter().copied()).is_empty() {
-            return Some(Ty { head: name.to_owned(), args: targs.to_vec() });
+            return Some(self.qualify_at(cx, Ty { head: name.to_owned(), args: targs.to_vec(), qual: qual.unwrap_or_default().to_owned() }));
         }
         let (in_scope, in_bases) = self.scope_set(cx.scopes);
         let is_fn = |c: SymbolId| db.name(c) == name && matches!(db.symbol(c).kind, SymbolKind::Function | SymbolKind::Method);
@@ -550,6 +650,22 @@ impl Query<'_> {
             }
         }
         best.map(|(_, t)| t)
+    }
+
+    /// Of equally ranked overloads of the call at `toks[i]`, those whose
+    /// parameter types fit the arguments best. Unchanged when no argument type is known.
+    pub(super) fn best_overloads(&self, path: &str, text: &str, toks: &[Token], i: usize, cands: Vec<SymbolId>) -> Vec<SymbolId> {
+        let open = i + 1;
+        let Some(close) = matching_fwd(toks, open) else { return cands };
+        let scopes = self.scopes_at(self.idx.file_index(path), toks[i].start);
+        let cx = Cx { path, text, scopes: &scopes };
+        let arg_tys: Vec<Option<Ty>> = split_call_args(&toks[open + 1..close]).into_iter().map(|a| self.expr_ty(&cx, &toks[..=open], a, 1)).collect();
+        if arg_tys.iter().all(Option::is_none) {
+            return cands;
+        }
+        let fits: Vec<(SymbolId, (bool, i32))> = cands.iter().map(|&c| (c, self.call_fit(&cx, c, &arg_tys))).collect();
+        let best = fits.iter().map(|f| f.1).max();
+        fits.into_iter().filter(|f| Some(f.1) == best).map(|f| f.0).collect()
     }
 
     /// Whether `c` accepts `args.len()` arguments and how well its parameter
@@ -595,7 +711,7 @@ impl Query<'_> {
             return 2;
         }
         let (ap, pp) = (PRIMS.contains(&arg.head.as_str()), PRIMS.contains(&param.head.as_str()));
-        let rec = |t: &Ty| self.resolve_records(self.idx.db.lookup(&t.head).iter().copied()).first().copied();
+        let rec = |t: &Ty| self.resolve_records(self.lookup_ty(t)).first().copied();
         match (rec(arg), rec(param)) {
             (Some(a), Some(p)) => {
                 if self.idx.hier.is_a(a, p) {
@@ -606,7 +722,9 @@ impl Query<'_> {
             }
             (Some(_), None) if pp => -3,
             (None, Some(_)) if ap => -3,
-            (None, None) if ap && pp => -1,
+            (None, None) if ap && pp => {
+                if prim_family(&arg.head) == prim_family(&param.head) { 1 } else { -1 }
+            }
             _ => 0,
         }
     }
@@ -704,7 +822,7 @@ impl Query<'_> {
             let close = matching_fwd(&toks, i + 1)?;
             Some(split_args(&toks[i + 2..close], head))
         })?;
-        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written }, derived, recv))
+        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written, qual: self.ty_of(base).qual }, derived, recv))
     }
 
     /// `ty`, written inside template `owner`, as seen from `recv = owner<args>`.
@@ -726,7 +844,7 @@ impl Query<'_> {
                 })
                 .map(Option::unwrap_or_default)
                 .collect();
-            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args }, 0);
+            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args, qual: recv.qual.clone() }, 0);
         }
         self.subst(cx, ty, owner, &params, recv, 0)
     }
@@ -760,7 +878,7 @@ impl Query<'_> {
                 None => a.clone(),
             })
             .collect();
-        Ty { head: ty.head.clone(), args }
+        Ty { head: ty.head.clone(), args, qual: ty.qual.clone() }
     }
 
     /// Source text of the file declaring `s`.
@@ -795,6 +913,7 @@ impl Query<'_> {
             };
             declared_type_tail(toks.get(lo..hi)?, src)
         })
+        .map(|t| self.qualify_in(t, id))
     }
 
     /// Written type of a declaration: a field/variable's type or a function's return type.
@@ -805,6 +924,15 @@ impl Query<'_> {
             let toks = sig_tokens(slice);
             declared_type_tail(&toks, slice).filter(|t| t.head != "auto")
         })
+        .map(|t| self.qualify_in(t, id))
+    }
+
+    /// The class (or other type) `id` itself, written fully qualified.
+    fn ty_of(&self, id: SymbolId) -> Ty {
+        let db = &self.idx.db;
+        let q = db.qualified_name(id);
+        let scope = q.rfind("::").map_or("", |i| &q[..i]);
+        Ty { head: db.name(id).to_owned(), args: Vec::new(), qual: format!("::{scope}") }
     }
 }
 
@@ -964,7 +1092,20 @@ fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
         let inner = declared_type_tail(&toks[..i - 2], text)?;
         return Some(trait_result(&inner).unwrap_or(inner));
     }
-    let ty = (i > 0 && toks[i - 1].kind == K::Ident).then(|| Ty { head: toks[i - 1].text(text).to_owned(), args })?;
+    let name = (i > 0 && toks[i - 1].kind == K::Ident).then(|| i - 1)?;
+    let (mut lo, mut path) = (name, Vec::new());
+    while lo >= 2 && toks[lo - 1].kind == K::ColonColon && toks[lo - 2].kind == K::Ident {
+        path.push(toks[lo - 2].text(text));
+        lo -= 2;
+    }
+    path.reverse();
+    let rooted = lo >= 1 && toks[lo - 1].kind == K::ColonColon && (lo == 1 || !matches!(toks[lo - 2].kind, K::Gt | K::Ident));
+    let qual = match (rooted, path.is_empty()) {
+        (false, _) => path.join("::"),
+        (true, true) => "::".to_owned(),
+        (true, false) => format!("::{}", path.join("::")),
+    };
+    let ty = Ty { head: toks[name].text(text).to_owned(), args, qual };
     Some(trait_result(&ty).unwrap_or(ty))
 }
 

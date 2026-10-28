@@ -185,6 +185,9 @@ impl Query<'_> {
         }
 
         let mut picked = best.1;
+        if arity.is_some() && picked.len() > 1 && picked.iter().all(|&c| db.symbol(c).kind.is_callable()) {
+            picked = self.best_overloads(path, text, toks, i, picked);
+        }
         if picked.iter().any(|&c| is_forward_decl_kind(db, c) && db.symbol(c).flags.contains(SymbolFlags::DEFINITION)) {
             picked.retain(|&c| !is_forward_decl_kind(db, c) || db.symbol(c).flags.contains(SymbolFlags::DEFINITION));
         }
