@@ -16,6 +16,8 @@ mod consteval;
 mod definition;
 mod hover;
 mod locals;
+mod occurrences;
+pub use occurrences::{FileOccurrences, OccurrenceStats};
 mod refs;
 mod search;
 mod semantic;

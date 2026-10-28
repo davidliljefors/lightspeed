@@ -38,6 +38,31 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
     );
     println!("{}", idx.stats.report(threads));
     println!("{}", idx.memory_report());
+    if args.iter().any(|a| a == "--occurrences") {
+        use lightspeed::base::mem::{mib, process_bytes};
+        use lightspeed::query::{DiskText, Query};
+        let before = process_bytes().0;
+        let t1 = Instant::now();
+        let (occ, st) = pool.install(|| Query::new(&idx, &DiskText).build_occurrences());
+        let secs = t1.elapsed().as_secs_f64();
+        let after = process_bytes();
+        println!(
+            "occurrences: {} files, {} candidate identifiers ({} member accesses, {} locals skipped) in {:.2} s on {threads} threads",
+            st.files, st.candidates, st.members, st.locals, secs
+        );
+        println!(
+            "  stored {} certain ({:.1}%), {} ambiguous, {} unresolved | table {} | resident {} -> {} (peak {})",
+            st.stored,
+            100.0 * st.stored as f64 / st.candidates.max(1) as f64,
+            st.ambiguous,
+            st.unresolved,
+            mib(st.bytes),
+            mib(before),
+            mib(after.0),
+            mib(after.1)
+        );
+        drop(occ);
+    }
     0
 }
 
