@@ -1,5 +1,7 @@
 //! Index build/update and navigation queries against real files on disk.
 
+mod common;
+
 use lightspeed::compile_commands::CompileDb;
 use lightspeed::index::{Index, IndexConfig};
 use lightspeed::query::{DiskText, Query};
@@ -51,39 +53,8 @@ fn names(idx: &Index, ids: &[SymbolId]) -> Vec<String> {
     ids.iter().map(|&i| idx.db.qualified_name(i)).collect()
 }
 
-/// Everything the indexes and hierarchy answer, keyed by names and source
-/// offsets (not IDs), so an incrementally patched index can be compared with a fresh one.
 fn observable(idx: &Index) -> Vec<String> {
-    let label = |id: SymbolId| {
-        let s = idx.db.symbol(id);
-        let file = idx.db.file_path(id).rsplit('/').next().unwrap().to_owned();
-        format!("{}@{file}:{}", idx.db.qualified_name(id), s.name_offset)
-    };
-    let sorted = |ids: &[SymbolId]| {
-        let mut v: Vec<String> = ids.iter().map(|&i| label(i)).collect();
-        v.sort();
-        v.join(",")
-    };
-    let mut out = Vec::new();
-    for (id, s) in idx.db.symbols().iter_enumerated() {
-        if idx.db.is_dead(id) {
-            continue;
-        }
-        let same_name = sorted(idx.db.lookup(idx.db.name(id)));
-        let children = sorted(idx.db.children(id));
-        let canon = label(idx.hier.canonical(id));
-        let fam = sorted(idx.hier.family_members(&idx.db, id));
-        let defs = sorted(idx.hier.out_of_line_defs(id));
-        let (mut ab, mut ad) = (Vec::new(), Vec::new());
-        idx.hier.all_bases(id, &mut ab);
-        idx.hier.all_derived(id, &mut ad);
-        let bases = sorted(idx.hier.bases(id));
-        let derived = sorted(idx.hier.derived(id));
-        let (ab, ad) = (sorted(&ab), sorted(&ad));
-        out.push(format!("{} {:?} | named [{same_name}] | children [{children}] | canonical {canon} | family [{fam}] | defs [{defs}] | bases [{bases}] derived [{derived}] all [{ab}] [{ad}] | {}", label(id), s.kind, s.family.is_some()));
-    }
-    out.sort();
-    out
+    common::observable(idx, 1)
 }
 
 #[test]

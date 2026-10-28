@@ -572,6 +572,9 @@ impl Hierarchy {
     /// bases and derived classes (the same algorithm as [`Self::build`]).
     fn recompute_families(&mut self, db: &mut SymbolDb, comp: &[SymbolId]) {
         let members: Vec<SymbolId> = comp.iter().flat_map(|&c| db.children(c).iter().copied()).collect();
+        // Definitions attached to a declaration elsewhere take its family; they are not members here.
+        let is_def = |h: &Self, m: SymbolId| h.canonical.get(m.index()).copied().flatten().is_some_and(|c| c != m);
+        let members: Vec<SymbolId> = members.into_iter().filter(|&m| !is_def(self, m)).collect();
         for &m in &members {
             if let Some(f) = db.symbol(m).family {
                 self.families_ovr.insert(f, Vec::new());
@@ -631,6 +634,9 @@ impl Hierarchy {
             }
             for &m in db.children(c) {
                 let s = db.symbol(m);
+                if is_def(self, m) {
+                    continue;
+                }
                 if s.flags.contains(SymbolFlags::STATIC) {
                     continue;
                 }

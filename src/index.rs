@@ -938,6 +938,13 @@ impl Index {
         self.dirty
     }
 
+    /// Discards incrementally patched indexes and hierarchy and rebuilds them
+    /// from the symbol tables. Used as the reference when testing patching.
+    pub fn rebuild_all(&mut self) {
+        self.dirty = true;
+        self.flush();
+    }
+
     /// Rebuilds name/children indexes and the hierarchy if anything changed,
     /// compacting first when tombstones pile up. O(symbols).
     pub fn flush(&mut self) {
