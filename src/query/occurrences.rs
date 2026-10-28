@@ -48,8 +48,40 @@ enum Pick {
 }
 
 impl Query<'_> {
-    /// Narrows several candidates for the identifier of file `fi` to one entity if possible.
-    fn pick_unique(&self, fi: usize, r: &[SymbolId], type_position: bool) -> Pick {
+    /// For every file, the files whose declarations some translation unit including it can see:
+    /// the union of the reachable sets of every root translation unit above it. A header that
+    /// relies on what its includer pulled in first is judged by all of its includers.
+    fn visibility_contexts(&self) -> Vec<Vec<u64>> {
+        let idx = self.idx;
+        let n = idx.files.len();
+        let words = n.div_ceil(64);
+        let mut included = vec![false; n];
+        for (fi, _) in idx.live_files() {
+            for t in idx.included_files(fi) {
+                included[t] = true;
+            }
+        }
+        let mut vis = vec![vec![0u64; words]; n];
+        for (fi, _) in idx.live_files() {
+            let reach = idx.reachable_files(fi);
+            let mut own = vec![0u64; words];
+            for &f in reach.iter() {
+                own[f as usize / 64] |= 1 << (f % 64);
+            }
+            // Roots define the contexts; a file in an include cycle with no root keeps its own.
+            let targets: Vec<usize> = if included[fi] { vec![fi] } else { reach.iter().map(|&f| f as usize).collect() };
+            for f in targets {
+                for (w, o) in vis[f].iter_mut().zip(&own) {
+                    *w |= o;
+                }
+            }
+        }
+        vis
+    }
+
+    /// Narrows the candidates for the identifier of file `fi` to one entity if possible. A
+    /// candidate nothing in the including translation units can see is not a candidate.
+    fn pick_unique(&self, vis: &[u64], r: &[SymbolId], type_position: bool) -> Pick {
         let (db, hier) = (&self.idx.db, &self.idx.hier);
         // Records of one entity (forward declarations, definitions, overrides) are one symbol.
         let one_entity = |v: &[SymbolId]| {
@@ -57,46 +89,55 @@ impl Query<'_> {
             self.equivalents(v[0], &mut group);
             v.iter().all(|c| group.contains(c))
         };
-        if one_entity(r) {
-            return Pick::One(hier.canonical(r[0]));
-        }
-        let seen = self.idx.reachable_files(fi);
-        let mut v: Vec<SymbolId> = r.iter().copied().filter(|&c| self.location(c).is_some_and(|l| seen.contains(&l.file))).collect();
+        let seen = |c: SymbolId| {
+            let mut group = vec![c];
+            self.equivalents(c, &mut group);
+            group.iter().any(|&s| self.location(s).is_some_and(|l| vis[l.file as usize / 64] >> (l.file % 64) & 1 == 1))
+        };
+        let mut v: Vec<SymbolId> = r.iter().copied().filter(|&c| seen(c)).collect();
         if v.is_empty() {
             return Pick::External;
         }
-        // `X::` and `X name` can only name a type or namespace.
+        // `X::` and `X name` can only name a type or namespace (or a macro that expands to one).
         if type_position {
-            let scopes: Vec<SymbolId> = v.iter().copied().filter(|&c| db.symbol(c).kind.is_type() || db.symbol(c).kind == SymbolKind::Namespace).collect();
+            let scopes: Vec<SymbolId> = v.iter().copied().filter(|&c| db.symbol(c).kind.is_type() || matches!(db.symbol(c).kind, SymbolKind::Namespace | SymbolKind::Macro)).collect();
             if !scopes.is_empty() {
                 v = scopes;
             }
         }
-        // Conditional `#define`s of one name are one macro as far as uses are concerned.
+        // Conditional `#define`s of one name in one file are one macro as far as uses are concerned.
         if v.iter().all(|&c| db.symbol(c).kind == SymbolKind::Macro) {
-            return Pick::One(hier.canonical(v[0]));
+            let file = db.symbol(v[0]).file;
+            return if v.iter().all(|&c| db.symbol(c).file == file) { Pick::One(hier.canonical(*v.iter().min().unwrap())) } else { Pick::Ambiguous(v) };
         }
-        // `typedef struct Foo Foo;` names the struct twice.
-        let qn = |c: SymbolId| db.qualified_name(c);
-        let types: Vec<String> = v.iter().filter(|&&c| matches!(db.symbol(c).kind, SymbolKind::Struct | SymbolKind::Class | SymbolKind::Union | SymbolKind::Enum)).map(|&c| qn(c)).collect();
-        v.retain(|&c| db.symbol(c).kind != SymbolKind::TypeAlias || !types.contains(&qn(c)));
+        // `typedef struct Foo Foo;` names the struct twice; an alias of something else does not.
+        let aliases: Vec<SymbolId> = v
+            .iter()
+            .copied()
+            .filter(|&c| {
+                db.symbol(c).kind == SymbolKind::TypeAlias && {
+                    let q = db.qualified_name(c);
+                    self.resolve_records([c]).iter().any(|&t| db.qualified_name(t) == q && v.contains(&t))
+                }
+            })
+            .collect();
+        v.retain(|c| !aliases.contains(c));
         // A namespace reopened in several files is one namespace.
-        let mut spaces: Vec<String> = Vec::new();
-        v.retain(|&c| {
-            if db.symbol(c).kind != SymbolKind::Namespace {
-                return true;
-            }
-            let q = qn(c);
-            let fresh = !spaces.contains(&q);
-            spaces.push(q);
-            fresh
-        });
-        if one_entity(&v) { Pick::One(hier.canonical(v[0])) } else { Pick::Ambiguous(v) }
+        let first_space = v.iter().copied().find(|&c| db.symbol(c).kind == SymbolKind::Namespace);
+        if let Some(first) = first_space {
+            let q = db.qualified_name(first);
+            let spaces: Vec<SymbolId> = v.iter().copied().filter(|&c| db.symbol(c).kind == SymbolKind::Namespace && db.qualified_name(c) == q).collect();
+            let canon = *spaces.iter().min().unwrap();
+            v.retain(|c| !spaces.contains(c));
+            v.push(canon);
+        }
+        if v.len() == 1 || one_entity(&v) { Pick::One(hier.canonical(v[0])) } else { Pick::Ambiguous(v) }
     }
 
     /// Resolves every candidate identifier of every live file in parallel.
     pub fn build_occurrences(&self) -> (Vec<FileOccurrences>, OccurrenceStats) {
         let idx = self.idx;
+        let contexts = self.visibility_contexts();
         let files: Vec<(usize, &str)> = idx.live_files().map(|(i, f)| (i, f.path.as_str())).collect();
         let parts: Vec<(usize, FileOccurrences, OccurrenceStats)> = files
             .par_iter()
@@ -107,6 +148,22 @@ impl Query<'_> {
                 let Some(t) = self.texts.text(path) else { return (fi, out, st) };
                 let text = t.as_str();
                 let toks = sig_tokens(text);
+                let vis = &contexts[fi];
+                // Aliases a qualifier may be spelled through; spelled anywhere in the file or its includes.
+                let file_aliases = std::cell::OnceCell::new();
+                let qualifier_is_alias = |i: usize| {
+                    let mut j = i;
+                    while j >= 2 && toks[j - 1].kind == K::ColonColon && toks[j - 2].kind == K::Ident {
+                        j -= 2;
+                    }
+                    if j == i {
+                        return false;
+                    }
+                    let q = toks[j].text(text);
+                    idx.db.lookup(q).iter().any(|&c| matches!(idx.db.symbol(c).kind, SymbolKind::TypeAlias | SymbolKind::Macro))
+                        || idx.included_decls(fi).alias(q).is_some()
+                        || file_aliases.get_or_init(|| crate::scope_decls::scan(&toks, text, toks.len(), false)).alias(q).is_some()
+                };
                 for (i, tok) in toks.iter().enumerate() {
                     if tok.kind != K::Ident || tok.keyword == Keyword::Reserved {
                         continue;
@@ -125,23 +182,27 @@ impl Query<'_> {
                         continue;
                     }
                     let r = self.definition_in(&toks, path, text, i);
-                    match r.as_slice() {
-                        [] => st.unresolved += 1,
-                        [one] => out.sites.push((tok.start, *one)),
-                        _ => match self.pick_unique(fi, &r, toks.get(i + 1).is_some_and(|t| t.kind == K::ColonColon || (t.kind == K::Ident && t.keyword != Keyword::Reserved))) {
-                            Pick::One(s) => out.sites.push((tok.start, s)),
-                            Pick::External => st.external += 1,
-                            Pick::Ambiguous(visible) => {
-                                st.ambiguous += 1;
-                                if debug {
-                                    let db = &idx.db;
-                                    let ctx = if i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow) { "member" } else if i > 0 && toks[i - 1].kind == K::ColonColon { "qualified" } else { "bare" };
-                                    let call = toks.get(i + 1).is_some_and(|t| t.kind == K::LParen);
-                                    let kinds: std::collections::BTreeSet<String> = visible.iter().map(|&c| format!("{:?}", db.symbol(c).kind)).collect();
-                                    eprintln!("AMB\t{name}\t{ctx}\t{}\t{}/{}\t{}\t{}:{}", if call { "call" } else { "nocall" }, visible.len(), r.len(), kinds.into_iter().collect::<Vec<_>>().join("+"), path.rsplit('/').next().unwrap_or(path), text[..tok.start as usize].matches('\n').count() + 1);
-                                }
+                    if r.is_empty() {
+                        st.unresolved += 1;
+                        continue;
+                    }
+                    if qualifier_is_alias(i) {
+                        st.ambiguous += 1;
+                        continue;
+                    }
+                    match self.pick_unique(vis, &r, toks.get(i + 1).is_some_and(|t| t.kind == K::ColonColon || (t.kind == K::Ident && t.keyword != Keyword::Reserved))) {
+                        Pick::One(s) => out.sites.push((tok.start, s)),
+                        Pick::External => st.external += 1,
+                        Pick::Ambiguous(visible) => {
+                            st.ambiguous += 1;
+                            if debug {
+                                let db = &idx.db;
+                                let ctx = if i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow) { "member" } else if i > 0 && toks[i - 1].kind == K::ColonColon { "qualified" } else { "bare" };
+                                let call = toks.get(i + 1).is_some_and(|t| t.kind == K::LParen);
+                                let kinds: std::collections::BTreeSet<String> = visible.iter().map(|&c| format!("{:?}", db.symbol(c).kind)).collect();
+                                eprintln!("AMB\t{name}\t{ctx}\t{}\t{}/{}\t{}\t{}:{}", if call { "call" } else { "nocall" }, visible.len(), r.len(), kinds.into_iter().collect::<Vec<_>>().join("+"), path.rsplit('/').next().unwrap_or(path), text[..tok.start as usize].matches('\n').count() + 1);
                             }
-                        },
+                        }
                     }
                 }
                 st.files = 1;

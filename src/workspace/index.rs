@@ -885,6 +885,11 @@ impl Index {
         s
     }
 
+    /// Live files that `file` includes directly.
+    pub fn included_files(&self, file: usize) -> impl Iterator<Item = usize> + '_ {
+        self.files[file].includes.iter().filter_map(|k| self.by_path.get(k)).map(|&i| i as usize).filter(|&i| self.files[i].alive)
+    }
+
     /// `file` and every file it includes, directly or not.
     pub fn reachable_files(&self, file: usize) -> std::sync::Arc<hashbrown::HashSet<u32, FxBuildHasher>> {
         if let Ok(c) = self.reach_cache.read()
