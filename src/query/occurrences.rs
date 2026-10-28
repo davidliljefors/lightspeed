@@ -160,8 +160,33 @@ impl Query<'_> {
                 let mut in_macro_args = vec![false; toks.len()];
                 let mut parens: Vec<bool> = Vec::new();
                 let mut open_macros = 0usize;
+                // Inside a class declared in a function body: its members are not indexed, so a bare name may be one.
+                let mut in_local_class = vec![false; toks.len()];
+                // Per open brace: 0 other, 1 namespace/extern block, 2 class body.
+                let mut braces: Vec<u8> = Vec::new();
                 for (i, tok) in toks.iter().enumerate() {
                     in_macro_args[i] = open_macros > 0;
+                    in_local_class[i] = braces.iter().enumerate().any(|(d, &b)| b == 2 && braces[..d].contains(&0));
+                    match tok.kind {
+                        K::LBrace => {
+                            let (mut class, mut ns, mut paren) = (false, false, false);
+                            for t in toks[..i].iter().rev().take(64) {
+                                match (t.kind, t.keyword) {
+                                    (K::Semi | K::LBrace | K::RBrace, _) => break,
+                                    (K::LParen, _) => paren = true,
+                                    (_, Keyword::Class | Keyword::Struct | Keyword::Union) => class = true,
+                                    (_, Keyword::Namespace | Keyword::Extern) => ns = true,
+                                    (_, Keyword::Enum) => paren = true,
+                                    _ => {}
+                                }
+                            }
+                            braces.push(if ns { 1 } else if class && !paren { 2 } else { 0 });
+                        }
+                        K::RBrace => {
+                            braces.pop();
+                        }
+                        _ => {}
+                    }
                     match tok.kind {
                         K::LParen => {
                             let is_macro = i > 0
@@ -215,7 +240,8 @@ impl Query<'_> {
                         st.unresolved += 1;
                         continue;
                     }
-                    if guessed {
+                    let maybe_local_member = in_local_class[i] && !scoped && r.iter().any(|&c| idx.db.symbol(c).parent.is_some_and(|p| idx.db.symbol(p).kind.is_record()));
+                    if guessed || maybe_local_member {
                         st.ambiguous += 1;
                         continue;
                     }

@@ -287,3 +287,12 @@ fn qualifier_naming_nothing_we_index_does_not_pick_a_same_named_stranger() {
     );
     assert!(got.is_empty(), "{got:?}");
 }
+
+#[test]
+fn local_class_field_declared_after_use_is_not_an_inherited_outer_member() {
+    let got = marked(
+        &[],
+        "struct Base { int id; };\nstruct Coll { virtual void hit(); };\nstruct D : Base { void f(); };\nvoid D::f() {\n  class L : public Coll {\n  public:\n    virtual void hit() override { /*@*/id = 1; }\n    int id;\n  };\n}\n",
+    );
+    assert!(!got.contains(&"Base::id".to_string()), "{got:?}");
+}
