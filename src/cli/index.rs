@@ -39,6 +39,21 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
     println!("{}", idx.stats.report(threads));
     println!("{}", idx.memory_report());
     print!("{}", lightspeed::pp::profile_report());
+    if let Some(out) = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)) {
+        let mut lines: Vec<String> = idx
+            .db
+            .symbols()
+            .iter_enumerated()
+            .filter(|(id, _)| !idx.db.is_dead(*id))
+            .map(|(id, s)| format!("{}|{:?}|{}|{}|{}-{}|{:?}|{}", idx.db.qualified_name(id), s.kind, idx.db.file_path(id), s.name_offset, s.extent_start, s.extent_end, s.access, s.flags.bits()))
+            .collect();
+        lines.sort_unstable();
+        lines.push(format!("families={} bases={}", idx.hier.stats.families, idx.hier.stats.bases_resolved));
+        if let Err(e) = std::fs::write(out, lines.join("\n")) {
+            eprintln!("dump: {e}");
+            return 1;
+        }
+    }
     0
 }
 
