@@ -32,6 +32,7 @@ mod directives;
 mod expand;
 mod expr;
 pub(crate) mod macros;
+mod prof;
 pub mod vfs;
 
 use std::sync::Arc;
@@ -44,6 +45,8 @@ use crate::base::hash::FieldHasher;
 use crate::lexer::{Keyword, Token, TokenKind, lex_into};
 use expand::{Ctx, ExpTok, F_ARENA, F_BOL, F_MACRO, F_SPACE, Texts};
 use macros::{Macro, MacroKind, MacroTable, NONE};
+use prof::{Count, Phase, Prof};
+pub use prof::report as profile_report;
 pub use vfs::{DiskFs, FileProvider, MemFs, normalize_path, path_key};
 
 /// Which toolchain's predefined macros to assume (compile_commands does not
@@ -518,6 +521,7 @@ pub struct Preprocessor<'fs, P: FileProvider> {
     pub(super) path_buf: String,
     pub(super) tmp_toks: Vec<Token>,
     pub(super) param_scratch: Vec<(u32, u32)>,
+    prof: Prof,
 }
 
 fn cplusplus_for(std: &str) -> Option<u32> {
@@ -577,6 +581,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             path_buf: String::new(),
             tmp_toks: Vec::new(),
             param_scratch: Vec::new(),
+            prof: Prof::new(),
         }
     }
 
@@ -668,6 +673,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
 
     /// Preprocesses `src` (the text of `path`) into `out`.
     pub fn run(&mut self, path: &str, src: &str, out: &mut PpOutput) {
+        self.prof.begin();
         self.bound_resolve_cache();
         out.clear();
         self.t.reset_from(&self.base);
@@ -690,7 +696,9 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         self.set_file(0, &main_path, key, NONE);
 
         let mut toks = self.tok_pool.pop().unwrap_or_default();
+        let ph = self.prof.enter(Phase::MainLex);
         lex_into(src, &mut toks);
+        self.prof.leave(ph);
         let mut inp = Input::new(src, &toks, 0);
         let mut first = !self.restore_snapshot(key, src, &mut inp, out);
         if first {
@@ -709,6 +717,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             self.file_depth = 0;
         }
 
+        let expand_ph = self.prof.enter(Phase::Expand);
         while let Some(t) = self.expand_next(&mut inp, out, 0, true) {
             if first {
                 first = false;
@@ -726,6 +735,10 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 }
             self.emit(&t, src, out);
         }
+        self.prof.leave(expand_ph);
+        let tail = self.prof.enter(Phase::Tail);
+        self.prof.count(Count::Runs, 1);
+        self.prof.count(Count::MainTokens, out.tokens.len() as u64);
         for c in &self.cond {
             out.diagnostics.push(PpDiag { loc: c.loc, kind: DiagKind::UnterminatedIf });
         }
@@ -734,6 +747,8 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         self.deps.sort_unstable();
         self.deps.dedup();
         out.deps.extend_from_slice(&self.deps);
+        self.prof.leave(tail);
+        self.prof.flush();
     }
 
     fn take_snapshot(&mut self, key: u64, t: &ExpTok, toks: &[Token], src: &str, out: &PpOutput) {
@@ -878,13 +893,21 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Loads the file whose normalized path is in `path_buf` and scans it for
     /// directives (tokens are not emitted).
     pub(super) fn enter_file(&mut self, key: u64, dir_idx: u32, out: &mut PpOutput) {
+        let prev = self.prof.enter(Phase::EnterFile);
+        self.enter_file_inner(key, dir_idx, out);
+        self.prof.leave(prev);
+    }
+
+    fn enter_file_inner(&mut self, key: u64, dir_idx: u32, out: &mut PpOutput) {
         if self.once.contains(&key) {
             out.stats.skipped_once += 1;
+            self.prof.count(Count::OnceSkips, 1);
             return;
         }
         if let Some(&Some((o, l))) = self.guards.get(&key)
             && self.t.lookup(&self.guard_text[o as usize..(o + l) as usize]).is_some() {
                 out.stats.skipped_guard += 1;
+                self.prof.count(Count::GuardSkips, 1);
                 return;
             }
         let depth = self.file_depth + 1;
@@ -906,14 +929,21 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                     }
                     None => {
                         let fs = self.fs;
-                        let Some(sf) = fs.load(&self.path_buf) else { return };
+                        let ph = self.prof.enter(Phase::Load);
+                        let loaded = fs.load(&self.path_buf);
+                        self.prof.leave(ph);
+                        let Some(sf) = loaded else { return };
+                        let ph = self.prof.enter(Phase::Lex);
                         let src = sf.text();
+                        self.prof.count(Count::HeaderLoads, 1);
+                        self.prof.count(Count::HeaderBytes, src.len() as u64);
                         let mut toks = self.tok_pool.pop().unwrap_or_default();
                         lex_into(src, &mut toks);
                         let guard = directives::detect_guard(src, &toks).map(str::to_owned);
                         let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::base::hash::hash_bytes(src.as_bytes()) };
                         directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
                         self.tok_pool.push(toks);
+                        self.prof.leave(ph);
                         let e = Arc::new(e);
                         match &self.shared {
                             Some(s) => s.insert(key, e),
@@ -933,6 +963,8 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             }
         };
         out.stats.headers_entered += 1;
+        self.prof.count(Count::Entered, 1);
+        self.prof.count(Count::HeaderTokens, entry.toks.len() as u64);
         let path = std::mem::take(&mut self.path_buf);
         self.set_file(depth, &path, key, dir_idx);
         self.path_buf = path;
@@ -989,12 +1021,23 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Every candidate probed is recorded as a dependency.
     fn probe(&mut self) -> bool {
         let key = path_key(&self.path_buf);
+        let ph = self.prof.enter(Phase::Probe);
         let hit = self.fs.exists_keyed(&self.path_buf, key);
+        self.prof.leave(ph);
+        self.prof.count(Count::Probes, 1);
         // A hit depends on that exact file; a miss only on a file of that name appearing.
         self.probes.push(if hit { key } else { vfs::name_key(&self.path_buf) });
         hit
     }
     pub(super) fn resolve(&mut self, name: &str, quote: bool, next: bool) -> Option<Resolved> {
+        let prev = self.prof.enter(Phase::Resolve);
+        self.prof.count(Count::Resolves, 1);
+        let r = self.resolve_inner(name, quote, next);
+        self.prof.leave(prev);
+        r
+    }
+
+    fn resolve_inner(&mut self, name: &str, quote: bool, next: bool) -> Option<Resolved> {
         let d = self.file_depth;
         let start = if next {
             match self.files[d].dir_idx {
@@ -1011,6 +1054,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         let ck = h.finish();
 
         if let Some(&(found, po, pl)) = self.resolve_cache.get(&ck) {
+            self.prof.count(Count::ResolveHits, 1);
             self.deps.extend_from_slice(&self.probes[po as usize..(po + pl) as usize]);
             return match found {
                 Some((o, l, dir, key)) => {

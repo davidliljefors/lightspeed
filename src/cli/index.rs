@@ -38,6 +38,7 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
     );
     println!("{}", idx.stats.report(threads));
     println!("{}", idx.memory_report());
+    print!("{}", lightspeed::pp::profile_report());
     0
 }
 

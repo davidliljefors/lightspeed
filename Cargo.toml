@@ -16,6 +16,10 @@ serde_json = "1.0.154"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 zstd = "0.13"
 
+[features]
+# Phase timings and counters for the preprocessor (see `pp::profile_report`).
+profile = []
+
 [dev-dependencies]
 criterion = "0.8.2"
 tempfile = "3.27.0"
