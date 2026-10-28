@@ -95,7 +95,9 @@ impl Query<'_> {
         let mut container = String::new();
         'names: for (score, mask, name) in names {
             let mut batch: Vec<(i32, SymbolId)> = Vec::new();
-            for &s in db.lookup_id(name).iter().filter(|&&s| live(s)) {
+            let mut cands: Vec<SymbolId> = db.lookup_id(name).iter().copied().filter(|&s| live(s)).collect();
+            super::drop_forward_declarations(db, &mut cands);
+            for s in cands {
                 let mut score = score;
                 if mask != full {
                     let Some(p) = db.symbol(s).parent else { continue };

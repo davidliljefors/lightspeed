@@ -102,7 +102,9 @@ impl Query<'_> {
                     true
                 }
             };
-            let Some(&c) = cands.iter().find(|&&c| fits(db.symbol(c).kind)) else { continue };
+            let fitting = |&&c: &&crate::symbols::SymbolId| fits(db.symbol(c).kind);
+            // Prefer the definition: a forward declaration may use another class-key (`class A;` vs `struct A {}`), which would colour the same type differently.
+            let Some(&c) = cands.iter().filter(fitting).find(|&&c| db.symbol(c).flags.contains(SymbolFlags::DEFINITION)).or_else(|| cands.iter().find(fitting)) else { continue };
             let s = db.symbol(c);
             let mut mods = if declared.binary_search(&t.start).is_ok() { DECLARATION } else { 0 };
             for (bit, flag) in [(1, SymbolFlags::STATIC), (2, SymbolFlags::CONST), (4, SymbolFlags::PURE)] {

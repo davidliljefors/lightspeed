@@ -241,6 +241,30 @@ struct RigidBody { int mass; };\n";
 }
 
 #[test]
+fn forward_declarations_are_not_listed_and_do_not_change_colour() {
+    let hdr = "class Widget;\nstruct Gadget;\nstruct Orphan;\n";
+    let src = "#include \"h.h\"\nstruct Widget { int a; };\nclass Gadget { int b; };\nWidget* w; Gadget* g; Orphan* o;\n";
+    let ws = Ws::new(&[("a.cpp", src), ("h.h", hdr)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let found = |s: &str| q.search_symbols(s, 20).iter().map(|&i| (idx.db.qualified_name(i), idx.db.file_path(i).ends_with("a.cpp"))).collect::<Vec<_>>();
+    assert_eq!(found("Widget"), [("Widget".to_string(), true)]);
+    assert_eq!(found("Gadget"), [("Gadget".to_string(), true)]);
+    // Without a definition the forward declaration is all there is.
+    assert_eq!(found("Orphan"), [("Orphan".to_string(), false)]);
+
+    let toks = q.semantic_tokens(&ws.path("a.cpp"), src, None);
+    let ty_at = |needle: &str, nth_hit: usize| {
+        let at = src.match_indices(needle).nth(nth_hit).unwrap().0 as u32;
+        toks.iter().find(|t| t.start == at).map(|t| t.ty)
+    };
+    // `Widget` is declared `class` in the header but defined as a struct.
+    assert_eq!(ty_at("Widget", 1), ty_at("Widget", 0));
+    assert_eq!(ty_at("Gadget", 1), ty_at("Gadget", 0));
+    assert_ne!(ty_at("Widget", 1), ty_at("Gadget", 1), "struct vs class definitions keep their own colour");
+}
+
+#[test]
 fn hover_reports_declaration_docs_and_hierarchy() {
     let src = "// Base of all things.\n// Second line.\nstruct Base { virtual void tick(int dt); };\n\
                /** Derived thing. */\nstruct Thing : Base { void tick(int dt) override; int count; };\n\
