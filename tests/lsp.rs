@@ -422,8 +422,10 @@ fn apply_pending_reports_whether_anything_changed() {
     assert!(!c.server.apply_pending());
 }
 
-/// Full-document latency on real files. Run with `cargo test --release --test lsp semantic_tokens_real -- --nocapture`.
+/// Full-document latency on real files; needs an optimized build, so it only runs there.
+/// Run with `cargo test --release --test lsp semantic_tokens_real -- --nocapture`.
 #[test]
+#[cfg_attr(debug_assertions, ignore = "timing needs --release")]
 fn semantic_tokens_real_world_timing() {
     let root = "C:/dev/shiki";
     let cdb = format!("{root}/compile_commands.json");

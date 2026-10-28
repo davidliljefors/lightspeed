@@ -356,10 +356,12 @@ impl HeaderEntry {
 
 const SHARED_SHARDS: usize = 64;
 
+type Slot<V> = Arc<std::sync::OnceLock<V>>;
+
 /// Sharded map whose values are computed once: concurrent callers for a key
 /// wait for whoever is already computing it instead of repeating the work.
 struct OnceMap<V> {
-    shards: Vec<std::sync::RwLock<HashMap<u64, Arc<std::sync::OnceLock<V>>, FxBuildHasher>>>,
+    shards: Vec<std::sync::RwLock<HashMap<u64, Slot<V>, FxBuildHasher>>>,
 }
 
 impl<V: Clone> OnceMap<V> {
@@ -367,7 +369,7 @@ impl<V: Clone> OnceMap<V> {
         Self { shards: (0..shards).map(|_| std::sync::RwLock::new(HashMap::with_hasher(FxBuildHasher))).collect() }
     }
 
-    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, Arc<std::sync::OnceLock<V>>, FxBuildHasher>> {
+    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, Slot<V>, FxBuildHasher>> {
         &self.shards[(key >> 7) as usize % self.shards.len()]
     }
 
