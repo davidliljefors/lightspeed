@@ -47,9 +47,14 @@ impl Server {
         let q = Query::new(idx, &overlay);
         if let Some(r) = q.symbol_refs(&path, text.as_str(), off) {
             let mut locs = r.certain;
-            locs.extend(r.uncertain);
-            locs.sort_unstable();
+            if !self.settings.certain_only {
+                locs.extend(r.uncertain);
+                locs.sort_unstable();
+            }
             return Some(self.locations_json(&locs));
+        }
+        if self.settings.certain_only {
+            return Some(json!([]));
         }
         let (a, b) = identifier_at(text.as_str(), off)?;
         let name = &text.as_str()[a as usize..b as usize];

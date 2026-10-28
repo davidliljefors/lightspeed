@@ -79,6 +79,9 @@ struct ClientCaps {
 struct Settings {
     /// How many overloads signature help lists (`signatureHelp.maxOverloads`).
     max_signatures: usize,
+    /// Find-references lists only occurrences proven to be the symbol (`references.certainOnly`);
+    /// otherwise unresolved same-named occurrences are included too. Rename is always certain-only.
+    certain_only: bool,
 }
 
 /// Last full token data sent per open document, for `full/delta`. Behind a mutex
@@ -134,19 +137,22 @@ impl Server {
             last_progress: ((0, 0), std::time::Instant::now()),
             shutdown: false,
             caps: ClientCaps::default(),
-            settings: Settings { max_signatures: 3 },
+            settings: Settings { max_signatures: 3, certain_only: false },
             refresh_seq: 0,
             sem: SemanticCache::default(),
             exit_code: None,
         }
     }
 
-    /// Reads `{"signatureHelp": {"maxOverloads": n}}` from `initializationOptions`
+    /// Reads `{"signatureHelp": {"maxOverloads": n}, "references": {"certainOnly": bool}}` from `initializationOptions`
     /// or a `workspace/didChangeConfiguration` payload (optionally under `lightspeed`).
     pub(in crate::lsp) fn apply_settings(&mut self, v: &Value) {
         let v = v.get("lightspeed").unwrap_or(v);
         if let Some(n) = v.pointer("/signatureHelp/maxOverloads").and_then(Value::as_u64) {
             self.settings.max_signatures = (n as usize).clamp(1, 20);
+        }
+        if let Some(b) = v.pointer("/references/certainOnly").and_then(Value::as_bool) {
+            self.settings.certain_only = b;
         }
     }
 

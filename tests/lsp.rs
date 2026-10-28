@@ -152,6 +152,25 @@ fn definition_on_the_definition_itself_returns_nothing() {
     assert_eq!(def("local;", 0).as_array().unwrap().len(), 1);
 }
 
+#[test]
+fn references_certain_only_drops_unresolved_occurrences() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    let txt = "struct A { int f(); };\nstruct B { int f(); };\ntemplate <class T> int g(T t) { return t.f(); }\nint h(A a) { return a.f(); }\n";
+    std::fs::write(&a, txt).unwrap();
+    write_cdb_for(&root, &["a.cpp"]);
+    let mut c = Client::new(&root);
+    c.open(&a, txt);
+    let mut refs = |c: &mut Client| {
+        let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&a)}, "position": pos_of(txt, "f()", 0), "context": {"includeDeclaration": true}}));
+        r["result"].as_array().unwrap().len()
+    };
+    let loose = refs(&mut c);
+    c.notify("workspace/didChangeConfiguration", json!({"settings": {"references": {"certainOnly": true}}}));
+    let strict = refs(&mut c);
+    assert_eq!((loose, strict), (3, 2), "declaration and a.f() stay; the call through T is dropped");
+}
+
 /// What "find references" of `Example::create` must and must not return in ordinary code.
 /// Every body line ending in `//=` is an expected hit; any other line is an expected miss.
 /// Bodies are checked once with `std` and once with `eastl` standing in for `NS`.
@@ -785,6 +804,61 @@ mod godot {
             let t0 = std::time::Instant::now();
             let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&file)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}}));
             eprintln!("references {needle}: {} locations in {:?}", r["result"].as_array().map_or(0, Vec::len), t0.elapsed());
+        }
+    }
+
+    /// Compares find-references with and without `references.certainOnly` on a spread of
+    /// Godot symbols. Prints counts and a sample of the occurrences strict mode drops.
+    #[test]
+    #[ignore = "needs a Godot checkout and --release"]
+    fn godot_references_certain_only_diff() {
+        let (mut c, _, _) = open();
+        let symbols = [
+            ("scene/main/node.h", "void add_child(", "add_child"),
+            ("scene/main/node.h", "Node *get_parent() const", "get_parent"),
+            ("scene/main/node.h", "Node *get_child(int", "get_child"),
+            ("scene/main/node.h", "void queue_free()", "queue_free"),
+            ("core/templates/vector.h", "bool push_back(T", "push_back"),
+            ("core/templates/vector.h", "bool append(T", "append"),
+            ("core/templates/vector.h", "void clear()", "clear"),
+            ("core/string/ustring.h", "int length() const", "length"),
+            ("core/string/ustring.h", "bool is_empty() const", "is_empty"),
+            ("core/variant/variant.h", "Type get_type() const", "get_type"),
+            ("core/variant/variant.h", "void clear()", "clear"),
+            ("core/object/ref_counted.h", "bool reference()", "reference"),
+            ("core/object/ref_counted.h", "bool init_ref()", "init_ref"),
+        ];
+        let line_of = |loc: &Value| {
+            let path = uri_to_path(loc["uri"].as_str().unwrap()).unwrap();
+            let line = loc["range"]["start"]["line"].as_u64().unwrap() as usize;
+            let text = std::fs::read_to_string(&path).unwrap_or_default().lines().nth(line).unwrap_or("").trim().to_string();
+            (format!("{}:{}", path.trim_start_matches(&format!("{ROOT}/")), line + 1), text)
+        };
+        for (file, needle, name) in symbols {
+            let path = format!("{ROOT}/{file}");
+            let text = std::fs::read_to_string(&path).unwrap();
+            c.open(&path, &text);
+            let at = text.find(needle).unwrap_or_else(|| panic!("{needle} not in {file}")) + needle.find(name).unwrap();
+            let (line, character) = offset_to_position(&text, &LineIndex::new(&text), at as u32);
+            let params = json!({"textDocument": {"uri": path_to_uri(&path)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}});
+            let mut run = |c: &mut Client, strict: bool| {
+                c.notify("workspace/didChangeConfiguration", json!({"settings": {"references": {"certainOnly": strict}}}));
+                let t0 = std::time::Instant::now();
+                let r = c.request("textDocument/references", params.clone());
+                (r["result"].as_array().cloned().unwrap_or_default(), t0.elapsed())
+            };
+            let (all, t_all) = run(&mut c, false);
+            let (strict, t_strict) = run(&mut c, true);
+            let key = |l: &Value| l.to_string();
+            let keep: std::collections::HashSet<String> = strict.iter().map(key).collect();
+            assert!(strict.iter().all(|l| all.iter().any(|a| key(a) == key(l))), "{name}: strict is not a subset");
+            let dropped: Vec<&Value> = all.iter().filter(|l| !keep.contains(&key(l))).collect();
+            eprintln!("\n== {file} {name}: all {} ({t_all:?}) -> certain {} ({t_strict:?}), dropped {}", all.len(), strict.len(), dropped.len());
+            let step = (dropped.len() / 6).max(1);
+            for l in dropped.iter().step_by(step).take(6) {
+                let (loc, src) = line_of(l);
+                eprintln!("   dropped {loc}: {src}");
+            }
         }
     }
 
