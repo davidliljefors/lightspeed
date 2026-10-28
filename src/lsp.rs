@@ -80,6 +80,12 @@ pub struct Server {
     shutdown: bool,
     /// How many overloads signature help lists (`signatureHelp.maxOverloads`).
     max_signatures: usize,
+    /// The client accepts `workspace/semanticTokens/refresh`.
+    refresh_ok: bool,
+    refresh_seq: u64,
+    /// Last full token data sent per open document, for `full/delta`.
+    sem_cache: std::sync::Mutex<HashMap<u64, (u64, Vec<u32>)>>,
+    sem_seq: std::sync::atomic::AtomicU64,
     pub exit_code: Option<i32>,
 }
 
@@ -250,6 +256,10 @@ impl Server {
             last_progress: ((0, 0), std::time::Instant::now()),
             shutdown: false,
             max_signatures: 3,
+            refresh_ok: false,
+            refresh_seq: 0,
+            sem_cache: Default::default(),
+            sem_seq: Default::default(),
             exit_code: None,
         }
     }
@@ -344,6 +354,7 @@ impl Server {
                     }
                     // Buffers opened while the build ran.
                     self.apply_pending();
+                    self.refresh_tokens(&mut out);
                     if let Some(idx) = self.index.as_mut() {
                         for d in self.docs.values() {
                             idx.warm(&d.path, &d.text);
@@ -351,7 +362,11 @@ impl Server {
                     }
                 }
                 Ok(Msg::Eof) | Err(RecvTimeoutError::Disconnected) => return i32::from(!self.shutdown),
-                Err(RecvTimeoutError::Timeout) => self.apply_pending(),
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.apply_pending() {
+                        self.refresh_tokens(&mut out);
+                    }
+                }
             }
             for m in out.drain(..) {
                 if write_frame(&mut output, &m).is_err() {
@@ -465,23 +480,35 @@ impl Server {
         warning
     }
 
-    /// Applies buffered edits and disk changes to the index.
-    pub fn apply_pending(&mut self) {
-        let Some(idx) = self.index.as_mut() else { return };
+    /// Applies buffered edits and disk changes to the index; true if anything changed.
+    pub fn apply_pending(&mut self) -> bool {
+        let Some(idx) = self.index.as_mut() else { return false };
+        let mut changed = false;
         for d in self.docs.values_mut().filter(|d| d.dirty) {
             d.dirty = false;
             let unchanged = idx.file_index(&d.path).is_some_and(|i| idx.files[i].content_hash == hash_bytes(d.text.as_bytes()));
             if !unchanged {
                 idx.update(&d.path, Some(&d.text));
+                changed = true;
             }
         }
         for p in std::mem::take(&mut self.fs_dirty) {
             // The editor's buffer is the truth for open files.
             if !self.docs.contains_key(&path_key(&p)) {
                 idx.update(&p, None);
+                changed = true;
             }
         }
         idx.flush();
+        changed
+    }
+
+    /// Asks the client to re-request semantic tokens: classifications depend on the whole index.
+    fn refresh_tokens(&mut self, out: &mut Vec<Value>) {
+        if self.refresh_ok {
+            self.refresh_seq += 1;
+            out.push(json!({"jsonrpc": "2.0", "id": format!("lightspeed-refresh-{}", self.refresh_seq), "method": "workspace/semanticTokens/refresh"}));
+        }
     }
 
     fn text_of(&self, path: &str) -> Option<Text> {
@@ -521,6 +548,7 @@ impl Server {
                 // Index before replying so the first request never races the build
                 // (unless indexing runs in the background, see `Server::background`).
                 self.progress_ok = params["capabilities"]["window"]["workDoneProgress"].as_bool() == Some(true);
+                self.refresh_ok = params["capabilities"]["workspace"]["semanticTokens"]["refreshSupport"].as_bool() == Some(true);
                 self.apply_settings(&params["initializationOptions"]);
                 let warning = self.start_index(root.as_deref());
                 if let Some(w) = warning {
@@ -545,7 +573,7 @@ impl Server {
                             "documentSymbolProvider": true,
                             "semanticTokensProvider": {
                                 "legend": {"tokenTypes": crate::query::SEMANTIC_TYPES, "tokenModifiers": crate::query::SEMANTIC_MODIFIERS},
-                                "full": true,
+                                "full": {"delta": true},
                                 "range": true,
                             },
                             "workspaceSymbolProvider": true,
@@ -594,10 +622,11 @@ impl Server {
             }
             ("workspace/didChangeConfiguration", _) => self.apply_settings(&params["settings"]),
             ("textDocument/didClose", _) => {
-                if let Some(path) = params["textDocument"]["uri"].as_str().and_then(uri_to_path)
-                    && self.docs.remove(&path_key(&path)).is_some()
-                {
-                    self.fs_dirty.insert(path);
+                if let Some(path) = params["textDocument"]["uri"].as_str().and_then(uri_to_path) {
+                    self.sem_cache.lock().unwrap().remove(&path_key(&path));
+                    if self.docs.remove(&path_key(&path)).is_some() {
+                        self.fs_dirty.insert(path);
+                    }
                 }
             }
             (m, Some(id)) => {
@@ -605,7 +634,7 @@ impl Server {
                     // While the index builds, answer with an empty result instead of an error popup.
                     let result = if self.building.is_some() {
                         match m {
-                            "textDocument/definition" | "textDocument/semanticTokens/full" | "textDocument/semanticTokens/range" | "textDocument/declaration" | "textDocument/implementation" | "textDocument/typeDefinition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" | "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes" | "typeHierarchy/subtypes" | "lightspeed/inheritanceGraph" => Some(Value::Null),
+                            "textDocument/definition" | "textDocument/semanticTokens/full" | "textDocument/semanticTokens/full/delta" | "textDocument/semanticTokens/range" | "textDocument/declaration" | "textDocument/implementation" | "textDocument/typeDefinition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" | "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes" | "typeHierarchy/subtypes" | "lightspeed/inheritanceGraph" => Some(Value::Null),
                             "textDocument/references" | "textDocument/documentSymbol" | "workspace/symbol" => Some(json!([])),
                             "textDocument/completion" => Some(json!({"isIncomplete": true, "items": []})),
                             "textDocument/rename" => {
@@ -652,6 +681,7 @@ impl Server {
                     "textDocument/completion" => self.completion(&params),
                     "textDocument/documentSymbol" => self.document_symbols(&params),
                     "textDocument/semanticTokens/full" => self.semantic_tokens(&params, false),
+                    "textDocument/semanticTokens/full/delta" => self.semantic_tokens_delta(&params),
                     "textDocument/semanticTokens/range" => self.semantic_tokens(&params, true),
                     "workspace/symbol" => self.workspace_symbols(&params),
                     _ => {
@@ -1063,7 +1093,8 @@ impl Server {
         Value::Array(arr)
     }
 
-    fn semantic_tokens(&self, params: &Value, ranged: bool) -> Option<Value> {
+    /// Encoded token data for the document (or the requested range of it).
+    fn semantic_data(&self, params: &Value, ranged: bool) -> Option<(String, Vec<u32>)> {
         let path = uri_to_path(params["textDocument"]["uri"].as_str()?)?;
         let text = self.text_of(&path)?;
         let text = text.as_str();
@@ -1083,7 +1114,43 @@ impl Server {
             data.extend([line - pl, if line == pl { col - pc } else { col }, end.1.saturating_sub(col), t.ty as u32, t.mods as u32]);
             (pl, pc) = (line, col);
         }
-        Some(json!({"data": data}))
+        Some((path, data))
+    }
+
+    fn semantic_tokens(&self, params: &Value, ranged: bool) -> Option<Value> {
+        let (path, data) = self.semantic_data(params, ranged)?;
+        if ranged {
+            return Some(json!({"data": data}));
+        }
+        let id = self.sem_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let reply = json!({"resultId": id.to_string(), "data": data});
+        self.sem_cache.lock().unwrap().insert(path_key(&path), (id, data));
+        Some(reply)
+    }
+
+    /// Answers with the single splice that turns the previous token array into the new one,
+    /// or with the full data when the client's `previousResultId` is not the one we last sent.
+    fn semantic_tokens_delta(&self, params: &Value) -> Option<Value> {
+        let (path, data) = self.semantic_data(params, false)?;
+        let key = path_key(&path);
+        let id = self.sem_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let prev = params["previousResultId"].as_str().and_then(|s| s.parse::<u64>().ok());
+        let mut cache = self.sem_cache.lock().unwrap();
+        let reply = match cache.get(&key).filter(|(old_id, _)| Some(*old_id) == prev) {
+            Some((_, old)) => {
+                let prefix = old.iter().zip(&data).take_while(|(a, b)| a == b).count();
+                let suffix = old[prefix..].iter().rev().zip(data[prefix..].iter().rev()).take_while(|(a, b)| a == b).count();
+                let edits = if prefix == old.len() && prefix == data.len() {
+                    json!([])
+                } else {
+                    json!([{"start": prefix, "deleteCount": old.len() - prefix - suffix, "data": &data[prefix..data.len() - suffix]}])
+                };
+                json!({"resultId": id.to_string(), "edits": edits})
+            }
+            None => json!({"resultId": id.to_string(), "data": data}),
+        };
+        cache.insert(key, (id, data));
+        Some(reply)
     }
 
     fn document_symbols(&self, params: &Value) -> Option<Value> {

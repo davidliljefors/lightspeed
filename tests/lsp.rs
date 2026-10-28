@@ -329,6 +329,66 @@ fn semantic_tokens_over_rpc() {
     assert!(!part.is_empty() && part.iter().all(|t| t.0 == 4), "{part:?}");
 }
 
+#[test]
+fn semantic_tokens_delta_applies_to_previous_result() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    let txt = "struct S { int v; };\nint f(S& s) { return s.v; }\nint g(S& t) { return t.v; }\n";
+    std::fs::write(&a, txt).unwrap();
+    std::fs::write(
+        format!("{root}/compile_commands.json"),
+        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+    )
+    .unwrap();
+    let mut c = Client::new(&root);
+    c.open(&a, txt);
+    let doc = json!({"uri": path_to_uri(&a)});
+    let ints = |v: &Value| -> Vec<u64> { v.as_array().unwrap().iter().map(|x| x.as_u64().unwrap()).collect() };
+    let full = c.request("textDocument/semanticTokens/full", json!({"textDocument": doc}))["result"].clone();
+    let mut data = ints(&full["data"]);
+    let mut prev = full["resultId"].as_str().unwrap().to_owned();
+
+    // Unchanged: no edits.
+    let r = c.request("textDocument/semanticTokens/full/delta", json!({"textDocument": doc, "previousResultId": prev}))["result"].clone();
+    assert_eq!(r["edits"].as_array().map(Vec::len), Some(0), "{r}");
+    prev = r["resultId"].as_str().unwrap().to_owned();
+
+    // Rename a parameter and its use, and add a line: the splice reproduces the new full data.
+    let edited = "struct S { int v; };\nint f(S& s) { return s.v; }\nint g(S& tt) { return tt.v; }\nint h(int q) { return q; }\n";
+    c.change(&a, edited);
+    c.server.apply_pending();
+    let r = c.request("textDocument/semanticTokens/full/delta", json!({"textDocument": doc, "previousResultId": prev}))["result"].clone();
+    for e in r["edits"].as_array().unwrap() {
+        let (start, del) = (e["start"].as_u64().unwrap() as usize, e["deleteCount"].as_u64().unwrap() as usize);
+        data.splice(start..start + del, ints(&e["data"]));
+    }
+    let fresh = c.request("textDocument/semanticTokens/full", json!({"textDocument": doc}))["result"]["data"].clone();
+    assert_eq!(data, ints(&fresh));
+
+    // A stale or unknown id falls back to the full data.
+    let r = c.request("textDocument/semanticTokens/full/delta", json!({"textDocument": doc, "previousResultId": "nope"}))["result"].clone();
+    assert_eq!(ints(&r["data"]), ints(&fresh));
+}
+
+#[test]
+fn apply_pending_reports_whether_anything_changed() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    std::fs::write(&a, "int a;\n").unwrap();
+    std::fs::write(
+        format!("{root}/compile_commands.json"),
+        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+    )
+    .unwrap();
+    let mut c = Client::new(&root);
+    c.open(&a, "int a;\n");
+    c.server.apply_pending();
+    assert!(!c.server.apply_pending(), "nothing pending");
+    c.change(&a, "int a; int b;\n");
+    assert!(c.server.apply_pending());
+    assert!(!c.server.apply_pending());
+}
+
 /// Full-document latency on real files. Run with `cargo test --release --test lsp semantic_tokens_real -- --nocapture`.
 #[test]
 fn semantic_tokens_real_world_timing() {
