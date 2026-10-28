@@ -163,12 +163,18 @@ fn resolve_base(db: &SymbolDb, e: &crate::symbols::BaseEdge, chain: &mut Vec<Sym
             continue;
         }
         let mut prox = 0u32;
+        let mut visible = true;
         let mut p = s.parent;
         while let Some(x) = p {
-            prox += chain.contains(&x) as u32;
+            let inside = chain.contains(&x);
+            prox += inside as u32;
+            visible &= inside;
             p = db.symbol(x).parent;
         }
-        let key = (u32::from(is_definition(db, c)) << 16) | prox.min(0xffff);
+        // A class in an unrelated namespace (`Dummy::Test`) must not beat the
+        // one declared at the deriving class's own scope or in its own file.
+        let same_file = s.file == db.symbol(e.derived).file;
+        let key = (u32::from(is_definition(db, c)) << 20) | (u32::from(visible) << 19) | (u32::from(same_file) << 18) | prox.min(0xffff);
         if best.is_none_or(|(k, _)| key > k) {
             best = Some((key, c));
         }

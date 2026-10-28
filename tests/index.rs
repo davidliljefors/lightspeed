@@ -108,6 +108,27 @@ fn headers_are_discovered_and_indexed() {
 }
 
 #[test]
+fn base_class_prefers_same_file_over_same_named_class_in_unrelated_namespace() {
+    let ws = Ws::new(
+        &[
+            ("a.cpp", "namespace Dummy { struct Test { int x; }; }\n"),
+            ("b.cpp", "class Test {};\nclass D1 : public Test {};\nclass D2 : public Test {};\n"),
+        ],
+        &[],
+    );
+    let mut idx = ws.index(&["a.cpp", "b.cpp"]);
+    let local = |idx: &Index| {
+        let t = idx.db.lookup_id(idx.db.names.lookup("Test").unwrap()).iter().copied().find(|&i| idx.db.qualified_name(i) == "Test").unwrap();
+        names(idx, idx.hier.derived(t))
+    };
+    assert_eq!(local(&idx).len(), 2);
+    let p = ws.path("b.cpp");
+    idx.update(&p, Some("class Test {};\nclass D5 : public Test {};\nclass D1 : public Test {};\nclass D2 : public Test {};\n"));
+    idx.flush();
+    assert_eq!(local(&idx).len(), 3);
+}
+
+#[test]
 fn definition_picks_overload_by_arity_and_scope() {
     let src = "struct Foo { void f(int a); void f(int a, int b); void g(); };\n\
                void Foo::g() { f(1, 2); }\n";
