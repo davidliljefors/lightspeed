@@ -424,6 +424,17 @@ impl<'a> Query<'a> {
         Some(Location { file: file as u32, start, end })
     }
 
+    /// The class (or struct/union) named at `offset`, at a declaration or a use;
+    /// type aliases are followed to their record.
+    pub fn class_at(&self, path: &str, text: &str, offset: u32) -> Option<SymbolId> {
+        let db = &self.idx.db;
+        let ids: Vec<SymbolId> = self.symbol_at(path, offset).into_iter().chain(self.definition(path, text, offset)).collect();
+        ids.into_iter().find_map(|id| {
+            let id = self.idx.hier.canonical(id);
+            if db.symbol(id).kind.is_record() { Some(id) } else { self.resolve_records([id]).first().copied() }
+        })
+    }
+
     /// Symbol whose name is written at `offset` in `path` (a declaration site).
     pub fn symbol_at(&self, path: &str, offset: u32) -> Option<SymbolId> {
         let fi = self.idx.file_index(path)?;

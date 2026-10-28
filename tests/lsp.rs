@@ -133,6 +133,37 @@ fn definition_references_and_live_edits() {
 }
 
 #[test]
+fn type_hierarchy_and_inheritance_graph_over_rpc() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    let txt = "struct A {};\nstruct B : A {};\nstruct C : B {};\nstruct D : B {};\nstruct Other {};\nB* make();\n";
+    std::fs::write(&a, txt).unwrap();
+    std::fs::write(
+        format!("{root}/compile_commands.json"),
+        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+    )
+    .unwrap();
+    let mut c = Client::new(&root);
+    c.open(&a, txt);
+    let at = json!({"textDocument": {"uri": path_to_uri(&a)}, "position": pos_of(txt, "B* make", 0)});
+
+    let r = c.request("textDocument/prepareTypeHierarchy", at.clone());
+    let item = r["result"][0].clone();
+    assert_eq!(item["name"], "B");
+    let names = |v: &Value| -> Vec<String> { let mut n: Vec<String> = v["result"].as_array().unwrap().iter().map(|i| i["name"].as_str().unwrap().to_owned()).collect(); n.sort(); n };
+    assert_eq!(names(&c.request("typeHierarchy/supertypes", json!({"item": item}))), ["A"]);
+    assert_eq!(names(&c.request("typeHierarchy/subtypes", json!({"item": item}))), ["C", "D"]);
+
+    let g = c.request("lightspeed/inheritanceGraph", at)["result"].clone();
+    assert_eq!(g["nodes"].as_array().unwrap().len(), 4);
+    assert_eq!(g["edges"].as_array().unwrap().len(), 3);
+    assert_eq!(g["truncated"], false);
+    let g = c.request("lightspeed/inheritanceGraph", json!({"typeName": "B", "maxNodes": 2}))["result"].clone();
+    assert_eq!(g["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(g["truncated"], true);
+}
+
+#[test]
 fn completion_over_rpc_and_unknown_method() {
     let (_d, root) = tmp();
     let a = format!("{root}/a.cpp");
