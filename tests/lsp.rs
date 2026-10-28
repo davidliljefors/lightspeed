@@ -1,5 +1,7 @@
 //! Protocol-level tests: drive the server with JSON-RPC messages.
 
+mod common;
+
 use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
@@ -98,11 +100,7 @@ fn definition_references_and_live_edits() {
     let atxt = "#include \"shape.h\"\nfloat Shape::area() { return 1; }\nfloat use(Shape* s) { return s->area(); }\n";
     std::fs::write(&h, htxt).unwrap();
     std::fs::write(&a, atxt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp", "-I", root]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, true);
 
     let mut c = Client::new(&root);
     c.open(&a, atxt);
@@ -138,11 +136,7 @@ fn type_hierarchy_and_inheritance_graph_over_rpc() {
     let a = format!("{root}/a.cpp");
     let txt = "struct A {};\nstruct B : A {};\nstruct C : B {};\nstruct D : B {};\nstruct Other {};\nB* make();\n";
     std::fs::write(&a, txt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     c.open(&a, txt);
     let at = json!({"textDocument": {"uri": path_to_uri(&a)}, "position": pos_of(txt, "B* make", 0)});
@@ -236,11 +230,7 @@ fn declaration_implementation_and_type_definition_over_rpc() {
     let (hp, ap) = (format!("{root}/h.h"), format!("{root}/a.cpp"));
     std::fs::write(&hp, h).unwrap();
     std::fs::write(&ap, a).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     c.open(&ap, a);
     let at = |needle: &str, nth: usize, delta: usize| {
@@ -294,11 +284,7 @@ fn semantic_tokens_over_rpc() {
     let a = format!("{root}/a.cpp");
     let txt = "#define LIMIT 4\nnamespace N { struct S { static int count; virtual void run() = 0; int v; }; enum E { One }; }\nint f(N::S& s) {\n  /* é */ int x = LIMIT + N::One;\n  s.run(); s.v = f(s); return N::S::count;\n}\nint g(int v) { int run = v; return run; }\n";
     std::fs::write(&a, txt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     let caps = c.request("initialize", json!({"rootUri": path_to_uri(&root), "capabilities": {}}));
     assert_eq!(caps["result"]["capabilities"]["semanticTokensProvider"]["legend"]["tokenTypes"][5], "function");
@@ -339,11 +325,7 @@ fn semantic_tokens_template_parameters_shadow_same_named_types() {
     let a = format!("{root}/a.cpp");
     let txt = "struct T {};\ntemplate <typename T, int N> struct Box { T items[N]; };\ntemplate <class T> T first(T a) { T x = a; return x; }\nT global;\n";
     std::fs::write(&a, txt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     c.open(&a, txt);
     let all = decode_tokens(&c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": path_to_uri(&a)}})));
@@ -364,11 +346,7 @@ fn semantic_tokens_delta_applies_to_previous_result() {
     let a = format!("{root}/a.cpp");
     let txt = "struct S { int v; };\nint f(S& s) { return s.v; }\nint g(S& t) { return t.v; }\n";
     std::fs::write(&a, txt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     c.open(&a, txt);
     let doc = json!({"uri": path_to_uri(&a)});
@@ -404,11 +382,7 @@ fn apply_pending_reports_whether_anything_changed() {
     let (_d, root) = tmp();
     let a = format!("{root}/a.cpp");
     std::fs::write(&a, "int a;\n").unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     c.open(&a, "int a;\n");
     c.server.apply_pending();
@@ -700,11 +674,7 @@ fn rename_class_members_and_refuse_outside_workspace_over_rpc() {
     let atxt = "#include \"shape.h\"\nfloat Shape::area() { return sides; }\nfloat Sq::area() { return 4; }\nfloat use(Shape* s, Sq q) { return s->area() + q.area() + s->sides; }\n";
     std::fs::write(&h, htxt).unwrap();
     std::fs::write(&a, atxt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp", "-I", root]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, true);
     let mut c = Client::new(&root);
     c.open(&a, atxt);
     let rename = |c: &mut Client, pos: Value, name: &str| {
@@ -737,11 +707,7 @@ fn rename_macros_and_enum_constants_over_rpc() {
     let atxt = "#include \"cfg.h\"\nint a[LIMIT];\nint f(int v) { return CLAMP(v); }\nMode m = Mode::Fast;\nint LIMITS = 1;\n";
     std::fs::write(&h, htxt).unwrap();
     std::fs::write(&a, atxt).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp", "-I", root]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, true);
     let mut c = Client::new(&root);
     c.open(&a, atxt);
     let mut rename = |pos: Value, name: &str| {
@@ -766,11 +732,7 @@ fn parameters_navigate_and_rename_over_rpc() {
     let src = "struct Mod { void* find(const char* name) const; int name; };\n\
 void* Mod::find(const char* name) const {\n  auto n = name;\n  return lookup(name, n);\n}\n";
     std::fs::write(&a, src).unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut c = Client::new(&root);
     c.open(&a, src);
     let doc = json!({"uri": path_to_uri(&a)});
@@ -806,11 +768,7 @@ void* Mod::find(const char* name) const {\n  auto n = name;\n  return lookup(nam
 fn missing_cdb_hint_falls_back_to_workspace_and_warns_when_none() {
     let (_d, root) = tmp();
     std::fs::write(format!("{root}/a.cpp"), "struct Found {};\n").unwrap();
-    std::fs::write(
-        format!("{root}/compile_commands.json"),
-        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
-    )
-    .unwrap();
+    common::write_cdb(&root, false);
     let mut s = Server::new(Some("C:/path/to/nowhere.json".into()));
     let mut out = Vec::new();
     s.handle(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": path_to_uri(&root)}}), &mut out);

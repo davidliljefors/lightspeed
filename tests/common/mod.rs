@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
-use lightspeed::workspace::index::Index;
+use lightspeed::workspace::compile_commands::CompileDb;
+use lightspeed::workspace::index::{Index, IndexConfig};
 use lightspeed::symbols::SymbolId;
 use std::collections::HashMap;
 
@@ -58,4 +59,61 @@ impl Rng {
     pub fn below(&mut self, n: usize) -> usize {
         (self.next() % n.max(1) as u64) as usize
     }
+}
+
+/// Writes a one-entry `compile_commands.json` for `a.cpp` in `root`.
+pub fn write_cdb(root: &str, include_root: bool) {
+    let mut args = vec!["clang++", "-c", "a.cpp"];
+    if include_root {
+        args.extend(["-I", root]);
+    }
+    let cdb = serde_json::json!([{"directory": root, "file": "a.cpp", "arguments": args}]);
+    std::fs::write(format!("{root}/compile_commands.json"), serde_json::to_string(&cdb).unwrap()).unwrap();
+}
+
+/// A temporary source tree that can be indexed through a generated `compile_commands.json`.
+pub struct Ws {
+    pub dir: tempfile::TempDir,
+    pub root: String,
+}
+
+impl Ws {
+    pub fn new(files: &[(&str, &str)], _tus: &[&str]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap().replace('\\', "/");
+        let ws = Self { dir, root };
+        for (p, t) in files {
+            ws.write(p, t);
+        }
+        ws
+    }
+
+    pub fn write(&self, rel: &str, text: &str) {
+        let p = self.dir.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    pub fn path(&self, rel: &str) -> String {
+        format!("{}/{rel}", self.root)
+    }
+
+    pub fn index(&self, tus: &[&str]) -> Index {
+        let entries: Vec<String> = tus
+            .iter()
+            .map(|f| format!(r#"{{"directory":"{}","file":"{f}","arguments":["clang++","-c","{f}","-I","{}"]}}"#, self.root, self.root))
+            .collect();
+        let cdb = CompileDb::from_json(&format!("[{}]", entries.join(","))).unwrap();
+        Index::build(cdb, IndexConfig::default())
+    }
+}
+
+/// Strips the `$` marker and returns the text with its byte offset.
+pub fn cursor(src: &str) -> (String, u32) {
+    let at = src.find('$').expect("marker");
+    (src.replacen('$', "", 1), at as u32)
+}
+
+pub fn names(idx: &Index, ids: &[SymbolId]) -> Vec<String> {
+    ids.iter().map(|&i| idx.db.qualified_name(i)).collect()
 }
