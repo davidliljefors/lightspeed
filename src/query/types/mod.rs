@@ -24,6 +24,7 @@
 use super::templates::template_header;
 use super::{Query, sig_tokens};
 use crate::lexer::{Keyword, Token, TokenKind as K};
+use crate::base::ids::Idx;
 use crate::symbols::{SymbolId, SymbolKind};
 
 pub(super) mod signature;
@@ -69,6 +70,9 @@ struct Ty {
     qual: String,
     /// Levels of `*` (or of `&` taken on a value): `Foo**` is 2. References are not tracked.
     ptr: u8,
+    /// One more than the index of the file whose includes decide which of several same-named
+    /// types is meant; 0 when unknown.
+    vis: u32,
 }
 
 impl Ty {
@@ -139,32 +143,49 @@ impl Query<'_> {
         const MAX_SCAN: usize = 4096;
         let db = &self.idx.db;
         let all = db.lookup(&ty.head);
-        if ty.qual.is_empty() || all.len() <= 1 || all.len() > MAX_SCAN {
+        if all.len() <= 1 || all.len() > MAX_SCAN {
             return all.to_vec();
         }
-        let (rooted, path) = ty.qual.strip_prefix("::").map_or((false, ty.qual.as_str()), |p| (true, p));
-        let want = if path.is_empty() { ty.head.clone() } else { format!("{path}::{}", ty.head) };
-        let tail = format!("::{want}");
-        let hits: Vec<SymbolId> = all
-            .iter()
-            .copied()
-            .filter(|&c| {
-                let q = db.qualified_name(c);
-                q == want || (!rooted && q.ends_with(&tail))
-            })
-            .collect();
-        if hits.is_empty() { all.to_vec() } else { hits }
+        let mut hits: Vec<SymbolId> = all.to_vec();
+        if !ty.qual.is_empty() {
+            let (rooted, path) = ty.qual.strip_prefix("::").map_or((false, ty.qual.as_str()), |p| (true, p));
+            let want = if path.is_empty() { ty.head.clone() } else { format!("{path}::{}", ty.head) };
+            let tail = format!("::{want}");
+            let scoped: Vec<SymbolId> = all
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let q = db.qualified_name(c);
+                    q == want || (!rooted && q.ends_with(&tail))
+                })
+                .collect();
+            if !scoped.is_empty() {
+                hits = scoped;
+            }
+        }
+        // Of several same-named types, only those reachable through the includes can be meant.
+        if ty.vis != 0 && hits.len() > 1 {
+            let seen = self.idx.reachable_files(ty.vis as usize - 1);
+            let visible: Vec<SymbolId> = hits.iter().copied().filter(|&c| seen.contains(&(db.symbol(c).file.index() as u32))).collect();
+            if !visible.is_empty() {
+                hits = visible;
+            }
+        }
+        hits
     }
 
     /// Pins an unqualified type name that several scopes declare to the one
     /// visible from `scope` (innermost enclosing scope first, as C++ looks
     /// names up), including inside its template arguments. Names declared in
     /// one place only are left alone: nothing to tell apart.
-    fn qualify(&self, mut ty: Ty, scope: &dyn Fn() -> String) -> Ty {
+    fn qualify(&self, mut ty: Ty, scope: &dyn Fn() -> String, file: Option<usize>) -> Ty {
         const MAX_CANDS: usize = 256;
         let db = &self.idx.db;
         let parent_of = |q: &str| q.rfind("::").map_or(String::new(), |i| q[..i].to_owned());
         let all = db.lookup(&ty.head);
+        if all.len() > 1 && all.len() <= MAX_CANDS {
+            ty.vis = file.map_or(0, |f| f as u32 + 1);
+        }
         if ty.qual.is_empty() && all.len() > 1 && all.len() <= MAX_CANDS {
             let homes: Vec<String> = all
                 .iter()
@@ -188,7 +209,7 @@ impl Query<'_> {
         for a in &mut ty.args {
             let stars = a.len() - a.trim_end_matches('*').len();
             if let Some(t) = parse_ty(&a[..a.len() - stars]) {
-                *a = self.qualify(t, scope).text() + &"*".repeat(stars);
+                *a = self.qualify(t, scope, file).text() + &"*".repeat(stars);
             }
         }
         ty
@@ -196,15 +217,19 @@ impl Query<'_> {
 
     /// [`Self::qualify`] for a type written in the declaration of `id`.
     fn qualify_in(&self, ty: Ty, id: SymbolId) -> Ty {
-        self.qualify(ty, &|| {
-            let q = self.idx.db.qualified_name(id);
-            q.rfind("::").map_or(String::new(), |i| q[..i].to_owned())
-        })
+        self.qualify(
+            ty,
+            &|| {
+                let q = self.idx.db.qualified_name(id);
+                q.rfind("::").map_or(String::new(), |i| q[..i].to_owned())
+            },
+            Some(self.idx.db.symbol(id).file.index()),
+        )
     }
 
     /// [`Self::qualify`] for a type written at the use site described by `cx`.
     fn qualify_at(&self, cx: &Cx, ty: Ty) -> Ty {
-        self.qualify(ty, &|| cx.scopes.iter().map(|&s| self.idx.db.qualified_name(s)).max_by_key(String::len).unwrap_or_default())
+        self.qualify(ty, &|| cx.scopes.iter().map(|&s| self.idx.db.qualified_name(s)).max_by_key(String::len).unwrap_or_default(), self.idx.file_index(cx.path))
     }
 
     /// Records `ids` may denote, following type aliases (`typedef struct _X X`,
@@ -449,7 +474,7 @@ impl Query<'_> {
             i = matching_fwd(expr, i)? + 1;
         }
         let ty = if is_new {
-            self.qualify_at(cx, Ty { head: name.to_owned(), args: targs, qual: path.last().map(|q| q.to_string()).unwrap_or_default(), ptr: 1 })
+            self.qualify_at(cx, Ty { head: name.to_owned(), args: targs, qual: path.last().map(|q| q.to_string()).unwrap_or_default(), ptr: 1, vis: 0 })
         } else if called && PASS_THROUGH.contains(&name) {
             let args = &expr[open + 1..i - 1];
             let first = &args[..top_level(args, K::Comma).unwrap_or(args.len())];
@@ -647,7 +672,7 @@ impl Query<'_> {
         }
         let db = &self.idx.db;
         if !self.resolve_records(db.lookup(name).iter().copied()).is_empty() {
-            return Some(self.qualify_at(cx, Ty { head: name.to_owned(), args: targs.to_vec(), qual: qual.unwrap_or_default().to_owned(), ptr: 0 }));
+            return Some(self.qualify_at(cx, Ty { head: name.to_owned(), args: targs.to_vec(), qual: qual.unwrap_or_default().to_owned(), ptr: 0, vis: 0 }));
         }
         let (in_scope, in_bases) = self.scope_set(cx.scopes);
         let is_fn = |c: SymbolId| db.name(c) == name && matches!(db.symbol(c).kind, SymbolKind::Function | SymbolKind::Method);
@@ -901,7 +926,7 @@ impl Query<'_> {
             let close = matching_fwd(&toks, i + 1)?;
             Some(split_args(&toks[i + 2..close], head))
         })?;
-        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written, qual: self.ty_of(base).qual, ptr: 0 }, derived, recv))
+        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written, qual: self.ty_of(base).qual, ptr: 0, vis: 0 }, derived, recv))
     }
 
     /// `ty`, written inside template `owner`, as seen from `recv = owner<args>`.
@@ -923,7 +948,7 @@ impl Query<'_> {
                 })
                 .map(Option::unwrap_or_default)
                 .collect();
-            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args, qual: recv.qual.clone(), ptr: recv.ptr }, 0);
+            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args, qual: recv.qual.clone(), ptr: recv.ptr, vis: recv.vis }, 0);
         }
         self.subst(cx, ty, owner, &params, recv, 0)
     }
@@ -957,7 +982,7 @@ impl Query<'_> {
                 None => a.clone(),
             })
             .collect();
-        Ty { head: ty.head.clone(), args, qual: ty.qual.clone(), ptr: ty.ptr }
+        Ty { head: ty.head.clone(), args, qual: ty.qual.clone(), ptr: ty.ptr, vis: ty.vis }
     }
 
     /// Source text of the file declaring `s`.
@@ -1001,6 +1026,11 @@ impl Query<'_> {
         self.source_of(cx, s, |src| {
             let slice = src.get(s.extent_start.min(s.name_offset) as usize..s.name_offset as usize)?;
             let toks = sig_tokens(slice);
+            // `struct { ... } name;`: the unnamed type the parser named after the member.
+            if toks.last().is_some_and(|t| t.kind == K::RBrace) {
+                let scope = s.parent.map(|p| self.idx.db.qualified_name(p)).unwrap_or_default();
+                return Some(Ty { head: format!("<anon {}>", self.idx.db.name(id)), qual: format!("::{scope}"), ..Ty::default() });
+            }
             declared_type_tail(&toks, slice).filter(|t| t.head != "auto")
         })
         .map(|t| self.qualify_in(t, id))
@@ -1011,7 +1041,7 @@ impl Query<'_> {
         let db = &self.idx.db;
         let q = db.qualified_name(id);
         let scope = q.rfind("::").map_or("", |i| &q[..i]);
-        Ty { head: db.name(id).to_owned(), args: Vec::new(), qual: format!("::{scope}"), ptr: 0 }
+        Ty { head: db.name(id).to_owned(), args: Vec::new(), qual: format!("::{scope}"), ptr: 0, vis: 0 }
     }
 }
 
@@ -1186,7 +1216,7 @@ fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
         (true, true) => "::".to_owned(),
         (true, false) => format!("::{}", path.join("::")),
     };
-    let ty = Ty { head: toks[name].text(text).to_owned(), args, qual, ptr };
+    let ty = Ty { head: toks[name].text(text).to_owned(), args, qual, ptr, vis: 0 };
     Some(trait_result(&ty).unwrap_or(ty))
 }
 
@@ -1312,6 +1342,10 @@ fn declared_before(toks: &[Token], text: &str, name: &str) -> Option<Decl> {
             return Some(Decl::Bind(n, Box::new(inner)));
         }
         let Some(ty) = declared_type_tail(&toks[..i], text) else { continue };
+        // `return x;` and the like are uses of `x`, not declarations of type `return`.
+        if matches!(ty.head.as_str(), "return" | "else" | "throw" | "delete" | "case" | "goto" | "co_return" | "co_yield" | "co_await" | "new" | "sizeof" | "typeid" | "do") {
+            continue;
+        }
         if ty.head != "auto" {
             return Some(Decl::Ty(ty));
         }

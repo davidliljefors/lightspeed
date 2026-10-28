@@ -161,7 +161,7 @@ fn references_certain_only_drops_unresolved_occurrences() {
     write_cdb_for(&root, &["a.cpp"]);
     let mut c = Client::new(&root);
     c.open(&a, txt);
-    let mut refs = |c: &mut Client| {
+    let refs = |c: &mut Client| {
         let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&a)}, "position": pos_of(txt, "f()", 0), "context": {"includeDeclaration": true}}));
         r["result"].as_array().unwrap().len()
     };
@@ -169,6 +169,61 @@ fn references_certain_only_drops_unresolved_occurrences() {
     c.notify("workspace/didChangeConfiguration", json!({"settings": {"references": {"certainOnly": true}}}));
     let strict = refs(&mut c);
     assert_eq!((loose, strict), (3, 2), "declaration and a.f() stay; the call through T is dropped");
+}
+
+/// Real hits that `references.certainOnly` must keep. Lines ending in `//=` must be returned,
+/// no other line may be. The cursor is on the first `f` in the text.
+mod strict_recall {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn check(src: &str) {
+        let (_d, root) = tmp();
+        let a = format!("{root}/a.cpp");
+        std::fs::write(&a, src).unwrap();
+        write_cdb_for(&root, &["a.cpp"]);
+        let mut c = Client::new(&root);
+        c.open(&a, src);
+        c.notify("workspace/didChangeConfiguration", json!({"settings": {"references": {"certainOnly": true}}}));
+        let at = src.find("f(").unwrap();
+        let (line, character) = offset_to_position(src, &LineIndex::new(src), at as u32);
+        let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&a)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}}));
+        let got: BTreeSet<usize> = r["result"].as_array().unwrap().iter().map(|l| l["range"]["start"]["line"].as_u64().unwrap() as usize).collect();
+        let lines: Vec<&str> = src.lines().collect();
+        let want: BTreeSet<usize> = (0..lines.len()).filter(|&i| lines[i].trim_end().ends_with("//=")).collect();
+        let mut errors = Vec::new();
+        errors.extend(want.difference(&got).map(|&i| format!("missing: {}", lines[i].trim())));
+        errors.extend(got.difference(&want).map(|&i| format!("extra:   {}", lines[i].trim())));
+        assert!(errors.is_empty(), "\n{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn local_declared_with_a_derived_pointer_type() {
+        check(
+            "struct Node { Node* f();  //=\n};\nstruct Viewport : Node { };\nstruct Tree { Tree* f(); };\nViewport* get_vp();\nvoid t() {\n  Viewport* vp = get_vp();\n  vp->f();  //=\n  Tree* tr = nullptr; tr->f();\n}\n",
+        );
+    }
+
+    #[test]
+    fn local_used_in_a_return_statement_first() {
+        check(
+            "struct Node { Node* f();  //=\n};\nstruct Tree { Tree* f(); };\nNode* get_n();\nNode* t(bool b) {\n  Node* vp = get_n();\n  if (b) {\n    return vp;\n  }\n  vp->f();  //=\n  return vp;\n}\n",
+        );
+    }
+
+    #[test]
+    fn members_of_an_anonymous_struct_variable() {
+        check(
+            "struct Node { void f();  //=\n};\nstruct Control : Node { };\nstruct Other { void f(); };\nstruct View {\n  struct { Control* popup = nullptr; Other* o; } gui;\n  void t() {\n    gui.popup->f();  //=\n    gui.o->f();\n  }\n};\n",
+        );
+    }
+
+    #[test]
+    fn append_on_a_templated_container_local() {
+        check(
+            "template <class T> struct Vec { bool f(T v); void g();  //=\n};\nstruct Map { void f(int); };\nenum Flag { FILL = 1 };\nvoid t(Vec<int>& a) {\n  Vec<int> flags;\n  flags.f(FILL);  //=\n  flags.f(2);  //=\n  Map m; m.f(1);\n}\n",
+        );
+    }
 }
 
 /// What "find references" of `Example::create` must and must not return in ordinary code.
@@ -841,7 +896,7 @@ mod godot {
             let at = text.find(needle).unwrap_or_else(|| panic!("{needle} not in {file}")) + needle.find(name).unwrap();
             let (line, character) = offset_to_position(&text, &LineIndex::new(&text), at as u32);
             let params = json!({"textDocument": {"uri": path_to_uri(&path)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}});
-            let mut run = |c: &mut Client, strict: bool| {
+            let run = |c: &mut Client, strict: bool| {
                 c.notify("workspace/didChangeConfiguration", json!({"settings": {"references": {"certainOnly": strict}}}));
                 let t0 = std::time::Instant::now();
                 let r = c.request("textDocument/references", params.clone());

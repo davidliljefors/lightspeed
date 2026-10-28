@@ -409,6 +409,7 @@ pub struct Index {
     worker: Worker,
     shared: std::sync::Arc<crate::pp::SharedHeaders>,
     scope_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<crate::scope_decls::ScopeDecls>>>,
+    reach_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<hashbrown::HashSet<u32, FxBuildHasher>>>>,
     dirty: bool,
     dead_symbols: usize,
     /// Files that could not be read during the last build.
@@ -434,6 +435,7 @@ impl Index {
         Self {
             shared,
             scope_cache: Default::default(),
+            reach_cache: Default::default(),
             db,
             hier,
             files: Vec::new(),
@@ -774,6 +776,7 @@ impl Index {
                 f.includes = a.includes.iter().map(|p| path_key(p)).collect();
                 f.decls = a.decls;
                 self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+                self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
                 return a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect();
             }
         }
@@ -808,6 +811,7 @@ impl Index {
         f.decls = a.decls;
         self.dirty = !(was_clean && self.patch_in_place(old_range, base..base + n_new));
         self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect()
     }
 
@@ -836,6 +840,7 @@ impl Index {
         f.alive = false;
         self.dirty = true;
         self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Using-directives and namespace aliases that files included (directly
@@ -873,6 +878,28 @@ impl Index {
         }
         s.push_str(&format!(" output trims {}", OUTPUT_TRIMS.load(std::sync::atomic::Ordering::Relaxed)));
         s
+    }
+
+    /// `file` and every file it includes, directly or not.
+    pub fn reachable_files(&self, file: usize) -> std::sync::Arc<hashbrown::HashSet<u32, FxBuildHasher>> {
+        if let Ok(c) = self.reach_cache.read()
+            && let Some(r) = c.get(&file)
+        {
+            return r.clone();
+        }
+        let mut seen: hashbrown::HashSet<u32, FxBuildHasher> = Default::default();
+        let mut stack = vec![file];
+        while let Some(f) = stack.pop() {
+            if !seen.insert(f as u32) {
+                continue;
+            }
+            stack.extend(self.files[f].includes.iter().filter_map(|k| self.by_path.get(k)).map(|&i| i as usize).filter(|&i| self.files[i].alive));
+        }
+        let r = std::sync::Arc::new(seen);
+        if let Ok(mut c) = self.reach_cache.write() {
+            c.insert(file, r.clone());
+        }
+        r
     }
 
     pub fn included_decls(&self, file: usize) -> std::sync::Arc<crate::scope_decls::ScopeDecls> {

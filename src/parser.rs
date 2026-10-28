@@ -557,12 +557,21 @@ impl<'a> Parser<'a> {
                 true
             }
             Some(K::LBrace | K::Colon) => {
-                let sym = cand.map(|c| {
-                    let name = self.db.intern(self.txt(c));
-                    let mut flags = spec;
-                    flags.insert(SymbolFlags::DEFINITION);
-                    (self.add(kind, name, c, kw_i, j, flags), name)
-                });
+                // `struct { ... } name;` declares a member of an unnamed type: give that type a
+                // synthetic name so `name.member` can be resolved.
+                let anon = if cand.is_none() && !typedef && self.k(j) == Some(K::LBrace) { self.anon_declarator(j) } else { None };
+                let sym = cand
+                    .map(|c| {
+                        let name = self.db.intern(self.txt(c));
+                        let mut flags = spec;
+                        flags.insert(SymbolFlags::DEFINITION);
+                        (self.add(kind, name, c, kw_i, j, flags), name)
+                    })
+                    .or_else(|| {
+                        let d = anon?;
+                        let name = self.db.intern(&format!("<anon {}>", self.txt(d)));
+                        Some((self.add(kind, name, kw_i, kw_i, j, SymbolFlags::DEFINITION), name))
+                    });
                 if let Some((id, _)) = sym {
                     if self.k(j) == Some(K::Colon) {
                         j = self.bases(id, j, default_access);
@@ -589,17 +598,27 @@ impl<'a> Parser<'a> {
                 {
                     self.set_extent_end(id, close);
                 }
-                self.declarators_after_body(typedef, kw_i);
+                self.declarators_after_body(typedef, kw_i, anon);
                 true
             }
             _ => false,
         }
     }
 
+    /// The declarator name after the `}` that closes the body opening at `open`, if the
+    /// body is followed by `name;`, `name,`, `name[`, or `name =`.
+    fn anon_declarator(&self, open: usize) -> Option<usize> {
+        let d = self.skip_balanced(open);
+        (self.k(d) == Some(K::Ident) && matches!(self.k(d + 1), Some(K::Semi | K::Comma | K::LBracket | K::Eq))).then_some(d)
+    }
+
     /// After `}` of a type definition: `... name1, *name2;` (typedef names
-    /// become aliases, plain declarators are ignored).
-    fn declarators_after_body(&mut self, typedef: bool, start: usize) {
+    /// become aliases; for an unnamed type `anon` is its one declarator, a member).
+    fn declarators_after_body(&mut self, typedef: bool, start: usize, anon: Option<usize>) {
         let end = self.recover_to_semi(self.i);
+        if let Some(d) = anon.filter(|&d| d >= self.i) {
+            self.emit_var(d, d, start, end, SymbolFlags::EMPTY);
+        }
         if typedef {
             for n in self.i..end {
                 if !(self.t[n].kind == K::Ident && self.k(n + 1).is_none_or(|k| matches!(k, K::Semi | K::Comma | K::LBracket))) {
@@ -743,7 +762,7 @@ impl<'a> Parser<'a> {
                     self.set_extent_end(id, close);
                 }
                 self.i = if self.k(close) == Some(K::RBrace) { close + 1 } else { close };
-                self.declarators_after_body(typedef, start);
+                self.declarators_after_body(typedef, start, None);
                 true
             }
             _ => false,
