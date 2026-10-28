@@ -100,7 +100,7 @@ fn cdb_cmd(args: &[String]) -> i32 {
         return 2;
     };
     let t = Instant::now();
-    let db = match lightspeed::compile_commands::CompileDb::load(path) {
+    let db = match lightspeed::workspace::compile_commands::CompileDb::load(path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("{e}");
@@ -137,7 +137,7 @@ fn pp_or_parse(threads: usize, args: &[String], parse: bool) -> i32 {
         return 2;
     };
     let follow = !args.iter().any(|a| a == "--no-follow");
-    let db = match lightspeed::compile_commands::CompileDb::load(path) {
+    let db = match lightspeed::workspace::compile_commands::CompileDb::load(path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("{e}");
@@ -197,7 +197,7 @@ fn index_cmd(threads: usize, args: &[String]) -> i32 {
         eprintln!("usage: lightspeed index [-j threads] <compile_commands.json>");
         return 2;
     };
-    let mut cdb = match lightspeed::compile_commands::CompileDb::load(path) {
+    let mut cdb = match lightspeed::workspace::compile_commands::CompileDb::load(path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("{e}");
@@ -208,7 +208,7 @@ fn index_cmd(threads: usize, args: &[String]) -> i32 {
         println!("{} built-in include dirs", cdb.add_system_includes());
     }
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20).build().expect("thread pool");
-    let mut cfg = lightspeed::index::IndexConfig::default();
+    let mut cfg = lightspeed::workspace::index::IndexConfig::default();
     if !args.iter().any(|a| a == "--no-cache") {
         cfg.cache = match args.iter().position(|a| a == "--cache-dir").and_then(|i| args.get(i + 1)) {
             Some(d) => Some(lightspeed::store::CacheConfig::at(d)),
@@ -219,7 +219,7 @@ fn index_cmd(threads: usize, args: &[String]) -> i32 {
         }
     }
     let t0 = Instant::now();
-    let idx = pool.install(|| lightspeed::index::Index::build(cdb, cfg));
+    let idx = pool.install(|| lightspeed::workspace::index::Index::build(cdb, cfg));
     println!(
         "{} files ({} unreadable), {} symbols, {} families, {} bases resolved | build on {threads} threads {:.1} ms",
         idx.live_files().count(),
@@ -240,12 +240,12 @@ fn def_cmd(threads: usize, args: &[String]) -> i32 {
         eprintln!("usage: lightspeed def <compile_commands.json> <file> <line> <col>   (1-based)");
         return 2;
     };
-    let Ok(mut cdb) = lightspeed::compile_commands::CompileDb::load(cdb_path) else { return 1 };
+    let Ok(mut cdb) = lightspeed::workspace::compile_commands::CompileDb::load(cdb_path) else { return 1 };
     cdb.add_system_includes();
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20).build().expect("thread pool");
-    let idx = pool.install(|| lightspeed::index::Index::build(cdb, Default::default()));
+    let idx = pool.install(|| lightspeed::workspace::index::Index::build(cdb, Default::default()));
     let text = std::fs::read_to_string(file).expect("read file");
-    let li = lightspeed::source::LineIndex::new(&text);
+    let li = lightspeed::base::source::LineIndex::new(&text);
     let off = li.line_start(line.parse::<usize>().unwrap() - 1).unwrap() + col.parse::<u32>().unwrap() - 1;
     let mut path = file.replace('\\', "/");
     lightspeed::pp::vfs::normalize_path(&mut path);

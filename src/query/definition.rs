@@ -1,7 +1,7 @@
 //! Go-to-definition: resolves the identifier under the cursor to the declarations it may name.
 
 use super::{Decls, Query, call_arity, drop_forward_declarations, ident_at, is_forward_decl_kind, sig_tokens, types};
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 use crate::lexer::{Token, TokenKind};
 use crate::symbols::{SymbolFlags, SymbolId};
 

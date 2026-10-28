@@ -52,11 +52,13 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
 
-use crate::cache::{DecodeError, ShardKey, decode_shard, encode_shard};
-use crate::hash::{FieldHasher, hash_bytes};
+pub mod codec;
+
+use crate::base::hash::{FieldHasher, hash_bytes};
+use crate::base::source::SourceFile;
 use crate::pp::vfs::{list_dir_entries, seed_dir};
 use crate::scope_decls::ScopeDecls;
-use crate::source::SourceFile;
+use crate::store::codec::{DecodeError, ShardKey, decode_shard, encode_shard};
 use crate::symbols::SymbolDb;
 
 const FILE_MAGIC: &[u8; 4] = b"LSIX";

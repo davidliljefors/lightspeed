@@ -7,7 +7,7 @@ use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
-/// A typed index into an [`IndexVec`] or [`Interner`](crate::interner::Interner).
+/// A typed index into an [`IndexVec`] or [`Interner`](crate::base::interner::Interner).
 pub trait Idx: Copy + Eq + Ord + Hash + fmt::Debug {
     /// Panics if `i` does not fit (`i >= u32::MAX`).
     fn from_usize(i: usize) -> Self;
@@ -23,7 +23,7 @@ macro_rules! define_id {
         #[repr(transparent)]
         $vis struct $name(::std::num::NonZeroU32);
 
-        impl $crate::ids::Idx for $name {
+        impl $crate::base::ids::Idx for $name {
             #[inline]
             fn from_usize(i: usize) -> Self {
                 let raw = u32::try_from(i)

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::source::SourceFile;
+use crate::base::source::SourceFile;
 
 /// Shared, read-only file access. Implementations must be cheap to call from
 /// many threads at once (no global locks on the hot path).
@@ -91,7 +91,7 @@ mod dir_cache {
     use rustc_hash::FxBuildHasher;
 
     use super::path_key;
-    use crate::hash::hash_bytes;
+    use crate::base::hash::hash_bytes;
 
     /// The files of one directory, as [`path_key`]s of their full paths.
     pub struct Dir {
@@ -291,16 +291,16 @@ pub fn normalize_path(p: &mut String) {
 pub fn path_key(p: &str) -> u64 {
     let b = p.as_bytes();
     if !cfg!(windows) {
-        return crate::hash::hash_bytes(b);
+        return crate::base::hash::hash_bytes(b);
     }
     if b.len() <= 256 {
         let mut buf = [0u8; 256];
         for (d, c) in buf.iter_mut().zip(b) {
             *d = c.to_ascii_lowercase();
         }
-        crate::hash::hash_bytes(&buf[..b.len()])
+        crate::base::hash::hash_bytes(&buf[..b.len()])
     } else {
-        crate::hash::hash_bytes(&b.to_ascii_lowercase())
+        crate::base::hash::hash_bytes(&b.to_ascii_lowercase())
     }
 }
 

@@ -1,10 +1,9 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lightspeed::cache::{Lookup, ShardCache, ShardKey, decode_shard, encode_shard};
-use lightspeed::compile_commands::CompileDb;
-use lightspeed::hash::hash_bytes;
+use lightspeed::store::codec::{ShardKey, decode_shard, encode_shard};
+use lightspeed::workspace::compile_commands::CompileDb;
+use lightspeed::base::hash::hash_bytes;
 use lightspeed::symbols::{Symbol, SymbolDb, SymbolKind};
 use lightspeed::testgen::{compile_commands_json, cpp_source};
-use rayon::prelude::*;
 use std::hint::black_box;
 
 fn hashing(c: &mut Criterion) {
@@ -60,23 +59,6 @@ fn shards(c: &mut Criterion) {
             b.iter(|| decode_shard(black_box(bytes), &key).unwrap().len())
         });
     }
-
-    // End-to-end cache hits across all cores: the common warm-start path.
-    let dir = tempfile::tempdir().unwrap();
-    let cache = ShardCache::open(dir.path()).unwrap();
-    let db = shard(200);
-    let paths: Vec<String> = (0..5_000).map(|i| format!("/src/f{i}.h")).collect();
-    paths.par_iter().for_each(|p| cache.store(&ShardKey { path: p, content_hash: 1, flags_hash: 2 }, &db).unwrap());
-    g.throughput(Throughput::Elements(paths.len() as u64));
-    g.sample_size(20);
-    g.bench_function("warm_load_5000_shards_parallel", |b| {
-        b.iter(|| {
-            paths
-                .par_iter()
-                .filter(|p| matches!(cache.load(&ShardKey { path: p, content_hash: 1, flags_hash: 2 }), Lookup::Hit(_)))
-                .count()
-        })
-    });
     g.finish();
 }
 

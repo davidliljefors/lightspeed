@@ -1,8 +1,8 @@
 //! Disk-cache behaviour: a warm launch must reuse exactly what is still valid
 //! and produce an index identical to a cold build, whatever changed in between.
 
-use lightspeed::compile_commands::CompileDb;
-use lightspeed::index::{CacheStats, Index, IndexConfig};
+use lightspeed::workspace::compile_commands::CompileDb;
+use lightspeed::workspace::index::{CacheStats, Index, IndexConfig};
 use lightspeed::pp::vfs::clear_dir_cache;
 use lightspeed::store::CacheConfig;
 

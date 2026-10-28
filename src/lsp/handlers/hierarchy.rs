@@ -7,11 +7,11 @@ use std::collections::HashMap;
 
 use hashbrown::HashSet;
 
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 use crate::lsp::convert::lsp_symbol_kind;
 use crate::lsp::position::{path_to_uri, position_to_offset, uri_to_path};
 use crate::query::{Query, Text};
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 use crate::symbols::SymbolId;
 
 impl Server {

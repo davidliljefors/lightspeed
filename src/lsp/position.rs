@@ -1,7 +1,7 @@
 //! URIs and positions: LSP speaks `file://` URIs and UTF-16 columns, the index speaks paths and byte offsets.
 
 use crate::pp::vfs::normalize_path;
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 
 pub fn uri_to_path(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;

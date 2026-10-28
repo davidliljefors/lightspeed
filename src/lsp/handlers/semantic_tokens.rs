@@ -6,7 +6,7 @@ use crate::lsp::{Overlay, Server};
 use crate::lsp::position::{offset_to_position, position_to_offset, uri_to_path};
 use crate::pp::vfs::path_key;
 use crate::query::Query;
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 
 impl Server {
     /// Encoded token data for the document (or the requested range of it).

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::lsp::{Overlay, Server};
 use crate::lsp::position::offset_to_position;
 use crate::query::Query;
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 
 impl Server {
     pub(in crate::lsp) fn hover(&self, params: &Value) -> Option<Value> {

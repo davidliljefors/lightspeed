@@ -1,4 +1,4 @@
-//! Phase 4: inheritance DAG and Virtual Function Families.
+//! Inheritance DAG and Virtual Function Families.
 //!
 //! [`Hierarchy::build`] runs one linear pass over a (merged) [`SymbolDb`]:
 //! resolve base names to class symbols, order classes bases-first, group
@@ -18,8 +18,8 @@
 //! - Inheritance cycles are tolerated: classes in a cycle are processed last,
 //!   in ID order.
 
-use crate::csr::Csr;
-use crate::ids::Idx;
+use crate::base::csr::Csr;
+use crate::base::ids::Idx;
 use crate::symbols::{FamilyId, NameId, SymbolDb, SymbolFlags, SymbolId, SymbolKind};
 use rustc_hash::{FxHashMap, FxHashSet};
 

@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use lightspeed::compile_commands::{FlagSet, IncludeDir, IncludeKind};
+use lightspeed::workspace::compile_commands::{FlagSet, IncludeDir, IncludeKind};
 use lightspeed::pp::vfs::MemFs;
 use lightspeed::pp::{PpConfig, PpOutput, Preprocessor};
 use lightspeed::testgen::cpp_source;

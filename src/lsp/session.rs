@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 
 use super::transport::{read_frame, write_frame, error};
 use super::{Msg, PROGRESS_TOKEN, Server};
-use crate::compile_commands::CompileDb;
-use crate::hash::hash_bytes;
-use crate::index::{Index, IndexConfig, Progress};
+use crate::workspace::compile_commands::CompileDb;
+use crate::base::hash::hash_bytes;
+use crate::workspace::index::{Index, IndexConfig, Progress};
 use crate::pp::vfs::{normalize_path, path_key};
 
 const IDLE_FLUSH: Duration = Duration::from_millis(150);

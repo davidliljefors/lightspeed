@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::lsp::{Overlay, Server};
 use crate::query::{Location, Query, identifier_at};
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 use crate::symbols::SymbolId;
 
 impl Server {

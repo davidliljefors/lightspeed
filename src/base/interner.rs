@@ -1,6 +1,6 @@
 //! String interner backed by one contiguous arena (no per-string allocation).
 
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
 use std::hash::BuildHasher;

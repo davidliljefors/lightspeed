@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::position::{offset_to_position, path_to_uri};
 use super::{Overlay, Server};
 use crate::query::{Location, Query, Text};
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 use crate::symbols::{SymbolId, SymbolKind};
 
 pub(super) fn lsp_symbol_kind(k: SymbolKind) -> u32 {

@@ -3,12 +3,11 @@
 //! Symbols are 32-byte `Copy` records in one `IndexVec`; relations (parent,
 //! bases, virtual family) are IDs rather than pointers. Side indexes
 //! ([`SymbolDb::rebuild_indexes`]) are O(n) rebuilds and are stale after any
-//! insertion until rebuilt; Phase 5 will replace the global rebuild with
-//! per-file shard patching.
+//! insertion until rebuilt (the workspace index patches them per file on edits).
 
-use crate::csr::Csr;
-use crate::ids::{Idx, IndexVec};
-use crate::interner::Interner;
+use crate::base::csr::Csr;
+use crate::base::ids::{Idx, IndexVec};
+use crate::base::interner::Interner;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 use std::ops::{BitOr, BitOrAssign};
@@ -26,7 +25,7 @@ crate::define_id!(
     pub FileId
 );
 crate::define_id!(
-    /// A group of virtual methods that override one another (Phase 4).
+    /// A group of virtual methods that override one another.
     pub FamilyId
 );
 
@@ -496,7 +495,7 @@ impl SymbolDb {
     /// Appends everything from `shard` (typically built privately by one worker
     /// thread, so no locks are needed while parsing). Names and files are
     /// re-interned once per unique string; symbols are remapped by a constant
-    /// offset. Virtual families are shard-local and are dropped; Phase 4
+    /// offset. Virtual families are shard-local and are dropped; the hierarchy
     /// computes them globally. Returns the ID offset applied to the shard's
     /// symbols. Indexes become stale.
     pub fn merge(&mut self, shard: &SymbolDb) -> usize {

@@ -1,4 +1,4 @@
-//! Phase 3: tolerant declaration scanner.
+//! Tolerant declaration scanner.
 //!
 //! Consumes the preprocessor's token stream and records high-level
 //! declarations into a [`SymbolDb`]. It never tries to understand function
@@ -11,7 +11,7 @@
 //! every loop iteration consumes at least one token, so malformed input can
 //! neither hang nor panic.
 
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 use crate::lexer::{Keyword as Kw, TokenKind as K};
 use crate::pp::{PpOutput, PpToken};
 use crate::symbols::{Access, BaseEdge, FileId, NameId, Signature, Symbol, SymbolDb, SymbolFlags, SymbolId, SymbolKind};

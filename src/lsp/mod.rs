@@ -29,10 +29,10 @@ use std::sync::mpsc::Sender;
 use hashbrown::HashSet;
 use serde_json::Value;
 
-use crate::index::{Index, Progress};
+use crate::workspace::index::{Index, Progress};
 use crate::pp::vfs::path_key;
 use crate::query::{DiskText, Text, TextSource};
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 
 pub use position::{offset_to_position, path_to_uri, position_to_offset, uri_to_path};
 pub use transport::{read_frame, serve_stdio, write_frame};

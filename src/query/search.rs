@@ -6,7 +6,7 @@
 use rayon::prelude::*;
 
 use super::Query;
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 use crate::symbols::{NameId, SymbolFlags, SymbolId};
 
 const MAX_TERMS: usize = 16;

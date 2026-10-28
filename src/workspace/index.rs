@@ -13,14 +13,14 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 use rustc_hash::{FxBuildHasher, FxHasher};
 
-use crate::compile_commands::{CompileDb, FlagSet};
-use crate::hash::hash_bytes;
+use crate::workspace::compile_commands::{CompileDb, FlagSet};
+use crate::base::hash::hash_bytes;
 use crate::hierarchy::Hierarchy;
 use crate::lexer::{Token, TokenKind, lex_into};
 use crate::parser::{ParseOutput, parse};
 use crate::pp::vfs::{DiskFs, normalize_path, path_key};
 use crate::pp::{PpConfig, PpOutput, Preprocessor};
-use crate::source::SourceFile;
+use crate::base::source::SourceFile;
 use crate::store::{self, CacheConfig, Probe, RecSrc, RecordParts, Snapshot};
 use crate::symbols::{SymbolDb, SymbolId};
 
@@ -146,10 +146,10 @@ impl CacheStats {
             self.encode_us as f64 / 1e3,
         );
         if self.fresh_bytes > 0 {
-            s.push_str(&format!(" | new records {} (largest {}: {})", crate::mem::mib(self.fresh_bytes as usize), crate::mem::mib(self.biggest_rec.0 as usize), self.biggest_rec.1));
+            s.push_str(&format!(" | new records {} (largest {}: {})", crate::base::mem::mib(self.fresh_bytes as usize), crate::base::mem::mib(self.biggest_rec.0 as usize), self.biggest_rec.1));
         }
         if self.saved_bytes > 0 {
-            s.push_str(&format!(" | saved {} in {:.0} ms", crate::mem::mib(self.saved_bytes as usize), self.save_ms));
+            s.push_str(&format!(" | saved {} in {:.0} ms", crate::base::mem::mib(self.saved_bytes as usize), self.save_ms));
         }
         s
     }
@@ -495,7 +495,7 @@ impl Index {
             {
                 idx.stats.biggest_result = (b, j.path.clone());
             }
-            idx.stats.rss_after_analyze = crate::mem::process_bytes().0.max(idx.stats.rss_after_analyze);
+            idx.stats.rss_after_analyze = crate::base::mem::process_bytes().0.max(idx.stats.rss_after_analyze);
             let t = std::time::Instant::now();
             let mut next: Vec<Job> = Vec::new();
             for (job, res) in jobs.iter().zip(results) {
@@ -677,7 +677,7 @@ impl Index {
             self.saver = Some(std::thread::spawn(move || {
                 let t = std::time::Instant::now();
                 match store::save(job) {
-                    Ok(b) => eprintln!("lightspeed: cache saved, {} in {:.0} ms", crate::mem::mib(b as usize), t.elapsed().as_secs_f64() * 1e3),
+                    Ok(b) => eprintln!("lightspeed: cache saved, {} in {:.0} ms", crate::base::mem::mib(b as usize), t.elapsed().as_secs_f64() * 1e3),
                     Err(e) => eprintln!("lightspeed: cache save failed: {e}"),
                 }
             }));
@@ -781,7 +781,7 @@ impl Index {
     /// or not) by `file` bring into scope. Cached until any file changes.
     /// Approximate memory held by each part of the index, plus process RSS.
     pub fn memory_report(&self) -> String {
-        use crate::mem::{mib, process_bytes};
+        use crate::base::mem::{mib, process_bytes};
         let (hn, htext, htoks) = self.shared.stats();
         let files: usize = self
             .files
@@ -984,7 +984,7 @@ impl Index {
     }
 }
 
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 
 fn flags_of(cdb: &CompileDb, entry: Option<u32>) -> (&FlagSet, u64) {
     static DEFAULT: std::sync::OnceLock<FlagSet> = std::sync::OnceLock::new();

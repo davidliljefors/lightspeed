@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use crate::lsp::{Overlay, Server};
 use crate::lsp::position::path_to_uri;
 use crate::query::{Query, identifier_at};
-use crate::source::LineIndex;
+use crate::base::source::LineIndex;
 
 impl Server {
     /// Parameter/local at the request position: its occurrences as ranges in the same document.

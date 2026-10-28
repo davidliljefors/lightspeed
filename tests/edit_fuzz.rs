@@ -10,8 +10,8 @@
 mod common;
 
 use common::{Rng, observable};
-use lightspeed::compile_commands::CompileDb;
-use lightspeed::index::{Index, IndexConfig};
+use lightspeed::workspace::compile_commands::CompileDb;
+use lightspeed::workspace::index::{Index, IndexConfig};
 use std::collections::HashMap;
 use std::path::Path;
 

@@ -32,9 +32,9 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::index::{Index, find_occurrences};
+use crate::workspace::index::{Index, find_occurrences};
 use crate::lexer::{Token, TokenKind, lex_into};
-use crate::source::SourceFile;
+use crate::base::source::SourceFile;
 use crate::symbols::{SymbolFlags, SymbolId};
 
 /// File contents, either mapped from disk or an editor buffer.

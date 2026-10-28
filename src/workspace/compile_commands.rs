@@ -1,4 +1,4 @@
-//! `compile_commands.json` ingestion (Phase 1).
+//! `compile_commands.json` ingestion.
 //!
 //! The file is memory-mapped and parsed zero-copy with serde (strings borrow
 //! from the map unless they contain JSON escapes). Per-entry flag extraction
@@ -16,9 +16,9 @@
 //! single quotes group, and `\"` is a literal quote. Other backslashes are
 //! literal so Windows paths survive.
 
-use crate::hash::FieldHasher;
-use crate::ids::IndexVec;
-use crate::source::{LoadError, SourceFile};
+use crate::base::hash::FieldHasher;
+use crate::base::ids::IndexVec;
+use crate::base::source::{LoadError, SourceFile};
 use hashbrown::HashTable;
 use rayon::prelude::*;
 use rustc_hash::FxBuildHasher;
@@ -357,7 +357,7 @@ impl CompileDb {
             .collect();
         keys.sort();
         keys.dedup();
-        let found: Vec<Vec<String>> = keys.par_iter().map(|(c, s)| crate::sysinc::discover(c, s.as_deref())).collect();
+        let found: Vec<Vec<String>> = keys.par_iter().map(|(c, s)| crate::workspace::sysinc::discover(c, s.as_deref())).collect();
         let total = found.iter().map(Vec::len).sum();
         for f in self.flag_sets.iter_mut() {
             let Some(c) = &f.compiler else { continue };
@@ -375,7 +375,7 @@ impl CompileDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::Idx;
+    use crate::base::ids::Idx;
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

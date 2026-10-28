@@ -1,8 +1,8 @@
 //! Hierarchy tests: base resolution, virtual families, out-of-line linking.
 
-use lightspeed::compile_commands::FlagSet;
+use lightspeed::workspace::compile_commands::FlagSet;
 use lightspeed::hierarchy::Hierarchy;
-use lightspeed::ids::Idx;
+use lightspeed::base::ids::Idx;
 use lightspeed::parser::{ParseOutput, parse};
 use lightspeed::pp::vfs::MemFs;
 use lightspeed::pp::{PpConfig, PpOutput, Preprocessor};

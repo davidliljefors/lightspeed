@@ -3,7 +3,7 @@
 //! Built with a stable counting sort (O(n), two allocations). Used for
 //! name -> symbols, parent -> children, base -> derived, family -> members.
 
-use crate::ids::Idx;
+use crate::base::ids::Idx;
 use std::marker::PhantomData;
 
 pub struct Csr<K, V> {

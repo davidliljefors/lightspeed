@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
-use lightspeed::csr::Csr;
-use lightspeed::interner::Interner;
+use lightspeed::base::csr::Csr;
+use lightspeed::base::interner::Interner;
 use lightspeed::symbols::{Symbol, SymbolDb, SymbolKind};
 use lightspeed::{NameId, SymbolId};
 

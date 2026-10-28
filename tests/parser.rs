@@ -1,7 +1,7 @@
 //! Declaration parser tests: preprocess, then parse, then inspect the flat DB.
 
-use lightspeed::compile_commands::FlagSet;
-use lightspeed::ids::Idx;
+use lightspeed::workspace::compile_commands::FlagSet;
+use lightspeed::base::ids::Idx;
 use lightspeed::parser::{OpaqueKind, ParseOutput, parse};
 use lightspeed::pp::vfs::MemFs;
 use lightspeed::pp::{PpConfig, PpOutput, Preprocessor};

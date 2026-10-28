@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use lightspeed::index::Index;
+use lightspeed::workspace::index::Index;
 use lightspeed::symbols::SymbolId;
 use std::collections::HashMap;
 

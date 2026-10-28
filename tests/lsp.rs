@@ -4,7 +4,7 @@ use std::io::{BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use lightspeed::lsp::{Server, offset_to_position, path_to_uri, position_to_offset, read_frame, uri_to_path, write_frame};
-use lightspeed::source::LineIndex;
+use lightspeed::base::source::LineIndex;
 use serde_json::{Value, json};
 
 struct Client {

@@ -2,9 +2,9 @@
 
 mod common;
 
-use lightspeed::compile_commands::CompileDb;
-use lightspeed::ids::Idx;
-use lightspeed::index::{Index, IndexConfig};
+use lightspeed::workspace::compile_commands::CompileDb;
+use lightspeed::base::ids::Idx;
+use lightspeed::workspace::index::{Index, IndexConfig};
 use lightspeed::query::{DiskText, Query};
 use lightspeed::symbols::SymbolId;
 

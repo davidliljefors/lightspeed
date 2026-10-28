@@ -1,31 +1,19 @@
-//! On-disk symbol shard cache (Phase 1).
+//! Binary encoding of one file's symbol shard, used by the persistent store.
 //!
-//! One file per `(source path, flags)` pair, fanned out over 256 directories.
-//! A shard is valid only if both the XXH3 of the file's contents and the
-//! XXH3 of its [`FlagSet`](crate::compile_commands::FlagSet) match, so parsing
-//! is skipped for unchanged files.
-//!
-//! Contention: workers never share state here. Each shard is its own file,
-//! written to a process-unique temp name and atomically renamed, and each
-//! shard path is touched by exactly one worker per run.
-//!
-//! Known limit (by design for now): a shard is keyed by its own file's
-//! contents, not those of the headers it includes. Once the preprocessor
-//! exists, include-dependent state must be folded into `content_hash`.
+//! A shard is valid only for the XXH3 of the file's contents and of its
+//! [`FlagSet`](crate::workspace::compile_commands::FlagSet) given in its [`ShardKey`].
 //!
 //! Format (little-endian): `magic "LSSD" | version u32 | content_hash u64 |
 //! flags_hash u64 | path | names | files | symbols | bases | out_of_line | signatures | xxh3 u64` where
 //! the trailer covers every preceding byte. Decoding validates every index,
 //! so corrupt or hostile files yield an error, never a panic.
 
-use crate::hash::hash_bytes;
-use crate::ids::Idx;
+use crate::base::hash::hash_bytes;
+use crate::base::ids::Idx;
 use crate::symbols::{
     Access, BaseEdge, FamilyId, FileId, NameId, Signature, Symbol, SymbolDb, SymbolFlags, SymbolId, SymbolKind,
 };
 use std::fmt;
-use std::io;
-use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"LSSD";
 /// Bump whenever the layout or the meaning of stored data changes.
@@ -317,64 +305,10 @@ fn decode_body(body: &[u8], key: &ShardKey) -> R<SymbolDb> {
     Ok(db)
 }
 
-/// Result of a cache probe.
-#[derive(Debug)]
-pub enum Lookup {
-    Hit(Box<SymbolDb>),
-    Miss,
-    /// A shard exists but was built from different content/flags/format.
-    Stale,
-    Corrupt(&'static str),
-}
-
-pub struct ShardCache {
-    root: PathBuf,
-}
-
-impl ShardCache {
-    pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let root = root.into();
-        std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
-    }
-
-    pub fn shard_path(&self, key: &ShardKey) -> PathBuf {
-        let mut h = crate::hash::FieldHasher::new();
-        h.str(key.path).u64(key.flags_hash);
-        let h = h.finish();
-        self.root.join(format!("{:02x}", h >> 56)).join(format!("{h:016x}.shard"))
-    }
-
-    pub fn load(&self, key: &ShardKey) -> Lookup {
-        match std::fs::read(self.shard_path(key)) {
-            Ok(bytes) => match decode_shard(&bytes, key) {
-                Ok(db) => Lookup::Hit(Box::new(db)),
-                Err(DecodeError::Stale) => Lookup::Stale,
-                Err(DecodeError::Corrupt(why)) => Lookup::Corrupt(why),
-            },
-            Err(_) => Lookup::Miss,
-        }
-    }
-
-    pub fn store(&self, key: &ShardKey, db: &SymbolDb) -> io::Result<()> {
-        let mut buf = Vec::new();
-        encode_shard(key, db, &mut buf);
-        let path = self.shard_path(key);
-        std::fs::create_dir_all(path.parent().expect("shard path has a parent"))?;
-        // One worker owns a given shard path per run; the pid separates processes.
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, &path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::symbols::{Symbol, SymbolFlags};
-    use rayon::prelude::*;
 
     const KEY: ShardKey<'static> = ShardKey { path: "/src/a.h", content_hash: 0xAA, flags_hash: 0xBB };
 
@@ -511,69 +445,5 @@ mod tests {
         let sum = hash_bytes(&b[..n]);
         b[n..].copy_from_slice(&sum.to_le_bytes());
         assert_eq!(decode_shard(&b, &KEY).unwrap_err(), DecodeError::Corrupt("count exceeds data"));
-    }
-
-    #[test]
-    fn disk_cache_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ShardCache::open(dir.path().join("cache")).unwrap();
-        assert!(matches!(cache.load(&KEY), Lookup::Miss));
-
-        cache.store(&KEY, &sample()).unwrap();
-        match cache.load(&KEY) {
-            Lookup::Hit(db) => assert_same(&db, &sample()),
-            other => panic!("expected hit, got {other:?}"),
-        }
-        // Same path+flags, changed content: same slot, now stale.
-        let changed = ShardKey { content_hash: 0xCC, ..KEY };
-        assert!(matches!(cache.load(&changed), Lookup::Stale));
-        cache.store(&changed, &sample()).unwrap();
-        assert!(matches!(cache.load(&changed), Lookup::Hit(_)));
-        assert!(matches!(cache.load(&KEY), Lookup::Stale));
-        // Different flags for the same file get their own shard.
-        let other_flags = ShardKey { flags_hash: 0xDD, ..KEY };
-        assert_ne!(cache.shard_path(&KEY), cache.shard_path(&other_flags));
-        assert!(matches!(cache.load(&other_flags), Lookup::Miss));
-    }
-
-    #[test]
-    fn detects_on_disk_corruption() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ShardCache::open(dir.path()).unwrap();
-        cache.store(&KEY, &sample()).unwrap();
-        let p = cache.shard_path(&KEY);
-        let mut bytes = std::fs::read(&p).unwrap();
-        bytes[20] ^= 1;
-        std::fs::write(&p, bytes).unwrap();
-        assert!(matches!(cache.load(&KEY), Lookup::Corrupt(_)));
-        std::fs::write(&p, b"").unwrap();
-        assert!(matches!(cache.load(&KEY), Lookup::Corrupt(_)));
-    }
-
-    #[test]
-    fn parallel_store_and_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = ShardCache::open(dir.path()).unwrap();
-        let paths: Vec<String> = (0..400).map(|i| format!("/src/f{i}.h")).collect();
-        paths.par_iter().for_each(|p| {
-            let key = ShardKey { path: p, content_hash: 7, flags_hash: 9 };
-            cache.store(&key, &sample()).unwrap();
-        });
-        let hits = paths
-            .par_iter()
-            .filter(|p| matches!(cache.load(&ShardKey { path: p, content_hash: 7, flags_hash: 9 }), Lookup::Hit(_)))
-            .count();
-        assert_eq!(hits, 400);
-        let leftovers = walk(dir.path()).into_iter().filter(|p| p.extension().is_some_and(|e| e != "shard")).count();
-        assert_eq!(leftovers, 0, "no temp files may remain");
-    }
-
-    fn walk(p: &std::path::Path) -> Vec<PathBuf> {
-        let mut out = Vec::new();
-        for e in std::fs::read_dir(p).unwrap().flatten() {
-            let path = e.path();
-            if path.is_dir() { out.extend(walk(&path)) } else { out.push(path) }
-        }
-        out
     }
 }

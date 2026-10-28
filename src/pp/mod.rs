@@ -39,8 +39,8 @@ use std::sync::Arc;
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
-use crate::compile_commands::{FlagSet, IncludeDir};
-use crate::hash::FieldHasher;
+use crate::workspace::compile_commands::{FlagSet, IncludeDir};
+use crate::base::hash::FieldHasher;
 use crate::lexer::{Keyword, Token, TokenKind, lex_into};
 use expand::{Ctx, ExpTok, F_ARENA, F_BOL, F_MACRO, F_SPACE, Texts};
 use macros::{Macro, MacroKind, MacroTable, NONE};
@@ -763,7 +763,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         let snap = Snapshot {
             base_key: self.base_key.unwrap_or(0),
             prefix_len: off as u32,
-            prefix_hash: crate::hash::hash_bytes(prefix),
+            prefix_hash: crate::base::hash::hash_bytes(prefix),
             t: self.t.clone(),
             cond: self.cond.clone(),
             once: self.once.clone(),
@@ -787,7 +787,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         let Some(s) = self.snapshots.get(&key) else { return false };
         let len = s.prefix_len as usize;
         let valid = s.base_key == self.base_key.unwrap_or(0)
-            && src.as_bytes().get(..len).is_some_and(|p| crate::hash::hash_bytes(p) == s.prefix_hash);
+            && src.as_bytes().get(..len).is_some_and(|p| crate::base::hash::hash_bytes(p) == s.prefix_hash);
         let pos = inp.toks.partition_point(|t| (t.start as usize) < len);
         // A token straddling the cut means the edit extended the prologue's last token.
         if !valid || pos.checked_sub(1).is_some_and(|i| inp.toks[i].end() as usize > len) {
@@ -911,7 +911,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                         let mut toks = self.tok_pool.pop().unwrap_or_default();
                         lex_into(src, &mut toks);
                         let guard = directives::detect_guard(src, &toks).map(str::to_owned);
-                        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::hash::hash_bytes(src.as_bytes()) };
+                        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::base::hash::hash_bytes(src.as_bytes()) };
                         directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
                         self.tok_pool.push(toks);
                         let e = Arc::new(e);

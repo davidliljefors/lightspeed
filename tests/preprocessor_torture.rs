@@ -2,7 +2,7 @@
 //! expectations, differentially against `clang -E` when available, plus
 //! robustness, isolation and determinism checks.
 
-use lightspeed::compile_commands::{FlagSet, IncludeDir, IncludeKind, MacroOp};
+use lightspeed::workspace::compile_commands::{FlagSet, IncludeDir, IncludeKind, MacroOp};
 use lightspeed::lexer::{Token, lex_into};
 use lightspeed::pp::vfs::MemFs;
 use lightspeed::pp::{DiagKind, PpConfig, PpOutput, Preprocessor, Profile};
@@ -649,7 +649,7 @@ fn deps_record_hits_misses_and_cached_resolutions() {
 
 #[test]
 fn depgraph_invalidates_on_modify_delete_and_create() {
-    use lightspeed::depgraph::DepGraph;
+    use lightspeed::workspace::depgraph::DepGraph;
     let fs = fs_with(&[("shared.h", ""), ("only1.h", "")]);
     let srcs = [
         "#include \"shared.h\"\n#include \"only1.h\"\n",
