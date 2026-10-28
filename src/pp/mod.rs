@@ -551,7 +551,7 @@ pub struct Preprocessor<'fs, P: FileProvider> {
     snapshots: HashMap<u64, Snapshot, FxBuildHasher>,
     snapshotting: bool,
     /// Predefined macros of the flag set; `base` is this plus the force-includes.
-    base0: MacroTable,
+    flags: FlagSet,
     prologue: Arc<Prologue>,
     prologue_stale: bool,
     base_key: Option<u64>,
@@ -620,7 +620,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             cfg,
             snapshots: HashMap::with_hasher(FxBuildHasher),
             snapshotting: false,
-            base0: MacroTable::new(),
+            flags: FlagSet::default(),
             prologue: Arc::new(Prologue::default()),
             prologue_stale: false,
             base_key: None,
@@ -677,7 +677,15 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         self.snapshots.clear();
         self.dirs.clone_from(&flags.include_dirs);
         self.force_includes.clone_from(&flags.force_includes);
+        // The predefined-macro table is only built if no worker has this
+        // flag set's prologue yet, so switching between known flag sets is cheap.
+        self.flags.clone_from(flags);
+        self.prologue_stale = true;
+    }
 
+    /// Leaves the flag set's predefined macros in `self.t`.
+    fn build_predefined(&mut self) {
+        let flags = std::mem::take(&mut self.flags);
         self.t = MacroTable::new();
         for (name, kind) in [
             ("__LINE__", MacroKind::Line),
@@ -706,8 +714,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 self.define_line(&format!("{} {}", m.name, m.value.as_deref().unwrap_or("1")));
             }
         }
-        self.base0 = std::mem::replace(&mut self.t, MacroTable::new());
-        self.prologue_stale = true;
+        self.flags = flags;
     }
 
     /// Forget cached include resolutions (call when files appear/disappear).
@@ -756,6 +763,13 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             self.build_prologue();
         }
         out.clear();
+        // An aborted expansion can leave macros disabled; the table is about
+        // to be rolled back rather than recopied, so clear that here.
+        for c in &self.ctx {
+            if let Some(m) = self.t.defs.get_mut(c.mac as usize) {
+                m.disabled = false;
+            }
+        }
         self.t.reset_from(&self.prologue.base);
         self.reset_tu_state();
 
@@ -848,12 +862,13 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// the macro table they leave (like a precompiled header) instead of
     /// re-executing them.
     fn compute_prologue(&mut self) -> Prologue {
-        let mut p = Prologue { base: self.base0.clone(), ..Prologue::default() };
+        self.build_predefined();
+        let mut p = Prologue { base: self.t.clone(), ..Prologue::default() };
         if self.force_includes.is_empty() || !self.cfg.follow_includes {
+            p.base.seal();
             return p;
         }
         let mut out = PpOutput::default();
-        self.t.reset_from(&self.base0);
         self.reset_tu_state();
         self.set_file(0, "<command-line>", 0, NONE);
         self.deps.clear();
@@ -884,6 +899,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         p.pool = out.pool;
         p.stats = out.stats;
         p.base.clone_from(&self.t);
+        p.base.seal();
         p
     }
 

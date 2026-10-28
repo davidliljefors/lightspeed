@@ -706,6 +706,34 @@ fn shared_force_include_prologue_matches_inline_and_keeps_deps() {
     assert!(results[0].1.contains(&key("/t/pre.h")) && results[0].1.contains(&key("/t/inner.h")));
 }
 
+#[test]
+fn reused_worker_matches_fresh_worker_across_tus() {
+    let fs = fs_with(&[("pre.h", "#define A 1\n#define B 2\n#define F(x) x+A\n")]);
+    let mut f = flags(&["/t"]);
+    f.force_includes.push("/t/pre.h".into());
+    let srcs = [
+        "#undef A\n#define A 10\nF(1) B\n",
+        "F(1) A B\n",
+        "#undef B\n#ifdef B\nyes\n#else\nno\n#endif\nA\n",
+        "#define B 5\n#define NEW 3\nB NEW F(2)\n",
+        "NEW B F(3)\n",
+        "#define F(x) x*x\nF(4)\n",
+        "F(5) A\n",
+    ];
+    let mut reused = Preprocessor::new(&fs, cfg());
+    reused.set_flags(&f);
+    let mut out = PpOutput::default();
+    for src in srcs {
+        let mut fresh = Preprocessor::new(&fs, cfg());
+        fresh.set_flags(&f);
+        let mut want = PpOutput::default();
+        fresh.run(MAIN, src, &mut want);
+        reused.run(MAIN, src, &mut out);
+        assert_eq!(norm(&out.render(src)), norm(&want.render(src)), "for {src:?}");
+        assert_eq!(reused.macro_count(), fresh.macro_count(), "for {src:?}");
+    }
+}
+
 // ---- flags
 
 fn with_flags(macros: Vec<MacroOp>, std: Option<&str>, src: &str) -> String {

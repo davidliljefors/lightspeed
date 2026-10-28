@@ -56,6 +56,33 @@ pub(crate) struct Macro {
 
 const FILTER_WORDS: usize = 1024;
 
+/// How to undo one index change.
+#[derive(Clone, Copy)]
+enum Undo {
+    /// A definition was added; `prev` is the live definition it replaced.
+    Defined { idx: u32, prev: Option<u32> },
+    /// The live definition `idx` was removed.
+    Undefined { idx: u32 },
+}
+
+/// Lets a table that was reset from a sealed base return to it by undoing
+/// only this TU's changes, instead of copying the whole base again.
+#[derive(Default)]
+struct Rollback {
+    /// Seal of the base this table currently derives from (0 = none).
+    synced: u64,
+    log: Vec<Undo>,
+}
+
+impl Clone for Rollback {
+    // A copy is a different table, so it never derives from a base.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+static NEXT_SEAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Clone)]
 pub(crate) struct MacroTable {
     /// Starts with `"01"` so the digits can be referenced without allocating.
@@ -66,6 +93,20 @@ pub(crate) struct MacroTable {
     /// 64Ki-bit Bloom-ish prefilter: almost all identifiers are not macros,
     /// and this keeps that check inside L1.
     filter: [u64; FILTER_WORDS],
+    rollback: Rollback,
+    /// Nonzero once this table is a finished base that others reset from;
+    /// it must not change afterwards.
+    seal: Seal,
+}
+
+/// Seal id; a clone is a different table, so it is never sealed.
+#[derive(Default)]
+struct Seal(u64);
+
+impl Clone for Seal {
+    fn clone(&self) -> Self {
+        Self(0)
+    }
 }
 
 #[inline]
@@ -93,7 +134,15 @@ impl MacroTable {
             body: Vec::new(),
             index: HashTable::new(),
             filter: [0; FILTER_WORDS],
+            rollback: Rollback::default(),
+            seal: Seal(0),
         }
+    }
+
+    /// Marks this table as a finished base (see [`reset_from`](Self::reset_from)).
+    /// Cloning it yields an unsealed copy.
+    pub fn seal(&mut self) {
+        self.seal = Seal(NEXT_SEAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     }
 
     #[inline]
@@ -129,12 +178,19 @@ impl MacroTable {
         self.filter[w] |= bit;
         let arena = &self.arena;
         let defs = &self.defs;
+        let log = self.rollback.synced != 0;
         if let Some(slot) = self.index.find_mut(h, |&i| {
             let s = defs[i as usize].name;
             &arena[s.off as usize..(s.off + s.len) as usize] == name
         }) {
+            if log {
+                self.rollback.log.push(Undo::Defined { idx, prev: Some(*slot) });
+            }
             *slot = idx;
         } else {
+            if log {
+                self.rollback.log.push(Undo::Defined { idx, prev: None });
+            }
             self.index.insert_unique(h, idx, |&i| {
                 let s = defs[i as usize].name;
                 hash_name(&arena[s.off as usize..(s.off + s.len) as usize])
@@ -151,11 +207,15 @@ impl MacroTable {
         }
         let arena = &self.arena;
         let defs = &self.defs;
+        let log = self.rollback.synced != 0;
         match self.index.find_entry(h, |&i| {
             let s = defs[i as usize].name;
             &arena[s.off as usize..(s.off + s.len) as usize] == name
         }) {
             Ok(e) => {
+                if log {
+                    self.rollback.log.push(Undo::Undefined { idx: *e.get() });
+                }
                 e.remove();
                 true
             }
@@ -173,8 +233,40 @@ impl MacroTable {
         self.index.len()
     }
 
-    /// Overwrites `self` with `base`, reusing allocations.
+    /// Makes `self` equal to `base`, reusing allocations. If `self` already
+    /// derives from this sealed `base`, only the changes made since are
+    /// undone, which is far cheaper than copying a large base (a table with
+    /// the Windows headers or STL pre-included) for every TU.
     pub fn reset_from(&mut self, base: &MacroTable) {
+        if base.seal.0 != 0 && self.rollback.synced == base.seal.0 {
+            while let Some(u) = self.rollback.log.pop() {
+                match u {
+                    Undo::Defined { idx, prev } => {
+                        let h = hash_name(self.text(self.defs[idx as usize].name));
+                        match (self.index.find_entry(h, |&i| i == idx), prev) {
+                            (Ok(mut e), Some(p)) => *e.get_mut() = p,
+                            (Ok(e), None) => {
+                                e.remove();
+                            }
+                            (Err(_), _) => {}
+                        }
+                    }
+                    Undo::Undefined { idx } => {
+                        let h = hash_name(self.text(self.defs[idx as usize].name));
+                        let (arena, defs) = (&self.arena, &self.defs);
+                        self.index.insert_unique(h, idx, |&i| {
+                            let s = defs[i as usize].name;
+                            hash_name(&arena[s.off as usize..(s.off + s.len) as usize])
+                        });
+                    }
+                }
+            }
+            self.arena.truncate(base.arena.len());
+            self.defs.truncate(base.defs.len());
+            self.body.truncate(base.body.len());
+            self.filter = base.filter;
+            return;
+        }
         self.arena.clear();
         self.arena.push_str(&base.arena);
         self.defs.clear();
@@ -183,5 +275,7 @@ impl MacroTable {
         self.body.extend_from_slice(&base.body);
         self.index.clone_from(&base.index);
         self.filter = base.filter;
+        self.rollback.log.clear();
+        self.rollback.synced = base.seal.0;
     }
 }

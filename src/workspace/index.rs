@@ -480,6 +480,9 @@ impl Index {
                 jobs.push(Job { path: p, flag_entry: Some(i as u32), is_tu: true });
             }
         }
+        // Same flag sets back to back: a worker then rolls its macro table back
+        // between TUs instead of recopying the (possibly large) base each time.
+        jobs.sort_by_key(|j| j.flag_entry.map_or(0, |i| idx.cdb.entries[i as usize].flags.index()));
         if let Some(p) = progress {
             p.total.store(jobs.len() as u32, Relaxed);
         }
