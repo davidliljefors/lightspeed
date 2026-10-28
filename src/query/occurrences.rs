@@ -189,9 +189,12 @@ impl Query<'_> {
                     }
                     match tok.kind {
                         K::LParen => {
-                            let is_macro = i > 0
-                                && toks[i - 1].kind == K::Ident
-                                && idx.db.lookup(toks[i - 1].text(text)).iter().any(|&c| idx.db.symbol(c).kind == SymbolKind::Macro);
+                            // Headers are parsed alone, so their includers' macros are unknown: ALL_CAPS(...) counts too.
+                            let is_macro = i > 0 && toks[i - 1].kind == K::Ident && {
+                                let n = toks[i - 1].text(text);
+                                idx.db.lookup(n).iter().any(|&c| idx.db.symbol(c).kind == SymbolKind::Macro)
+                                    || (n.len() > 1 && n.bytes().any(|b| b.is_ascii_uppercase()) && !n.bytes().any(|b| b.is_ascii_lowercase()))
+                            };
                             open_macros += is_macro as usize;
                             parens.push(is_macro);
                         }

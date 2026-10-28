@@ -30,6 +30,20 @@ use crate::symbols::{SymbolId, SymbolKind};
 pub(super) mod signature;
 mod nav;
 
+thread_local! {
+    static GUESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Marks the current lookup as having picked among same-named strangers.
+fn note_guess() {
+    GUESSED.set(true);
+}
+
+/// Whether a type lookup since the last call had to guess; clears the mark.
+pub(super) fn take_guess() -> bool {
+    GUESSED.replace(false)
+}
+
 const MAX_DEPTH: u8 = 4;
 const SMART_PTRS: &[&str] = &["unique_ptr", "shared_ptr", "weak_ptr", "intrusive_ptr", "scoped_ptr", "linked_ptr", "optional"];
 const MAKE_SMART: &[&str] = &["make_unique", "make_shared", "make_intrusive", "allocate_shared", "make_optional"];
@@ -306,6 +320,8 @@ impl Query<'_> {
                 return hits;
             }
             if scope.is_empty() {
+                // No enclosing scope declares it, so every same-named symbol is a stranger until proven otherwise.
+                note_guess();
                 return all.to_vec();
             }
             scope = scope.rfind("::").map_or("", |i| &scope[..i]);

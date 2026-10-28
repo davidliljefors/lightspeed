@@ -70,8 +70,9 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
                 (head.matches('\n').count(), head.len() - head.rfind('\n').map_or(0, |n| n + 1))
             };
             let mut out = String::new();
+            let stride: usize = args.iter().position(|a| a == "--sample-stride").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(25);
             for (fi, f) in idx.live_files() {
-                if fi % 25 != 0 || occ[fi].sites.is_empty() {
+                if fi % stride != 0 || occ[fi].sites.is_empty() {
                     continue;
                 }
                 let step = (occ[fi].sites.len() / 20).max(1);

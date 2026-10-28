@@ -29,8 +29,9 @@ impl Query<'_> {
     /// access whose receiver type is unknown, which then matches every member of that name.
     pub(super) fn definition_checked(&self, toks: &[Token], path: &str, text: &str, i: usize) -> (Vec<SymbolId>, bool) {
         let mut guessed = false;
+        super::types::take_guess();
         let r = self.resolve_identifier(toks, path, text, i, &|_| true, &mut guessed);
-        (r, guessed)
+        (r, guessed | super::types::take_guess())
     }
 
     fn resolve_identifier(&self, toks: &[Token], path: &str, text: &str, i: usize, kind_ok: &dyn Fn(crate::symbols::SymbolKind) -> bool, guessed: &mut bool) -> Vec<SymbolId> {
@@ -47,6 +48,10 @@ impl Query<'_> {
         }
         qual.reverse();
         let global = j >= 1 && toks[j - 1].kind == TokenKind::ColonColon;
+        if j == i && i >= 2 && toks[i - 1].kind == TokenKind::ColonColon && matches!(toks[i - 2].kind, TokenKind::Gt | TokenKind::RParen | TokenKind::RBracket) {
+            // `Tmpl<T>::name`: the qualifier is a type we do not follow, so it cannot be told from a bare name.
+            *guessed = true;
+        }
         let arity = (toks.get(i + 1).is_some_and(|t| t.kind == TokenKind::LParen)).then(|| call_arity(toks, i + 1));
 
         let fi = self.idx.file_index(path);

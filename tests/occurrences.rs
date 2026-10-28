@@ -296,3 +296,55 @@ fn local_class_field_declared_after_use_is_not_an_inherited_outer_member() {
     );
     assert!(!got.contains(&"Base::id".to_string()), "{got:?}");
 }
+
+#[test]
+fn member_qualified_by_a_template_id_is_not_the_enclosing_classes_member() {
+    // embree: `vfloat<M>::store_nt` inside a class that has its own `store_nt`.
+    let got = marked(
+        &[],
+        "template<class T> struct V { static void store(int); };\ntemplate<int M> struct Tri { void store(int); void f() { V<M>::/*@*/store(1); } };\n",
+    );
+    assert!(got.is_empty(), "{got:?}");
+}
+
+#[test]
+fn alias_to_a_namespaced_template_does_not_resolve_to_a_global_class_of_that_name() {
+    // Godot's `Array` vs `JPH::Array`, reached through `JPH::TriangleList`.
+    let got = marked(
+        &[("g.h", "struct Array { void reserve(int); };\n"), ("j.h", "namespace JPH { template<class T> struct Array { void reserve(int); }; using List = Array<int>; }\n")],
+        "#include \"g.h\"\n#include \"j.h\"\nvoid f() { JPH::List l; l./*@*/reserve(1); }\n",
+    );
+    assert!(!got.contains(&"Array::reserve".to_string()), "{got:?}");
+}
+
+#[test]
+fn class_with_an_attribute_between_keyword_and_name_is_a_class() {
+    let got = marked(
+        &[("b.h", "namespace N { class [[nodiscard]] Builder { public: struct Face {}; }; }\n"), ("o.h", "namespace M { struct Face {}; }\n")],
+        "#include \"b.h\"\n#include \"o.h\"\nvoid f() { N::Builder::/*@*/Face* x; }\n",
+    );
+    assert_eq!(got, ["N::Builder::Face"]);
+}
+
+#[test]
+#[ignore = "headers are parsed standalone, so macros from their includers are unknown"]
+fn header_that_relies_on_its_includers_macros_never_misleads_a_same_named_global() {
+    // Jolt: `Array.h` opens its namespace with a macro from `Core.h`, which it does not include.
+    // Parsed standalone the class is lost; the global `Array` must not be picked in its place.
+    let got = marked(
+        &[
+            ("m.h", "#define NS_BEGIN namespace JPH {\n#define NS_END }\n"),
+            ("a.h", "#pragma once\nNS_BEGIN\ntemplate <class T> class [[nodiscard]] Array { public: void reserve(int); };\nusing List = Array<int>;\nNS_END\n"),
+            ("g.h", "struct Array { void reserve(int); };\n"),
+        ],
+        "#include \"m.h\"\n#include \"a.h\"\n#include \"g.h\"\nvoid f() { JPH::List l; l./*@*/reserve(1); }\n",
+    );
+    assert!(!got.contains(&"Array::reserve".to_string()), "{got:?}");
+}
+
+#[test]
+fn argument_of_an_unknown_all_caps_macro_is_not_a_use_of_the_same_named_method() {
+    // Godot's `EXBIND1(set_layer, int)` comes from a generated header: it declares a method rather than using one.
+    let got = marked(&[], "struct Base { virtual void set_layer(int); };\nstruct D : Base {\n  EXBIND1(/*@*/set_layer, int)\n};\n");
+    assert!(got.is_empty(), "{got:?}");
+}
