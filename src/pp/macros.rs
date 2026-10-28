@@ -68,14 +68,18 @@ enum Undo {
 /// Lets a table that was reset from a sealed base return to it by undoing
 /// only this TU's changes, instead of copying the whole base again.
 #[derive(Default)]
-struct Rollback {
+struct Lineage {
+    /// Nonzero once this table is a finished base that others reset from;
+    /// it must not change afterwards.
+    seal: u64,
     /// Seal of the base this table currently derives from (0 = none).
     synced: u64,
+    /// Index changes made since `synced`; only recorded while `synced != 0`.
     log: Vec<Undo>,
 }
 
-impl Clone for Rollback {
-    // A copy is a different table, so it never derives from a base.
+impl Clone for Lineage {
+    // A copy is a different table: neither sealed nor derived from a base.
     fn clone(&self) -> Self {
         Self::default()
     }
@@ -93,20 +97,7 @@ pub(crate) struct MacroTable {
     /// 64Ki-bit Bloom-ish prefilter: almost all identifiers are not macros,
     /// and this keeps that check inside L1.
     filter: [u64; FILTER_WORDS],
-    rollback: Rollback,
-    /// Nonzero once this table is a finished base that others reset from;
-    /// it must not change afterwards.
-    seal: Seal,
-}
-
-/// Seal id; a clone is a different table, so it is never sealed.
-#[derive(Default)]
-struct Seal(u64);
-
-impl Clone for Seal {
-    fn clone(&self) -> Self {
-        Self(0)
-    }
+    lineage: Lineage,
 }
 
 #[inline]
@@ -134,15 +125,14 @@ impl MacroTable {
             body: Vec::new(),
             index: HashTable::new(),
             filter: [0; FILTER_WORDS],
-            rollback: Rollback::default(),
-            seal: Seal(0),
+            lineage: Lineage::default(),
         }
     }
 
     /// Marks this table as a finished base (see [`reset_from`](Self::reset_from)).
     /// Cloning it yields an unsealed copy.
     pub fn seal(&mut self) {
-        self.seal = Seal(NEXT_SEAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        self.lineage.seal = NEXT_SEAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[inline]
@@ -178,18 +168,18 @@ impl MacroTable {
         self.filter[w] |= bit;
         let arena = &self.arena;
         let defs = &self.defs;
-        let log = self.rollback.synced != 0;
+        let log = self.lineage.synced != 0;
         if let Some(slot) = self.index.find_mut(h, |&i| {
             let s = defs[i as usize].name;
             &arena[s.off as usize..(s.off + s.len) as usize] == name
         }) {
             if log {
-                self.rollback.log.push(Undo::Defined { idx, prev: Some(*slot) });
+                self.lineage.log.push(Undo::Defined { idx, prev: Some(*slot) });
             }
             *slot = idx;
         } else {
             if log {
-                self.rollback.log.push(Undo::Defined { idx, prev: None });
+                self.lineage.log.push(Undo::Defined { idx, prev: None });
             }
             self.index.insert_unique(h, idx, |&i| {
                 let s = defs[i as usize].name;
@@ -207,14 +197,14 @@ impl MacroTable {
         }
         let arena = &self.arena;
         let defs = &self.defs;
-        let log = self.rollback.synced != 0;
+        let log = self.lineage.synced != 0;
         match self.index.find_entry(h, |&i| {
             let s = defs[i as usize].name;
             &arena[s.off as usize..(s.off + s.len) as usize] == name
         }) {
             Ok(e) => {
                 if log {
-                    self.rollback.log.push(Undo::Undefined { idx: *e.get() });
+                    self.lineage.log.push(Undo::Undefined { idx: *e.get() });
                 }
                 e.remove();
                 true
@@ -238,8 +228,8 @@ impl MacroTable {
     /// undone, which is far cheaper than copying a large base (a table with
     /// the Windows headers or STL pre-included) for every TU.
     pub fn reset_from(&mut self, base: &MacroTable) {
-        if base.seal.0 != 0 && self.rollback.synced == base.seal.0 {
-            while let Some(u) = self.rollback.log.pop() {
+        if base.lineage.seal != 0 && self.lineage.synced == base.lineage.seal {
+            while let Some(u) = self.lineage.log.pop() {
                 match u {
                     Undo::Defined { idx, prev } => {
                         let h = hash_name(self.text(self.defs[idx as usize].name));
@@ -275,7 +265,7 @@ impl MacroTable {
         self.body.extend_from_slice(&base.body);
         self.index.clone_from(&base.index);
         self.filter = base.filter;
-        self.rollback.log.clear();
-        self.rollback.synced = base.seal.0;
+        self.lineage.log.clear();
+        self.lineage.synced = base.lineage.seal;
     }
 }

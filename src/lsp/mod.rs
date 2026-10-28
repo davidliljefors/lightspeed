@@ -114,8 +114,6 @@ pub struct Server {
     caps: ClientCaps,
     settings: Settings,
     refresh_seq: u64,
-    /// `documentLink` requests that arrived during the first build; clients never re-ask.
-    deferred_links: Vec<(Value, Value)>,
     sem: SemanticCache,
     pub exit_code: Option<i32>,
 }
@@ -138,7 +136,6 @@ impl Server {
             caps: ClientCaps::default(),
             settings: Settings { max_signatures: 3 },
             refresh_seq: 0,
-            deferred_links: Vec::new(),
             sem: SemanticCache::default(),
             exit_code: None,
         }

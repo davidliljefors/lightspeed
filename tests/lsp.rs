@@ -862,28 +862,3 @@ fn stdio_smoke_test() {
     let _ = stdout.read_to_string(&mut rest);
     assert!(child.wait().unwrap().success());
 }
-
-#[test]
-fn document_link_asked_during_startup_is_answered_after_the_build() {
-    let (_d, root) = tmp();
-    std::fs::write(format!("{root}/q.h"), "#pragma once\n").unwrap();
-    let a = format!("{root}/a.cpp");
-    let txt = "#include \"q.h\"\nint x;\n";
-    std::fs::write(&a, txt).unwrap();
-    common::write_cdb(&root, true);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lightspeed")).arg("lsp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": path_to_uri(&root)}})).unwrap();
-    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": path_to_uri(&a), "text": txt}}})).unwrap();
-    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentLink", "params": {"textDocument": {"uri": path_to_uri(&a)}}})).unwrap();
-    let r = loop {
-        let v: Value = serde_json::from_slice(&read_frame(&mut stdout).unwrap().unwrap()).unwrap();
-        if v["id"] == 2 && v.get("method").is_none() {
-            break v;
-        }
-    };
-    assert_eq!(r["result"].as_array().map(Vec::len), Some(1), "{r}");
-    let _ = child.kill();
-    let _ = child.wait();
-}

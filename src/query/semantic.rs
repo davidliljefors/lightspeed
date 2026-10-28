@@ -8,7 +8,7 @@
 
 use super::{LocalKind, Query, sig_tokens};
 use crate::lexer::{Keyword, TokenKind as K};
-use crate::symbols::{SymbolFlags, SymbolKind};
+use crate::symbols::{SymbolFlags, SymbolId, SymbolKind};
 
 pub const TOKEN_TYPES: [&str; 14] = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter", "typeParameter", "string"];
 pub const MODIFIERS: [&str; 4] = ["static", "readonly", "abstract", "declaration"];
@@ -29,67 +29,11 @@ const TYPE_PARAMETER: u8 = 12;
 const STRING: u8 = 13;
 
 /// Byte ranges of the header names in `#include`/`#include_next`/`#import` lines, in source order.
-fn include_names(text: &str) -> Vec<(u32, u32)> {
-    let b = text.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0usize;
-    let mut line_start = true;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\n' {
-            line_start = true;
-            i += 1;
-        } else if c == b' ' || c == b'\t' || c == b'\r' {
-            i += 1;
-        } else if line_start && c == b'#' {
-            line_start = false;
-            let d = text[i + 1..].trim_start_matches([' ', '\t']);
-            if d.starts_with("include") || d.starts_with("import") {
-                out.extend(crate::workspace::index::include_name_span(text, i as u32));
-            }
-            i += 1;
-        } else {
-            line_start = false;
-            i = skip_literal(b, i);
-        }
-    }
-    out
-}
-
-/// Past the comment or string literal starting at `i`, or one byte on if there is none.
-fn skip_literal(b: &[u8], i: usize) -> usize {
-    let find = |from: usize, pat: &[u8]| b[from..].windows(pat.len()).position(|w| w == pat).map_or(b.len(), |p| from + p + pat.len());
-    let line_end = |mut j: usize| {
-        while j < b.len() && (b[j] != b'\n' || b[j - 1] == b'\\') {
-            j += 1;
-        }
-        j
-    };
-    let ident = |j: usize| b[j].is_ascii_alphanumeric() || b[j] == b'_';
-    match b[i] {
-        b'/' if b.get(i + 1) == Some(&b'*') => find(i + 2, b"*/"),
-        b'/' if b.get(i + 1) == Some(&b'/') => line_end(i + 2),
-        b'R' if b.get(i + 1) == Some(&b'"') && (i == 0 || !ident(i - 1) || matches!(b[i - 1], b'L' | b'u' | b'U' | b'8')) => {
-            let open = i + 2;
-            match b[open..].iter().position(|&x| x == b'(' || x == b'\n') {
-                Some(p) if b[open + p] == b'(' => {
-                    let mut close = vec![b')'];
-                    close.extend_from_slice(&b[open..open + p]);
-                    close.push(b'"');
-                    find(open + p + 1, &close)
-                }
-                _ => i + 1,
-            }
-        }
-        q @ (b'"' | b'\'') if q == b'"' || i == 0 || !ident(i - 1) => {
-            let mut j = i + 1;
-            while j < b.len() && b[j] != q && b[j] != b'\n' {
-                j += if b[j] == b'\\' { 2 } else { 1 };
-            }
-            if b.get(j) == Some(&q) { j + 1 } else { j.min(b.len()) }
-        }
-        _ => i + 1,
-    }
+fn include_names(toks: &[crate::lexer::Token], text: &str) -> Vec<(u32, u32)> {
+    toks.windows(2)
+        .filter(|w| w[0].kind == K::Hash && w[0].at_line_start() && !w[1].at_line_start() && matches!(w[1].text(text), "include" | "include_next" | "import"))
+        .filter_map(|w| crate::workspace::index::include_name_span(text, w[0].start))
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +62,23 @@ fn token_type(k: SymbolKind) -> u8 {
 }
 
 impl Query<'_> {
+    /// The symbol that colours `toks[i]` among the same-named `cands` that `fits`.
+    fn pick_candidate(&self, toks: &[crate::lexer::Token], path: &str, text: &str, i: usize, cands: &[SymbolId], fits: &dyn Fn(SymbolKind) -> bool) -> Option<SymbolId> {
+        let db = &self.idx.db;
+        let mut fit = cands.iter().copied().filter(|&c| fits(db.symbol(c).kind));
+        let first = fit.next()?;
+        let first_ty = token_type(db.symbol(first).kind);
+        // Same-named symbols of different kinds: resolve the name by scope instead of guessing.
+        if fit.any(|c| token_type(db.symbol(c).kind) != first_ty)
+            && let Some(c) = self.definition_of_kind(toks, path, text, i, fits).into_iter().find(|&c| fits(db.symbol(c).kind))
+        {
+            return Some(c);
+        }
+        // Prefer the definition: a forward declaration may use another class-key (`class A;` vs `struct A {}`), which would colour the same type differently.
+        let definition = cands.iter().copied().find(|&c| fits(db.symbol(c).kind) && db.symbol(c).flags.contains(SymbolFlags::DEFINITION));
+        definition.or(Some(first))
+    }
+
     /// Classified identifiers of `text` that start inside `range` (all if `None`), in source order.
     pub fn semantic_tokens(&self, path: &str, text: &str, range: Option<(u32, u32)>) -> Vec<SemTok> {
         let db = &self.idx.db;
@@ -130,7 +91,7 @@ impl Query<'_> {
         let first = toks.partition_point(|t| t.end() <= lo);
         let mut out = Vec::new();
         // A header name is one string, not a run of identifiers.
-        let includes = include_names(text);
+        let includes = include_names(&toks, text);
         out.extend(includes.iter().filter(|&&(s, e)| s < hi && e > lo).map(|&(s, e)| SemTok { start: s, len: e - s, ty: STRING, mods: 0 }));
         for i in first..toks.len() {
             let t = &toks[i];
@@ -178,15 +139,7 @@ impl Query<'_> {
                     !matches!(k, SymbolKind::Constructor | SymbolKind::Destructor)
                 }
             };
-            let fitting = |&&c: &&crate::symbols::SymbolId| fits(db.symbol(c).kind);
-            // Prefer the definition: a forward declaration may use another class-key (`class A;` vs `struct A {}`), which would colour the same type differently.
-            let mut fit = cands.iter().filter(fitting);
-            let Some(&first) = fit.next() else { continue };
-            let first_ty = token_type(db.symbol(first).kind);
-            let ambiguous = fit.any(|&c| token_type(db.symbol(c).kind) != first_ty);
-            // Same-named symbols of different kinds: resolve the name by scope instead of guessing.
-            let scoped = if ambiguous { self.definition_of_kind(&toks, path, text, i, &fits).into_iter().find(|&c| fits(db.symbol(c).kind)) } else { None };
-            let Some(c) = scoped.or_else(|| cands.iter().filter(fitting).find(|&&c| db.symbol(c).flags.contains(SymbolFlags::DEFINITION)).or_else(|| cands.iter().find(fitting)).copied()) else { continue };
+            let Some(c) = self.pick_candidate(&toks, path, text, i, cands, &fits) else { continue };
             let s = db.symbol(c);
             let mut mods = if declared.binary_search(&t.start).is_ok() { DECLARATION } else { 0 };
             for (bit, flag) in [(1, SymbolFlags::STATIC), (2, SymbolFlags::CONST), (4, SymbolFlags::PURE)] {

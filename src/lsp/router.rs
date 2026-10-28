@@ -17,8 +17,6 @@ enum Pending {
     EmptyList,
     EmptyCompletion,
     Busy,
-    /// Answered once the build finishes.
-    Defer,
 }
 
 /// `Err` becomes a JSON-RPC error (code -32803, "request failed").
@@ -38,7 +36,7 @@ const ROUTES: &[(&str, Pending, Handler)] = &[
     ("textDocument/signatureHelp", Pending::Null, |s, p, _| ok(s.signature_help(p))),
     ("textDocument/completion", Pending::EmptyCompletion, |s, p, _| ok(s.completion(p))),
     ("textDocument/documentSymbol", Pending::EmptyList, |s, p, _| ok(s.document_symbols(p))),
-    ("textDocument/documentLink", Pending::Defer, |s, p, _| ok(s.document_links(p))),
+    ("textDocument/documentLink", Pending::EmptyList, |s, p, _| ok(s.document_links(p))),
     ("workspace/symbol", Pending::EmptyList, |s, p, _| ok(s.workspace_symbols(p))),
     ("textDocument/prepareRename", Pending::Null, |s, p, _| ok(s.prepare_rename(p))),
     ("textDocument/rename", Pending::Busy, |s, p, out| {
@@ -122,16 +120,11 @@ impl Server {
     fn request(&mut self, method: &str, id: &Value, params: &Value, out: &mut Vec<Value>) {
         let route = ROUTES.iter().find(|r| r.0 == method);
         if self.index.is_none() {
-            if self.building.is_some() && matches!(route, Some(&(_, Pending::Defer, _))) {
-                self.deferred_links.push((id.clone(), params.clone()));
-                return;
-            }
             let reply = match (self.building.is_some(), route) {
                 (true, Some(&(_, Pending::Null, _))) => respond(id, Value::Null),
                 (true, Some(&(_, Pending::EmptyList, _))) => respond(id, json!([])),
                 (true, Some(&(_, Pending::EmptyCompletion, _))) => respond(id, json!({"isIncomplete": true, "items": []})),
                 (true, Some(&(_, Pending::Busy, _))) => error(id, -32803, "Lightspeed is still indexing; try again in a moment"),
-                (true, Some(&(_, Pending::Defer, _))) => respond(id, json!([])),
                 _ => error(id, -32002, "server not initialized"),
             };
             out.push(reply);

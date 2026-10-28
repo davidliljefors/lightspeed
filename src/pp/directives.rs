@@ -4,7 +4,7 @@ use super::expand::{ExpTok, F_SPACE, Texts};
 use super::expr;
 use super::macros::{BodyTok, Macro, MacroKind, NONE, NO_PARAM};
 use super::vfs::FileProvider;
-use super::{Cond, Count, DefineRecord, DiagKind, IncludeRecord, Input, Phase, PpOutput, Preprocessor};
+use super::{Cond, DefineRecord, DiagKind, IncludeRecord, Input, PpOutput, Preprocessor};
 use crate::lexer::{Lexer, Token, TokenFlags, TokenKind as K, lex_into};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,27 +60,18 @@ pub(super) fn compact_directives(src: &str, toks: &[Token], text: &mut String, o
 impl<P: FileProvider> Preprocessor<'_, P> {
     /// Header mode: only directives matter, everything else is skipped.
     pub(super) fn scan_directives(&mut self, inp: &mut Input<'_>, out: &mut PpOutput) {
-        let prev = self.prof.enter(Phase::Scan);
         while let Some(&t) = inp.toks.get(inp.pos) {
             inp.pos += 1;
             if t.kind == K::Hash && bol(&t) {
                 self.directive(inp, out);
             }
         }
-        self.prof.leave(prev);
     }
 
     /// Executes the directive whose `#` was just consumed. Leaves `inp.pos` at
     /// the start of the next line (or, after a skipped group, at the `#` of the
     /// directive that ends it).
     pub(super) fn directive(&mut self, inp: &mut Input<'_>, out: &mut PpOutput) {
-        let prev = self.prof.enter(Phase::Scan);
-        self.prof.count(Count::Directives, 1);
-        self.directive_inner(inp, out);
-        self.prof.leave(prev);
-    }
-
-    fn directive_inner(&mut self, inp: &mut Input<'_>, out: &mut PpOutput) {
         let toks = inp.toks;
         let src = inp.src;
         let hash_loc = toks[inp.pos - 1].start;
@@ -205,15 +196,7 @@ impl<P: FileProvider> Preprocessor<'_, P> {
     /// normal directive path handles it. Only directive structure is parsed;
     /// everything else, however malformed, is skipped.
     fn skip_group(&mut self, inp: &mut Input<'_>, out: &mut PpOutput, to_endif: bool) {
-        let prev = self.prof.enter(Phase::Skip);
-        self.skip_group_inner(inp, out, to_endif);
-        self.prof.leave(prev);
-    }
-
-    fn skip_group_inner(&mut self, inp: &mut Input<'_>, out: &mut PpOutput, to_endif: bool) {
-        self.prof.count(Count::SkippedTokens, 0);
         let toks = inp.toks;
-        let i0 = inp.pos;
         let src = inp.src;
         let a = if inp.pos > 0 { toks[inp.pos - 1].end() } else { 0 };
         let mut i = inp.pos;
@@ -237,7 +220,6 @@ impl<P: FileProvider> Preprocessor<'_, P> {
             i += 1;
         };
         inp.pos = stop;
-        self.prof.count(Count::SkippedTokens, (stop - i0) as u64);
         if inp.depth == 0 {
             let b = toks.get(stop).map_or(src.len() as u32, |t| t.start);
             if b > a {
@@ -254,13 +236,10 @@ impl<P: FileProvider> Preprocessor<'_, P> {
         let mut list = self.take_vec();
         list.extend(args.iter().map(|&t| ExpTok::from_src(t)));
         let mut res = self.take_vec();
-        let prev = self.prof.enter(Phase::Cond);
-        self.prof.count(Count::Conds, 1);
         let saved = std::mem::replace(&mut self.in_if, true);
         self.expand_list(&list, inp, out, &mut res);
         self.in_if = saved;
         let r = expr::eval(&res, Texts { arena: &self.t.arena, src: inp.src });
-        self.prof.leave(prev);
         self.give_vec(list);
         self.give_vec(res);
         match r {
@@ -279,14 +258,6 @@ impl<P: FileProvider> Preprocessor<'_, P> {
     /// Parses `NAME[(params)] body` (tokens after `define`) into the table.
     /// Returns the name's `(offset, len, function_like)` on success.
     pub(super) fn do_define(&mut self, line: &[Token], src: &str) -> Option<(u32, u32, bool)> {
-        let prev = self.prof.enter(Phase::Define);
-        self.prof.count(Count::Defines, 1);
-        let r = self.do_define_inner(line, src);
-        self.prof.leave(prev);
-        r
-    }
-
-    fn do_define_inner(&mut self, line: &[Token], src: &str) -> Option<(u32, u32, bool)> {
         let nt = *line.first()?;
         if !matches!(nt.kind, K::Ident | K::Keyword) {
             return None;

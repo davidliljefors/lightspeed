@@ -734,6 +734,26 @@ fn reused_worker_matches_fresh_worker_across_tus() {
     }
 }
 
+#[test]
+fn reused_worker_recovers_from_an_aborted_expansion() {
+    let fs = fs_with(&[("pre.h", "#define ID(x) x\n#define TWICE(x) ID(x) ID(x)\n#define BIG TWICE(TWICE(TWICE(TWICE(TWICE(1)))))\n")]);
+    let mut f = flags(&["/t"]);
+    f.force_includes.push("/t/pre.h".into());
+    let small = PpConfig { max_expansion_tokens: 20, ..cfg() };
+    let srcs = ["BIG\n", "ID(1) TWICE(2)\n", "BIG ID(3)\n", "ID(4)\n"];
+    let mut reused = Preprocessor::new(&fs, small.clone());
+    reused.set_flags(&f);
+    let mut out = PpOutput::default();
+    for src in srcs {
+        let mut fresh = Preprocessor::new(&fs, small.clone());
+        fresh.set_flags(&f);
+        let mut want = PpOutput::default();
+        fresh.run(MAIN, src, &mut want);
+        reused.run(MAIN, src, &mut out);
+        assert_eq!(norm(&out.render(src)), norm(&want.render(src)), "for {src:?}");
+    }
+}
+
 // ---- flags
 
 fn with_flags(macros: Vec<MacroOp>, std: Option<&str>, src: &str) -> String {

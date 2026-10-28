@@ -32,7 +32,6 @@ mod directives;
 mod expand;
 mod expr;
 pub(crate) mod macros;
-mod prof;
 pub mod vfs;
 
 use std::sync::Arc;
@@ -45,8 +44,6 @@ use crate::base::hash::FieldHasher;
 use crate::lexer::{Keyword, Token, TokenKind, lex_into};
 use expand::{Ctx, ExpTok, F_ARENA, F_BOL, F_MACRO, F_SPACE, Texts};
 use macros::{Macro, MacroKind, MacroTable, NONE};
-use prof::{Count, Phase, Prof};
-pub use prof::report as profile_report;
 pub use vfs::{DiskFs, FileProvider, MemFs, normalize_path, path_key};
 
 /// Which toolchain's predefined macros to assume (compile_commands does not
@@ -359,27 +356,82 @@ impl HeaderEntry {
 
 const SHARED_SHARDS: usize = 64;
 
-/// One header's slot: empty while some worker is loading it, then the entry
-/// (`None` when the file could not be read).
-type HeaderSlot = Arc<std::sync::OnceLock<Option<Arc<HeaderEntry>>>>;
+/// Sharded map whose values are computed once: concurrent callers for a key
+/// wait for whoever is already computing it instead of repeating the work.
+struct OnceMap<V> {
+    shards: Vec<std::sync::RwLock<HashMap<u64, Arc<std::sync::OnceLock<V>>, FxBuildHasher>>>,
+}
+
+impl<V: Clone> OnceMap<V> {
+    fn new(shards: usize) -> Self {
+        Self { shards: (0..shards).map(|_| std::sync::RwLock::new(HashMap::with_hasher(FxBuildHasher))).collect() }
+    }
+
+    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, Arc<std::sync::OnceLock<V>>, FxBuildHasher>> {
+        &self.shards[(key >> 7) as usize % self.shards.len()]
+    }
+
+    /// The value for `key`, computed with `init` if nobody has yet. Also
+    /// returns whether this call did the computing. `init` must not call back in.
+    fn get_or_init(&self, key: u64, init: impl FnOnce() -> V) -> (V, bool) {
+        let sh = self.shard(key);
+        let existing = sh.read().ok().and_then(|m| m.get(&key).cloned());
+        let slot = match existing {
+            Some(s) => s,
+            None => match sh.write() {
+                Ok(mut m) => m.entry(key).or_default().clone(),
+                Err(_) => return (init(), true),
+            },
+        };
+        let mut computed = false;
+        let v = slot
+            .get_or_init(|| {
+                computed = true;
+                init()
+            })
+            .clone();
+        (v, computed)
+    }
+
+    fn remove(&self, key: u64) {
+        if let Ok(mut m) = self.shard(key).write() {
+            m.remove(&key);
+        }
+    }
+
+    /// Drops every finished value for which `keep` is false.
+    fn retain(&self, keep: impl Fn(&V) -> bool) {
+        for sh in &self.shards {
+            if let Ok(mut m) = sh.write() {
+                m.retain(|_, slot| slot.get().is_none_or(&keep));
+            }
+        }
+    }
+
+    /// Every finished value.
+    fn ready(&self) -> Vec<(u64, V)> {
+        let mut out = Vec::new();
+        for sh in &self.shards {
+            if let Ok(m) = sh.read() {
+                out.extend(m.iter().filter_map(|(&k, slot)| Some((k, slot.get()?.clone()))));
+            }
+        }
+        out
+    }
+}
 
 /// Header directive streams shared by every worker, so each header is read and
-/// lexed once per build instead of once per thread. Sharded; each header has a
-/// compute-once slot, so workers that want a header somebody is already
-/// loading wait for it instead of repeating the work.
-type PrologueSlot = Arc<std::sync::OnceLock<Arc<Prologue>>>;
-
+/// lexed once per build instead of once per thread, plus the force-include
+/// prologue of each flag set. The header value is `None` when the file could
+/// not be read.
 pub struct SharedHeaders {
-    shards: Vec<std::sync::RwLock<HashMap<u64, HeaderSlot, FxBuildHasher>>>,
-    prologues: std::sync::Mutex<HashMap<u64, PrologueSlot, FxBuildHasher>>,
+    headers: OnceMap<Option<Arc<HeaderEntry>>>,
+    prologues: OnceMap<Arc<Prologue>>,
 }
 
 impl Default for SharedHeaders {
     fn default() -> Self {
-        Self {
-            shards: (0..SHARED_SHARDS).map(|_| std::sync::RwLock::new(HashMap::with_hasher(FxBuildHasher))).collect(),
-            prologues: std::sync::Mutex::new(HashMap::with_hasher(FxBuildHasher)),
-        }
+        Self { headers: OnceMap::new(SHARED_SHARDS), prologues: OnceMap::new(1) }
     }
 }
 
@@ -387,76 +439,40 @@ impl SharedHeaders {
     /// The force-include prologue of flag set `key`, built by whichever
     /// worker asks first (the others wait for it).
     fn get_or_build_prologue(&self, key: u64, build: impl FnOnce() -> Prologue) -> Arc<Prologue> {
-        let slot = match self.prologues.lock() {
-            Ok(mut m) => m.entry(key).or_default().clone(),
-            Err(_) => return Arc::new(build()),
-        };
-        slot.get_or_init(|| Arc::new(build())).clone()
-    }
-    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, HeaderSlot, FxBuildHasher>> {
-        &self.shards[(key >> 7) as usize % SHARED_SHARDS]
+        self.prologues.get_or_init(key, || Arc::new(build())).0
     }
 
     /// `(entries, text bytes, token bytes)` currently cached.
     pub fn stats(&self) -> (usize, usize, usize) {
         let mut s = (0, 0, 0);
-        for sh in &self.shards {
-            if let Ok(m) = sh.read() {
-                for e in m.values().filter_map(|slot| slot.get()?.as_ref()) {
-                    s.0 += 1;
-                    s.1 += e.text.capacity();
-                    s.2 += e.toks.capacity() * std::mem::size_of::<Token>();
-                }
-            }
+        for e in self.headers.ready().iter().filter_map(|(_, e)| e.as_ref()) {
+            s.0 += 1;
+            s.1 += e.text.capacity();
+            s.2 += e.toks.capacity() * std::mem::size_of::<Token>();
         }
         s
     }
 
     /// `(key, path, content hash)` of every header read so far.
     pub fn files(&self) -> Vec<(u64, String, u64)> {
-        let mut out = Vec::new();
-        for sh in &self.shards {
-            if let Ok(m) = sh.read() {
-                out.extend(m.iter().filter_map(|(&k, slot)| slot.get()?.as_ref().map(|e| (k, e.path.clone(), e.hash))));
-            }
-        }
-        out
+        self.headers.ready().into_iter().filter_map(|(k, e)| e.map(|e| (k, e.path.clone(), e.hash))).collect()
     }
 
     /// The entry for `key`, loading it with `load` if no worker has yet.
-    /// Returns whether this call did the loading. Concurrent callers for the
-    /// same key block until the loader finishes. `load` must not call back in.
+    /// Returns whether this call did the loading.
     fn get_or_load(&self, key: u64, load: impl FnOnce() -> Option<Arc<HeaderEntry>>) -> (Option<Arc<HeaderEntry>>, bool) {
-        let sh = self.shard(key);
-        let existing = sh.read().ok().and_then(|m| m.get(&key).cloned());
-        let slot = match existing {
-            Some(s) => s,
-            None => match sh.write() {
-                Ok(mut m) => m.entry(key).or_default().clone(),
-                Err(_) => return (load(), true),
-            },
-        };
-        let mut loaded = false;
-        let r = slot.get_or_init(|| {
-            loaded = true;
-            load()
-        });
-        let r = r.clone();
+        let (r, loaded) = self.headers.get_or_init(key, load);
         if r.is_none() && loaded {
             // Do not remember a failed read: the file may appear later.
-            self.invalidate(key);
+            self.headers.remove(key);
         }
         (r, loaded)
     }
 
     /// Forgets one file (it changed on disk).
     pub fn invalidate(&self, key: u64) {
-        if let Ok(mut m) = self.prologues.lock() {
-            m.retain(|_, slot| slot.get().is_none_or(|p| !p.deps.contains(&key)));
-        }
-        if let Ok(mut m) = self.shard(key).write() {
-            m.remove(&key);
-        }
+        self.prologues.retain(|p| !p.deps.contains(&key));
+        self.headers.remove(key);
     }
 }
 
@@ -595,7 +611,6 @@ pub struct Preprocessor<'fs, P: FileProvider> {
     pub(super) path_buf: String,
     pub(super) tmp_toks: Vec<Token>,
     pub(super) param_scratch: Vec<(u32, u32)>,
-    prof: Prof,
 }
 
 fn cplusplus_for(std: &str) -> Option<u32> {
@@ -657,7 +672,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             path_buf: String::new(),
             tmp_toks: Vec::new(),
             param_scratch: Vec::new(),
-            prof: Prof::new(),
         }
     }
 
@@ -757,7 +771,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
 
     /// Preprocesses `src` (the text of `path`) into `out`.
     pub fn run(&mut self, path: &str, src: &str, out: &mut PpOutput) {
-        self.prof.begin();
         self.bound_resolve_cache();
         if self.prologue_stale {
             self.build_prologue();
@@ -779,9 +792,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         self.set_file(0, &main_path, key, NONE);
 
         let mut toks = self.tok_pool.pop().unwrap_or_default();
-        let ph = self.prof.enter(Phase::MainLex);
         lex_into(src, &mut toks);
-        self.prof.leave(ph);
         let mut inp = Input::new(src, &toks, 0);
         let mut first = !self.restore_snapshot(key, src, &mut inp, out);
         if first {
@@ -799,7 +810,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             out.stats = p.stats;
         }
 
-        let expand_ph = self.prof.enter(Phase::Expand);
         while let Some(t) = self.expand_next(&mut inp, out, 0, true) {
             if first {
                 first = false;
@@ -817,10 +827,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 }
             self.emit(&t, src, out);
         }
-        self.prof.leave(expand_ph);
-        let tail = self.prof.enter(Phase::Tail);
-        self.prof.count(Count::Runs, 1);
-        self.prof.count(Count::MainTokens, out.tokens.len() as u64);
         for c in &self.cond {
             out.diagnostics.push(PpDiag { loc: c.loc, kind: DiagKind::UnterminatedIf });
         }
@@ -829,8 +835,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         self.deps.sort_unstable();
         self.deps.dedup();
         out.deps.extend_from_slice(&self.deps);
-        self.prof.leave(tail);
-        self.prof.flush();
     }
 
     fn reset_tu_state(&mut self) {
@@ -1045,43 +1049,27 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Reads and lexes the header whose normalized path is in `path_buf`,
     /// keeping only its directive lines.
     fn load_header(&mut self) -> Option<Arc<HeaderEntry>> {
-        let fs = self.fs;
-        let ph = self.prof.enter(Phase::Load);
-        let loaded = fs.load(&self.path_buf);
-        self.prof.leave(ph);
-        let sf = loaded?;
-        let ph = self.prof.enter(Phase::Lex);
+        let sf = self.fs.load(&self.path_buf)?;
         let src = sf.text();
-        self.prof.count(Count::HeaderLoads, 1);
-        self.prof.count(Count::HeaderBytes, src.len() as u64);
         let mut toks = self.tok_pool.pop().unwrap_or_default();
         lex_into(src, &mut toks);
         let guard = directives::detect_guard(src, &toks).map(str::to_owned);
         let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::base::hash::hash_bytes(src.as_bytes()) };
         directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
         self.tok_pool.push(toks);
-        self.prof.leave(ph);
         Some(Arc::new(e))
     }
 
     /// Loads the file whose normalized path is in `path_buf` and scans it for
     /// directives (tokens are not emitted).
     pub(super) fn enter_file(&mut self, key: u64, dir_idx: u32, out: &mut PpOutput) {
-        let prev = self.prof.enter(Phase::EnterFile);
-        self.enter_file_inner(key, dir_idx, out);
-        self.prof.leave(prev);
-    }
-
-    fn enter_file_inner(&mut self, key: u64, dir_idx: u32, out: &mut PpOutput) {
         if self.once.contains(&key) {
             out.stats.skipped_once += 1;
-            self.prof.count(Count::OnceSkips, 1);
             return;
         }
         if let Some(&Some((o, l))) = self.guards.get(&key)
             && self.t.lookup(&self.guard_text[o as usize..(o + l) as usize]).is_some() {
                 out.stats.skipped_guard += 1;
-                self.prof.count(Count::GuardSkips, 1);
                 return;
             }
         let depth = self.file_depth + 1;
@@ -1119,8 +1107,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             }
         };
         out.stats.headers_entered += 1;
-        self.prof.count(Count::Entered, 1);
-        self.prof.count(Count::HeaderTokens, entry.toks.len() as u64);
         let path = std::mem::take(&mut self.path_buf);
         self.set_file(depth, &path, key, dir_idx);
         self.path_buf = path;
@@ -1181,23 +1167,12 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Every candidate probed is recorded as a dependency.
     fn probe(&mut self) -> bool {
         let key = path_key(&self.path_buf);
-        let ph = self.prof.enter(Phase::Probe);
         let hit = self.fs.exists_keyed(&self.path_buf, key);
-        self.prof.leave(ph);
-        self.prof.count(Count::Probes, 1);
         // A hit depends on that exact file; a miss only on a file of that name appearing.
         self.probes.push(if hit { key } else { vfs::name_key(&self.path_buf) });
         hit
     }
     pub(super) fn resolve(&mut self, name: &str, quote: bool, next: bool) -> Option<Resolved> {
-        let prev = self.prof.enter(Phase::Resolve);
-        self.prof.count(Count::Resolves, 1);
-        let r = self.resolve_inner(name, quote, next);
-        self.prof.leave(prev);
-        r
-    }
-
-    fn resolve_inner(&mut self, name: &str, quote: bool, next: bool) -> Option<Resolved> {
         let d = self.file_depth;
         let start = if next {
             match self.files[d].dir_idx {
@@ -1214,7 +1189,6 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         let ck = h.finish();
 
         if let Some(&(found, po, pl)) = self.resolve_cache.get(&ck) {
-            self.prof.count(Count::ResolveHits, 1);
             self.deps.extend_from_slice(&self.probes[po as usize..(po + pl) as usize]);
             return match found {
                 Some((o, l, dir, key)) => {
