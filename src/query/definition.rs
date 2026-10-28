@@ -29,6 +29,7 @@ impl Query<'_> {
             j -= 2;
         }
         qual.reverse();
+        let global = j >= 1 && toks[j - 1].kind == TokenKind::ColonColon;
         let arity = (toks.get(i + 1).is_some_and(|t| t.kind == TokenKind::LParen)).then(|| call_arity(toks, i + 1));
 
         let fi = self.idx.file_index(path);
@@ -63,6 +64,12 @@ impl Query<'_> {
             })
         };
 
+        if global && qual.is_empty() {
+            let top: Vec<SymbolId> = cands.iter().copied().filter(|&c| db.symbol(c).parent.is_none()).collect();
+            if !top.is_empty() {
+                cands = top;
+            }
+        }
         if !qual.is_empty() {
             let mut buf = String::new();
             let mut by_qualifier = |want: &str, cands: &[SymbolId]| -> Vec<SymbolId> {
@@ -73,7 +80,7 @@ impl Query<'_> {
                         let Some(p) = db.symbol(c).parent else { return false };
                         buf.clear();
                         db.write_qualified_name(p, &mut buf);
-                        buf == want || buf.strip_suffix(want).is_some_and(|r| r.ends_with("::"))
+                        buf == want || (!global && buf.strip_suffix(want).is_some_and(|r| r.ends_with("::")))
                     })
                     .collect()
             };
@@ -120,6 +127,9 @@ impl Query<'_> {
                         score += 8 - pos.min(4) as i32;
                     } else if in_bases.contains(&p) {
                         score += 3;
+                    } else if db.symbol(p).kind == crate::symbols::SymbolKind::Namespace && decls_at().names_contain(db.names.get(db.symbol(p).name)) {
+                        // Named by a `using namespace` in effect here.
+                        score += 5;
                     }
                 }
                 if s.kind == crate::symbols::SymbolKind::EnumConstant
