@@ -130,6 +130,34 @@ fn definition_references_and_live_edits() {
     assert!(r["result"].as_array().unwrap().is_empty());
 }
 
+/// Ctrl-click on a function that is defined right where the cursor is has nowhere to go.
+/// Answering with its own location makes editors start a find-references search instead.
+#[test]
+fn definition_on_the_definition_itself_returns_nothing() {
+    let (_d, root) = tmp();
+    let h = format!("{root}/example.h");
+    let htxt = "#pragma once\nclass Example {\npublic:\n  static Example* create() { return new Example(); }\n  int count(int n) { int local = n; return local; }\n  void declared_only();\n};\nExample* make() { return Example::create(); }\n";
+    std::fs::write(&h, htxt).unwrap();
+    write_cdb_for(&root, &["a.cpp"]);
+    std::fs::write(format!("{root}/a.cpp"), "#include \"example.h\"\n").unwrap();
+
+    let mut c = Client::new(&root);
+    c.open(&h, htxt);
+    let mut def = |needle: &str, nth: usize| c.request("textDocument/definition", json!({"textDocument": {"uri": path_to_uri(&h)}, "position": pos_of(htxt, needle, nth)}))["result"].clone();
+    assert_eq!(def("create()", 0), json!([]), "inline definition");
+    assert_eq!(def("local =", 0), json!([]), "local declaration");
+    assert_eq!(def("declared_only", 0), json!([]), "declaration without an implementation");
+    // From a use, it still jumps.
+    assert_eq!(def("create()", 1).as_array().unwrap().len(), 1);
+    assert_eq!(def("local;", 0).as_array().unwrap().len(), 1);
+}
+
+/// Like `common::write_cdb`, but lists every given translation unit.
+fn write_cdb_for(root: &str, files: &[&str]) {
+    let cdb: Vec<Value> = files.iter().map(|f| json!({"directory": root, "file": f, "arguments": ["clang++", "-c", f, "-I", root]})).collect();
+    std::fs::write(format!("{root}/compile_commands.json"), serde_json::to_string(&cdb).unwrap()).unwrap();
+}
+
 #[test]
 fn includes_are_document_links() {
     let (_d, root) = tmp();

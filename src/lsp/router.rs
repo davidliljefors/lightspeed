@@ -28,9 +28,9 @@ fn ok(v: Option<Value>) -> Result<Option<Value>, String> {
 
 const ROUTES: &[(&str, Pending, Handler)] = &[
     ("textDocument/definition", Pending::Null, |s, p, _| ok(s.definition(p))),
-    ("textDocument/declaration", Pending::Null, |s, p, _| ok(s.navigate(p, true, |q, p, t, o| q.declarations(p, t, o)))),
-    ("textDocument/implementation", Pending::Null, |s, p, _| ok(s.navigate(p, false, |q, p, t, o| q.implementations(p, t, o)))),
-    ("textDocument/typeDefinition", Pending::Null, |s, p, _| ok(s.navigate(p, false, |q, p, t, o| q.type_definitions(p, t, o)))),
+    ("textDocument/declaration", Pending::Null, |s, p, _| ok(s.navigate(p, true, false, |q, p, t, o| q.declarations(p, t, o)))),
+    ("textDocument/implementation", Pending::Null, |s, p, _| ok(s.navigate(p, false, false, |q, p, t, o| q.implementations(p, t, o)))),
+    ("textDocument/typeDefinition", Pending::Null, |s, p, _| ok(s.navigate(p, false, false, |q, p, t, o| q.type_definitions(p, t, o)))),
     ("textDocument/references", Pending::EmptyList, |s, p, _| ok(s.references(p))),
     ("textDocument/hover", Pending::Null, |s, p, _| ok(s.hover(p))),
     ("textDocument/signatureHelp", Pending::Null, |s, p, _| ok(s.signature_help(p))),
