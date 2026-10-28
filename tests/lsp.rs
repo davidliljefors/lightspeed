@@ -161,6 +161,71 @@ fn type_hierarchy_and_inheritance_graph_over_rpc() {
     let g = c.request("lightspeed/inheritanceGraph", json!({"typeName": "B", "maxNodes": 2}))["result"].clone();
     assert_eq!(g["nodes"].as_array().unwrap().len(), 2);
     assert_eq!(g["truncated"], true);
+
+    // Cursor on a declaration, in a namespace, with `public` bases and a template base.
+    let t2 = "namespace n {\ntemplate<class T> struct Base { virtual void f(); };\nclass Mid : public Base<int> {};\nclass Leaf final : public Mid {};\n}\n";
+    let b = format!("{root}/b.cpp");
+    std::fs::write(&b, t2).unwrap();
+    c.open(&b, t2);
+    for (needle, want) in [("Mid :", "Mid"), ("Leaf final", "Leaf"), ("Base {", "Base"), ("Base<int>", "Base")] {
+        let r = c.request("textDocument/prepareTypeHierarchy", json!({"textDocument": {"uri": path_to_uri(&b)}, "position": pos_of(t2, needle, 0)}));
+        assert_eq!(r["result"][0]["name"], want, "{needle}: {r}");
+    }
+    let r = c.request("textDocument/prepareTypeHierarchy", json!({"textDocument": {"uri": path_to_uri(&b)}, "position": pos_of(t2, "Mid :", 0)}));
+    let item = r["result"][0].clone();
+    assert_eq!(names(&c.request("typeHierarchy/supertypes", json!({"item": item}))), ["Base"]);
+    assert_eq!(names(&c.request("typeHierarchy/subtypes", json!({"item": item}))), ["Leaf"]);
+
+    // Classes typed into an open buffer are visible to the very next request.
+    let t3 = format!("{t2}struct Typed : n::Mid {{}};\nstruct Typed2 : Typed {{}};\n");
+    c.change(&b, &t3);
+    let pos = |needle: &str| json!({"textDocument": {"uri": path_to_uri(&b)}, "position": pos_of(&t3, needle, 0)});
+    let r = c.request("textDocument/prepareTypeHierarchy", pos("Typed :"));
+    assert_eq!(r["result"][0]["name"], "Typed", "{r}");
+    let item = r["result"][0].clone();
+    assert_eq!(names(&c.request("typeHierarchy/supertypes", json!({"item": item}))), ["Mid"]);
+    assert_eq!(names(&c.request("typeHierarchy/subtypes", json!({"item": item}))), ["Typed2"]);
+
+    // Typing a new class character by character in a file that includes a header
+    // (and in a header no translation unit includes).
+    let hh = format!("{root}/h.h");
+    let h_txt = "#pragma once\nstruct HBase { virtual void f(); };\n";
+    let m = format!("{root}/m.cpp");
+    let m_txt = "#include \"h.h\"\nstruct Existing : HBase {};\n";
+    std::fs::write(&hh, h_txt).unwrap();
+    std::fs::write(&m, m_txt).unwrap();
+    c.open(&m, m_txt);
+    let orphan = format!("{root}/orphan.h");
+    std::fs::write(&orphan, "").unwrap();
+    c.open(&orphan, "");
+    let mut buf = m_txt.to_owned();
+    let mut obuf = String::new();
+    let otyped = "struct Orph {};\n";
+    let typed = "struct Fresh : public HBase {};\n";
+    for (ch, och) in typed.chars().zip(otyped.chars().chain(std::iter::repeat('\n'))) {
+        buf.push(ch);
+        obuf.push(och);
+        c.change(&m, &buf);
+        c.change(&orphan, &obuf);
+        let r = c.request("textDocument/prepareTypeHierarchy", json!({"textDocument": {"uri": path_to_uri(&m)}, "position": pos_of(&buf, "HBase", 0)}));
+        assert!(r["result"].is_array() || r["result"].is_null(), "{r}");
+    }
+    let r = c.request("textDocument/prepareTypeHierarchy", json!({"textDocument": {"uri": path_to_uri(&m)}, "position": pos_of(&buf, "Fresh", 0)}));
+    assert_eq!(r["result"][0]["name"], "Fresh", "{r}");
+    let item = r["result"][0].clone();
+    assert_eq!(names(&c.request("typeHierarchy/supertypes", json!({"item": item}))), ["HBase"]);
+    let hb = c.request("textDocument/prepareTypeHierarchy", json!({"textDocument": {"uri": path_to_uri(&m)}, "position": pos_of(&buf, "HBase", 0)}));
+    let subs = names(&c.request("typeHierarchy/subtypes", json!({"item": hb["result"][0]})));
+    assert_eq!(subs, ["Existing", "Fresh"]);
+    let r = c.request("textDocument/prepareTypeHierarchy", json!({"textDocument": {"uri": path_to_uri(&orphan)}, "position": pos_of(&obuf, "Orph", 0)}));
+    assert_eq!(r["result"][0]["name"], "Orph", "orphan header: {r}");
+
+    // An edit between prepare and the follow-up request renumbers symbols; the item still resolves.
+    let hb_item = hb["result"][0].clone();
+    let shifted = format!("struct Inserted {{}};\nstruct Inserted2 : HBase {{}};\n{buf}");
+    c.change(&m, &shifted);
+    let subs = names(&c.request("typeHierarchy/subtypes", json!({"item": hb_item})));
+    assert!(subs.contains(&"Inserted2".to_owned()) && subs.contains(&"Fresh".to_owned()), "{subs:?}");
 }
 
 #[test]

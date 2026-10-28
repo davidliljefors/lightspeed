@@ -935,6 +935,18 @@ impl Server {
         let idx = self.index.as_ref()?;
         let db = &idx.db;
         let item = params.get("item").unwrap_or(params);
+        let overlay = Overlay(&self.docs);
+        // Items are resolved by where the name is written now: symbol ids are
+        // renumbered when the index is rebuilt after an edit, positions are not.
+        if let (Some(uri), Some(line), Some(col)) = (item["uri"].as_str(), item["selectionRange"]["start"]["line"].as_u64(), item["selectionRange"]["start"]["character"].as_u64())
+            && let Some(path) = uri_to_path(uri)
+            && let Some(text) = self.text_of(&path)
+        {
+            let off = position_to_offset(text.as_str(), &LineIndex::new(text.as_str()), line as u32, col as u32);
+            if let Some(id) = Query::new(idx, &overlay).class_at(&path, text.as_str(), off) {
+                return Some(id);
+            }
+        }
         if let Some(raw) = item["data"]["id"].as_u64().or_else(|| params["id"].as_u64()) {
             let raw = raw as usize;
             return (raw < db.len() && db.symbol(SymbolId::from_usize(raw)).kind.is_record()).then(|| SymbolId::from_usize(raw));
@@ -944,7 +956,6 @@ impl Server {
             return db.lookup(last).iter().copied().find(|&c| db.symbol(c).kind.is_record() && db.qualified_name(c).ends_with(name));
         }
         let (path, text, off) = self.cursor(params)?;
-        let overlay = Overlay(&self.docs);
         Query::new(idx, &overlay).class_at(&path, text.as_str(), off)
     }
 
