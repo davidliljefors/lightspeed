@@ -313,6 +313,21 @@ impl Query<'_> {
     }
 
     /// The type name an alias is written in terms of, read from its declaration.
+    /// The name `#define NAME Target` stands for, when the body is one (possibly qualified) identifier.
+    pub(super) fn object_macro_target(&self, id: SymbolId) -> Option<String> {
+        let db = &self.idx.db;
+        let s = db.symbol(id);
+        let text = self.texts.text(db.files.path(s.file))?;
+        let line = text.as_str().get(s.name_offset as usize..)?.lines().next()?;
+        let body = line.strip_prefix(db.name(id))?;
+        if !body.starts_with([' ', '\t']) {
+            return None;
+        }
+        let body = body.split("//").next()?.trim();
+        let ok = !body.is_empty() && body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b':') && !body.as_bytes()[0].is_ascii_digit();
+        ok.then(|| body.trim_start_matches("::").to_owned())
+    }
+
     fn alias_target(&self, id: SymbolId) -> Option<String> {
         let db = &self.idx.db;
         let s = db.symbol(id);
@@ -1056,10 +1071,13 @@ impl Query<'_> {
         self.source_of(cx, s, |src| {
             let slice = src.get(s.extent_start.min(s.name_offset) as usize..s.name_offset as usize)?;
             let toks = sig_tokens(slice);
-            // `struct { ... } name;`: the unnamed type the parser named after the member.
+            // `struct [Name] { ... } name;`: the type is the written name, or for an unnamed
+            // one the name the parser gave it after the member.
             if toks.last().is_some_and(|t| t.kind == K::RBrace) {
                 let scope = s.parent.map(|p| self.idx.db.qualified_name(p)).unwrap_or_default();
-                return Some(Ty { head: format!("<anon {}>", self.idx.db.name(id)), qual: format!("::{scope}"), ..Ty::default() });
+                let written = toks.get(1).filter(|t| t.kind == K::Ident).map(|t| t.text(slice).to_owned());
+                let head = written.unwrap_or_else(|| format!("<anon {}>", self.idx.db.name(id)));
+                return Some(Ty { head, qual: format!("::{scope}"), ..Ty::default() });
             }
             declared_type_tail(&toks, slice).filter(|t| t.head != "auto")
         })

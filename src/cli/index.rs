@@ -51,10 +51,11 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
             st.files, st.candidates, st.members, st.locals, secs
         );
         println!(
-            "  stored {} certain ({:.1}%), {} ambiguous, {} unresolved | table {} | resident {} -> {} (peak {})",
+            "  stored {} certain ({:.1}%), {} ambiguous, {} external, {} unresolved | table {} | resident {} -> {} (peak {})",
             st.stored,
             100.0 * st.stored as f64 / st.candidates.max(1) as f64,
             st.ambiguous,
+            st.external,
             st.unresolved,
             mib(st.bytes),
             mib(before),

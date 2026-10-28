@@ -557,9 +557,8 @@ impl<'a> Parser<'a> {
                 true
             }
             Some(K::LBrace | K::Colon) => {
-                // `struct { ... } name;` declares a member of an unnamed type: give that type a
-                // synthetic name so `name.member` can be resolved.
-                let anon = if cand.is_none() && !typedef && self.k(j) == Some(K::LBrace) { self.anon_declarator(j) } else { None };
+                // `struct [Name] { ... } member;` also declares a member (or variable) of that type.
+                let anon = if !typedef && self.k(j) == Some(K::LBrace) { self.anon_declarator(j) } else { None };
                 let sym = cand
                     .map(|c| {
                         let name = self.db.intern(self.txt(c));

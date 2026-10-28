@@ -224,6 +224,41 @@ mod strict_recall {
             "template <class T> struct Vec { bool f(T v); void g();  //=\n};\nstruct Map { void f(int); };\nenum Flag { FILL = 1 };\nvoid t(Vec<int>& a) {\n  Vec<int> flags;\n  flags.f(FILL);  //=\n  flags.f(2);  //=\n  Map m; m.f(1);\n}\n",
         );
     }
+
+    #[test]
+    fn call_chain_through_an_inherited_function() {
+        check(
+            "struct Vp { int f();  //=\n};\nstruct Other { int f(); };\nstruct Node { Vp* get_vp(); };\nstruct Item : Node {\n  void t() {\n    get_vp()->f();  //=\n  }\n};\nvoid u(Item* i) { i->get_vp()->f();  //=\n}\n",
+        );
+    }
+
+    #[test]
+    fn type_alias_used_as_a_qualifier() {
+        check(
+            "struct Server { static Server* f();  //=\n};\nstruct Other { static Other* f(); };\nusing SV = Server;\ntypedef Server SV2;\n#define SV3 Server\nvoid t() {\n  SV::f();  //=\n  SV2::f();  //=\n  SV3::f();  //=\n  Other::f();\n}\n",
+        );
+    }
+
+    #[test]
+    fn nested_struct_member_of_the_enclosing_class() {
+        check(
+            "struct Tex { bool f();  //=\n};\nstruct Other { bool f(); };\nstruct Box {\n  struct Cache { Tex* icon; Other* o; } cache;\n  void t() {\n    cache.icon->f();  //=\n    cache.o->f();\n  }\n};\n",
+        );
+    }
+
+    #[test]
+    fn members_reached_through_a_smart_pointer() {
+        check(
+            "template <class T> struct Ref { T* operator->() const; bool ok() const; };\nstruct Imp { bool f();  //=\n};\nstruct Other { bool f(); };\nstruct Params { Ref<Imp> imp; Other* o; };\nvoid t(Ref<Params> params, const Ref<Params>& cp) {\n  params->imp->f();  //=\n  cp->imp->f();  //=\n  params->o->f();\n}\n",
+        );
+    }
+
+    #[test]
+    fn const_reference_to_a_template_parameter() {
+        check(
+            "struct Elem { int f();  //=\n};\nstruct Other { int f(); };\ntemplate <class T> struct List { T* front() const; T& back(); };\nvoid t(const List<Elem>& l, List<Other>* o) {\n  l.front()->f();  //=\n  l.back().f();  //=\n  o->front()->f();\n}\n",
+        );
+    }
 }
 
 /// What "find references" of `Example::create` must and must not return in ordinary code.

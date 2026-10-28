@@ -102,6 +102,28 @@ impl Query<'_> {
                 }
                 filtered = by_qualifier(&want, &cands);
             }
+            if filtered.is_empty() {
+                // `using RD = RenderingDevice;` makes `RD::` mean `RenderingDevice::`.
+                let aliases: Vec<SymbolId> = db.lookup(qual[0]).iter().copied().filter(|&c| db.symbol(c).kind == crate::symbols::SymbolKind::TypeAlias).collect();
+                let mut targets = self.resolve_records(aliases);
+                for &m in db.lookup(qual[0]).iter().filter(|&&c| db.symbol(c).kind == crate::symbols::SymbolKind::Macro) {
+                    if let Some(t) = self.object_macro_target(m) {
+                        let last = t.rsplit("::").next().unwrap_or(&t);
+                        let named: Vec<SymbolId> = db.lookup(last).iter().copied().filter(|&c| db.symbol(c).kind.is_type()).collect();
+                        targets.extend(self.resolve_records(named));
+                    }
+                }
+                for rec in targets {
+                    let mut want = db.qualified_name(rec);
+                    for q in &qual[1..] {
+                        want.push_str("::");
+                        want.push_str(q);
+                    }
+                    filtered.extend(by_qualifier(&want, &cands));
+                }
+                filtered.sort_unstable();
+                filtered.dedup();
+            }
             if !filtered.is_empty() {
                 cands = filtered;
             }
