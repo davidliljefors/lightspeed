@@ -292,6 +292,8 @@ pub struct Signature {
 pub struct BaseEdge {
     pub derived: SymbolId,
     pub base_name: NameId,
+    /// Written qualifier: `A::B` for `A::B::Base`, empty for `::Base`.
+    pub qual: Option<NameId>,
     pub base: Option<SymbolId>,
     pub access: Access,
     pub is_virtual: bool,
@@ -523,6 +525,7 @@ impl SymbolDb {
         self.bases.extend(shard.bases.iter().map(|e| BaseEdge {
             derived: shift(e.derived),
             base_name: name_map[e.base_name.index()],
+            qual: e.qual.map(|q| name_map[q.index()]),
             base: e.base.map(shift),
             ..*e
         }));
@@ -569,6 +572,7 @@ impl SymbolDb {
                     && o.access == n.access
                     && o.is_virtual == n.is_virtual
                     && self.names.get(o.base_name) == shard.names.get(n.base_name)
+                    && o.qual.map(|q| self.names.get(q)) == n.qual.map(|q| shard.names.get(q))
             })
         }) && old_bases.next().is_none();
         if !same_bases {
@@ -835,7 +839,7 @@ mod tests {
             let c = fx.add(cls, SymbolKind::Class, None);
             let m = fx.add("Tick", SymbolKind::Method, Some(c));
             let bn = fx.db.intern("Base");
-            fx.db.add_base(BaseEdge { derived: c, base_name: bn, base: None, access: Access::Private, is_virtual: true });
+            fx.db.add_base(BaseEdge { derived: c, base_name: bn, qual: None, base: None, access: Access::Private, is_virtual: true });
             (fx.db, m)
         };
         let (a, _) = build("a.h", "A", 11);
@@ -896,6 +900,7 @@ mod tests {
         fx.db.add_base(BaseEdge {
             derived,
             base_name: bn,
+            qual: None,
             base: Some(base),
             access: Access::Public,
             is_virtual: false,

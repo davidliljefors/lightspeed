@@ -604,13 +604,22 @@ impl<'a> Parser<'a> {
     fn bases(&mut self, derived: SymbolId, colon: usize, default_access: Access) -> usize {
         let mut j = colon + 1;
         let (mut access, mut virt, mut last) = (default_access, false, None::<usize>);
+        // First identifier of the current qualified name, and a leading `::`.
+        let mut q = (0usize, false);
         loop {
             match self.k(j) {
                 None | Some(K::LBrace | K::Semi | K::RBrace) => break,
                 Some(K::Comma) => {
-                    self.flush_base(derived, &mut last, access, virt);
+                    self.flush_base(derived, &mut last, q, access, virt);
+                    q = (0, false);
                     access = default_access;
                     virt = false;
+                    j += 1;
+                }
+                Some(K::ColonColon) => {
+                    if last.is_none() && q.0 == 0 {
+                        q.1 = true;
+                    }
                     j += 1;
                 }
                 Some(K::Keyword) => {
@@ -625,6 +634,9 @@ impl<'a> Parser<'a> {
                 }
                 Some(K::Ident) if self.k(j + 1) == Some(K::LParen) => j = self.skip_balanced(j + 1),
                 Some(K::Ident) => {
+                    if q.0 == 0 || self.t[j - 1].kind != K::ColonColon {
+                        q.0 = j;
+                    }
                     last = Some(j);
                     j += 1;
                 }
@@ -632,14 +644,39 @@ impl<'a> Parser<'a> {
                 _ => j += 1,
             }
         }
-        self.flush_base(derived, &mut last, access, virt);
+        self.flush_base(derived, &mut last, q, access, virt);
         j
     }
 
-    fn flush_base(&mut self, derived: SymbolId, last: &mut Option<usize>, access: Access, is_virtual: bool) {
+    /// `q` is the first identifier of the qualified base name and whether it
+    /// starts with `::`. The qualifier (`A::B` for `A::B::Base`, empty for
+    /// `::Base`) is recorded so resolution can honour it.
+    fn flush_base(&mut self, derived: SymbolId, last: &mut Option<usize>, q: (usize, bool), access: Access, is_virtual: bool) {
         if let Some(l) = last.take() {
             let base_name = self.db.intern(self.txt(l));
-            self.db.add_base(BaseEdge { derived, base_name, base: None, access, is_virtual });
+            let qual = if q.0 < l {
+                let mut s = String::new();
+                let mut depth = 0u32;
+                for k in q.0..l {
+                    match self.t[k].kind {
+                        K::Lt => depth += 1,
+                        K::Gt => depth = depth.saturating_sub(1),
+                        K::Ident if depth == 0 => {
+                            if !s.is_empty() {
+                                s.push_str("::");
+                            }
+                            s.push_str(self.txt(k));
+                        }
+                        _ => {}
+                    }
+                }
+                Some(self.db.intern(&s))
+            } else if q.1 {
+                Some(self.db.intern(""))
+            } else {
+                None
+            };
+            self.db.add_base(BaseEdge { derived, base_name, qual, base: None, access, is_virtual });
         }
     }
 

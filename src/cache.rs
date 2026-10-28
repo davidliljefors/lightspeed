@@ -29,9 +29,9 @@ use std::path::PathBuf;
 
 const MAGIC: &[u8; 4] = b"LSSD";
 /// Bump whenever the layout or the meaning of stored data changes.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 const SYMBOL_BYTES: usize = 32;
-const BASE_BYTES: usize = 16;
+const BASE_BYTES: usize = 20;
 
 /// Identifies what a shard was built from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +124,7 @@ pub fn encode_shard(key: &ShardKey, db: &SymbolDb, out: &mut Vec<u8>) {
     for b in db.bases() {
         w.u32(b.derived.index() as u32);
         w.u32(b.base_name.index() as u32);
+        w.opt(b.qual.map(|q| q.index() as u32));
         w.opt(b.base.map(|p| p.index() as u32));
         w.0.push(b.access as u8);
         w.0.push(b.is_virtual as u8);
@@ -277,11 +278,13 @@ fn decode_body(body: &[u8], key: &ShardKey) -> R<SymbolDb> {
     for _ in 0..n_bases {
         let derived = r.idx(n_syms)?;
         let base_name = r.idx(n_names)?;
+        let qual = r.opt(n_names)?;
         let base = r.opt(n_syms)?;
         let tail = r.bytes(4)?;
         db.add_base(BaseEdge {
             derived: SymbolId::from_usize(derived as usize),
             base_name: NameId::from_usize(base_name as usize),
+            qual: qual.map(|q| NameId::from_usize(q as usize)),
             base: base.map(|p| SymbolId::from_usize(p as usize)),
             access: Access::from_u8(tail[0]).ok_or(bad("bad access"))?,
             is_virtual: tail[1] != 0,
@@ -391,7 +394,7 @@ mod tests {
                 .with_access(Access::Protected)
                 .with_flags(SymbolFlags::VIRTUAL | SymbolFlags::CONST),
         );
-        db.add_base(BaseEdge { derived: c, base_name: base, base: None, access: Access::Public, is_virtual: true });
+        db.add_base(BaseEdge { derived: c, base_name: base, qual: None, base: None, access: Access::Public, is_virtual: true });
         db.add_out_of_line(c, base);
         db.add_signature(Signature { symbol: c, arity: 2, hash: 0xDEAD });
         db.rebuild_indexes();

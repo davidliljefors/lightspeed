@@ -3,6 +3,7 @@
 mod common;
 
 use lightspeed::compile_commands::CompileDb;
+use lightspeed::ids::Idx;
 use lightspeed::index::{Index, IndexConfig};
 use lightspeed::query::{DiskText, Query};
 use lightspeed::symbols::SymbolId;
@@ -126,6 +127,30 @@ fn base_class_prefers_same_file_over_same_named_class_in_unrelated_namespace() {
     idx.update(&p, Some("class Test {};\nclass D5 : public Test {};\nclass D1 : public Test {};\nclass D2 : public Test {};\n"));
     idx.flush();
     assert_eq!(local(&idx).len(), 3);
+}
+
+#[test]
+fn base_resolution_uses_scope_names_and_written_qualifiers() {
+    let h = "#pragma once\nnamespace A { struct Base {}; }\nnamespace B { struct Base {}; }\nstruct Fwd;\nnamespace N { struct Fwd {}; }\n";
+    let a = "#include \"h.h\"\nnamespace A { struct DA : Base {}; struct DB : B::Base {}; }\nnamespace B { struct DB2 : Base {}; struct DG : ::Fwd {}; }\nstruct G : Fwd {};\n";
+    let ws = Ws::new(&[("h.h", h), ("a.cpp", a)], &[]);
+    let mut idx = ws.index(&["a.cpp"]);
+    let base_of = |idx: &Index, cls: &str| -> String {
+        let id = (0..idx.db.len()).map(SymbolId::from_usize).find(|&i| !idx.db.is_dead(i) && idx.db.qualified_name(i) == cls).unwrap();
+        names(idx, idx.hier.bases(id)).join(",")
+    };
+    let check = |idx: &Index| {
+        assert_eq!(base_of(idx, "A::DA"), "A::Base");
+        assert_eq!(base_of(idx, "A::DB"), "B::Base", "qualifier wins over the enclosing namespace");
+        assert_eq!(base_of(idx, "B::DB2"), "B::Base", "namespace reopened in another file");
+        assert_eq!(base_of(idx, "B::DG"), "Fwd", "::Fwd is the global one");
+        assert_eq!(base_of(idx, "G"), "Fwd");
+    };
+    check(&idx);
+    idx.update(&ws.path("a.cpp"), Some(&format!("{a}namespace B {{ struct Extra : Base {{}}; }}\n")));
+    idx.flush();
+    check(&idx);
+    assert_eq!(base_of(&idx, "B::Extra"), "B::Base");
 }
 
 #[test]

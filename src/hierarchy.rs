@@ -147,34 +147,69 @@ fn is_definition(db: &SymbolDb, id: SymbolId) -> bool {
     db.symbol(id).flags.contains(SymbolFlags::DEFINITION)
 }
 
-/// The class a base-specifier names: last identifier, preferring
-/// definitions and then classes closest to the deriving class's scopes.
-fn resolve_base(db: &SymbolDb, e: &crate::symbols::BaseEdge, chain: &mut Vec<SymbolId>) -> Option<SymbolId> {
+/// The class a base-specifier names: last identifier, preferring classes that
+/// match the written qualifier, then ones in an enclosing scope of the deriving
+/// class (innermost first; scopes are compared by name since a namespace
+/// reopened in another file is a different symbol), then definitions, then
+/// the deriving class's own file. `chain` is scratch: the names of the
+/// deriving class's enclosing scopes, innermost first.
+fn resolve_base(db: &SymbolDb, e: &crate::symbols::BaseEdge, chain: &mut Vec<NameId>) -> Option<SymbolId> {
     chain.clear();
     let mut p = db.symbol(e.derived).parent;
     while let Some(x) = p {
-        chain.push(x);
+        chain.push(db.symbol(x).name);
         p = db.symbol(x).parent;
     }
+    let n = chain.len();
+    let derived_file = db.symbol(e.derived).file;
+    let qual = e.qual.map(|q| db.names.get(q));
     let mut best: Option<(u32, SymbolId)> = None;
     for &c in db.lookup_id(e.base_name) {
         let s = db.symbol(c);
         if !s.kind.is_record() || c == e.derived {
             continue;
         }
-        let mut prox = 0u32;
-        let mut visible = true;
+        let mut m = 0usize;
         let mut p = s.parent;
         while let Some(x) = p {
-            let inside = chain.contains(&x);
-            prox += inside as u32;
-            visible &= inside;
+            m += 1;
             p = db.symbol(x).parent;
         }
-        // A class in an unrelated namespace (`Dummy::Test`) must not beat the
-        // one declared at the deriving class's own scope or in its own file.
-        let same_file = s.file == db.symbol(e.derived).file;
-        let key = (u32::from(is_definition(db, c)) << 20) | (u32::from(visible) << 19) | (u32::from(same_file) << 18) | prox.min(0xffff);
+        let qual_ok = qual.is_some_and(|q| {
+            let mut scope = s.parent;
+            let mut segs = if q.is_empty() { None } else { Some(q.rsplit("::")) };
+            let mut ok = true;
+            if let Some(it) = segs.as_mut() {
+                for seg in it {
+                    match scope {
+                        Some(x) if db.names.get(db.symbol(x).name) == seg => scope = db.symbol(x).parent,
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                ok
+            } else {
+                m == 0
+            }
+        });
+        let visible = m <= n && {
+            let mut p = s.parent;
+            let mut k = n - m;
+            let mut same = true;
+            while let Some(x) = p {
+                same &= db.symbol(x).name == chain[k];
+                k += 1;
+                p = db.symbol(x).parent;
+            }
+            same
+        };
+        let key = (u32::from(qual_ok) << 26)
+            | (u32::from(visible) << 25)
+            | ((if visible { m.min(255) as u32 } else { 0 }) << 17)
+            | (u32::from(is_definition(db, c)) << 16)
+            | (u32::from(s.file == derived_file) << 15);
         if best.is_none_or(|(k, _)| key > k) {
             best = Some((key, c));
         }
@@ -227,7 +262,7 @@ impl Hierarchy {
 
         // 1. Resolve base names.
         let mut resolved: Vec<Option<SymbolId>> = Vec::with_capacity(db.bases().len());
-        let mut chain: Vec<SymbolId> = Vec::new();
+        let mut chain: Vec<NameId> = Vec::new();
         for e in db.bases() {
             resolved.push(resolve_base(db, e, &mut chain));
         }
