@@ -94,6 +94,38 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
             }
             std::fs::write(p, out).unwrap();
         }
+        if let Some(name) = args.iter().position(|a| a == "--refs-of").and_then(|i| args.get(i + 1)) {
+            let q = Query::new(&idx, &DiskText);
+            let last = name.rsplit("::").next().unwrap_or(name);
+            for &seed in idx.db.lookup(last).iter().filter(|&&c| idx.db.qualified_name(c) == *name).take(1) {
+                let loc = q.location(seed).unwrap();
+                let (path, off) = (idx.files[loc.file as usize].path.as_str(), loc.start);
+                let text = std::fs::read_to_string(path).unwrap();
+                let t = Instant::now();
+                let r = q.symbol_refs(path, &text, off).unwrap();
+                let inference = t.elapsed();
+                let t = Instant::now();
+                let targets: std::collections::HashSet<_> = q.entity_records(seed).into_iter().chain(r.targets.iter().copied()).collect();
+                let mut hits: Vec<(u32, u32)> = Vec::new();
+                for (fi, o) in occ.iter().enumerate() {
+                    hits.extend(o.sites.iter().filter(|(_, s)| targets.contains(s)).map(|&(off, _)| (fi as u32, off)));
+                }
+                let lookup = t.elapsed();
+                let certain: std::collections::HashSet<_> = r.certain.iter().map(|l| (l.file, l.start)).collect();
+                let stored: std::collections::HashSet<_> = hits.iter().copied().collect();
+                let only_occ: Vec<_> = stored.difference(&certain).collect();
+                println!(
+                    "refs-of {name}: inference certain {} + uncertain {} in {:.1} ms | occurrence lookup {} in {:.1} ms | only in table {}, only in inference-certain {}",
+                    r.certain.len(), r.uncertain.len(), inference.as_secs_f64() * 1e3, hits.len(), lookup.as_secs_f64() * 1e3, only_occ.len(), certain.difference(&stored).count()
+                );
+                for &&(f, o) in only_occ.iter().take(5) {
+                    println!("  only table: {}:{o}", idx.files[f as usize].path);
+                }
+                for &(f, o) in certain.difference(&stored).take(5) {
+                    println!("  only inference: {}:{o}", idx.files[f as usize].path);
+                }
+            }
+        }
         drop(occ);
     }
     0
