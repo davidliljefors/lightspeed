@@ -317,9 +317,8 @@ void t(int n, const char* s, long l) {
         );
     }
 
-    /// Known gap: parameter types drop `*`/`&`, so overloads differing only in pointer-ness tie.
+    /// Overloads differing only in pointer-ness are told apart.
     #[test]
-    #[ignore = "known gap: pointer-ness of types is not tracked"]
     fn overloads_by_pointer_ness() {
         check(
             r#"
@@ -336,10 +335,9 @@ void t(int n, int* p) {
         );
     }
 
-    /// Known gap: arguments only fit a parameter by identical name or inheritance, never by an
-    /// implicit conversion (converting constructor, conversion operator).
+    /// Arguments fit a parameter through implicit conversions (converting constructor,
+    /// conversion operator).
     #[test]
-    #[ignore = "known gap: implicit conversions are not modelled"]
     fn overloads_by_implicit_conversion() {
         check(
             r#"

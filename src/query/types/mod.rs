@@ -50,9 +50,12 @@ fn prim_family(name: &str) -> u8 {
     }
 }
 
+/// Parameter types with a has-default flag, and whether the function is variadic.
+type Params = (Vec<(Option<Ty>, bool)>, bool);
+
 /// A written type reduced to what member lookup needs: its leading name and,
 /// for templates, its arguments, each as normalized type text (`Foo`,
-/// `vector<Foo>`; `const` and `*`/`&` dropped) so they can be parsed again
+/// `vector<Foo>`; `const` and `&` dropped, `*` counted in `ptr`) so they can be parsed again
 /// with [`parse_ty`] when substituted into a member's type.
 ///
 /// `qual` is the scope the name lives in, so `a::Foo` and `b::Foo` stay apart:
@@ -64,6 +67,8 @@ struct Ty {
     head: String,
     args: Vec<String>,
     qual: String,
+    /// Levels of `*` (or of `&` taken on a value): `Foo**` is 2. References are not tracked.
+    ptr: u8,
 }
 
 impl Ty {
@@ -343,8 +348,10 @@ impl Query<'_> {
         }
         let mut start = 0;
         let mut derefs = 0;
+        let mut addrs = 0u8;
         while let Some(t) = expr.get(start).filter(|t| matches!(t.kind, K::Star | K::Amp | K::AmpAmp) || t.is_keyword(Keyword::Const)) {
             derefs += (t.kind == K::Star) as usize;
+            addrs += (t.kind == K::Amp) as u8;
             start += 1;
         }
         let (mut ty, mut i) = self.primary_ty(cx, prefix, expr, start, depth)?;
@@ -368,9 +375,13 @@ impl Query<'_> {
                 }
                 K::LBracket => {
                     i = matching_fwd(expr, i)? + 1;
-                    ty = match self.operator_ty(cx, &ty, "operator[]").filter(|t| self.resolves(t)) {
-                        Some(t) => t,
-                        None => ty.args.first().and_then(|a| parse_ty(a)).unwrap_or(ty),
+                    ty = if ty.ptr > 0 {
+                        Ty { ptr: ty.ptr - 1, ..ty }
+                    } else {
+                        match self.operator_ty(cx, &ty, "operator[]").filter(|t| self.resolves(t)) {
+                            Some(t) => t,
+                            None => ty.args.first().and_then(|a| parse_ty(a)).unwrap_or(ty),
+                        }
                     };
                 }
                 _ => break,
@@ -379,6 +390,7 @@ impl Query<'_> {
         for _ in 0..derefs {
             ty = self.deref_ty(cx, ty);
         }
+        ty.ptr = ty.ptr.saturating_add(addrs);
         let Some(t) = expr.get(i) else { return Some(ty) };
         match t.kind {
             K::Eq | K::Comma | K::Semi => Some(ty),
@@ -391,12 +403,13 @@ impl Query<'_> {
     fn primary_ty(&self, cx: &Cx, prefix: &[Token], expr: &[Token], mut i: usize, depth: u8) -> Option<(Ty, usize)> {
         let tx = |t: &Token| t.text(cx.text);
         if let Some(t) = expr.get(i).filter(|t| matches!(t.kind, K::String | K::Char | K::Number)) {
-            let head = match t.kind {
-                K::Number if tx(t).starts_with("0x") || !tx(t).contains(['.', 'e']) => "int",
-                K::Number => "double",
-                _ => "char",
+            let (head, ptr) = match t.kind {
+                K::Number if tx(t).starts_with("0x") || !tx(t).contains(['.', 'e']) => ("int", 0),
+                K::Number => ("double", 0),
+                K::String => ("char", 1),
+                _ => ("char", 0),
             };
-            return Some((Ty { head: head.to_owned(), ..Ty::default() }, i + 1));
+            return Some((Ty { head: head.to_owned(), ptr, ..Ty::default() }, i + 1));
         }
         if expr.get(i).is_some_and(|t| t.kind == K::LParen) {
             let j = matching_fwd(expr, i)?;
@@ -436,7 +449,7 @@ impl Query<'_> {
             i = matching_fwd(expr, i)? + 1;
         }
         let ty = if is_new {
-            self.qualify_at(cx, Ty { head: name.to_owned(), args: targs, qual: path.last().map(|q| q.to_string()).unwrap_or_default() })
+            self.qualify_at(cx, Ty { head: name.to_owned(), args: targs, qual: path.last().map(|q| q.to_string()).unwrap_or_default(), ptr: 1 })
         } else if called && PASS_THROUGH.contains(&name) {
             let args = &expr[open + 1..i - 1];
             let first = &args[..top_level(args, K::Comma).unwrap_or(args.len())];
@@ -485,7 +498,7 @@ impl Query<'_> {
             let preferred = aliases.clone().find(|c| db.symbol(*c).parent.is_some_and(|p| cx.scopes.contains(&p)));
             let next = preferred.into_iter().chain(aliases.take(8)).find_map(|a| self.alias_full_ty(cx, a).filter(|t| t.head != ty.head));
             match next {
-                Some(t) => ty = t,
+                Some(t) => ty = Ty { ptr: t.ptr + ty.ptr, ..t },
                 None => break,
             }
         }
@@ -494,14 +507,26 @@ impl Query<'_> {
 
     /// The type reached through `->`.
     fn arrow_ty(&self, cx: &Cx, ty: Ty) -> Ty {
+        let ty = self.expand_alias(cx, ty);
+        if ty.ptr > 0 {
+            return Ty { ptr: ty.ptr - 1, ..ty };
+        }
         if let Some(t) = ty.smart_inner() {
             return t;
         }
-        self.operator_ty(cx, &ty, "operator->").filter(|t| self.resolves(t)).unwrap_or(ty)
+        // `operator->` returns a pointer to the object.
+        match self.operator_ty(cx, &ty, "operator->").filter(|t| self.resolves(t)) {
+            Some(t) => Ty { ptr: t.ptr.saturating_sub(1), ..t },
+            None => ty,
+        }
     }
 
     /// The type of `*expr`.
     fn deref_ty(&self, cx: &Cx, ty: Ty) -> Ty {
+        let ty = self.expand_alias(cx, ty);
+        if ty.ptr > 0 {
+            return Ty { ptr: ty.ptr - 1, ..ty };
+        }
         if let Some(t) = ty.smart_inner() {
             return t;
         }
@@ -622,7 +647,7 @@ impl Query<'_> {
         }
         let db = &self.idx.db;
         if !self.resolve_records(db.lookup(name).iter().copied()).is_empty() {
-            return Some(self.qualify_at(cx, Ty { head: name.to_owned(), args: targs.to_vec(), qual: qual.unwrap_or_default().to_owned() }));
+            return Some(self.qualify_at(cx, Ty { head: name.to_owned(), args: targs.to_vec(), qual: qual.unwrap_or_default().to_owned(), ptr: 0 }));
         }
         let (in_scope, in_bases) = self.scope_set(cx.scopes);
         let is_fn = |c: SymbolId| db.name(c) == name && matches!(db.symbol(c).kind, SymbolKind::Function | SymbolKind::Method);
@@ -668,12 +693,10 @@ impl Query<'_> {
         fits.into_iter().filter(|f| Some(f.1) == best).map(|f| f.0).collect()
     }
 
-    /// Whether `c` accepts `args.len()` arguments and how well its parameter
-    /// types match the argument types (higher is better).
-    fn call_fit(&self, cx: &Cx, c: SymbolId, args: &[Option<Ty>]) -> (bool, i32) {
-        let db = &self.idx.db;
-        let s = db.symbol(c);
-        let Some((params, variadic)) = self.source_of(cx, s, |src| {
+    /// Parameter types of the function `s` declares (and whether each has a
+    /// default), and whether it is variadic.
+    fn param_tys(&self, cx: &Cx, s: &crate::symbols::Symbol) -> Option<Params> {
+        self.source_of(cx, s, |src| {
             let head = src.get(s.name_offset as usize..(s.name_offset as usize + 600).min(s.extent_end as usize).min(src.len()))?;
             let toks = sig_tokens(head);
             let open = toks.iter().position(|t| t.kind == K::LParen)?;
@@ -692,7 +715,13 @@ impl Query<'_> {
                 }
             }
             Some((out, inner.iter().any(|t| t.kind == K::Ellipsis)))
-        }) else {
+        })
+    }
+
+    /// Whether `c` accepts `args.len()` arguments and how well its parameter
+    /// types match the argument types (higher is better).
+    fn call_fit(&self, cx: &Cx, c: SymbolId, args: &[Option<Ty>]) -> (bool, i32) {
+        let Some((params, variadic)) = self.param_tys(cx, self.idx.db.symbol(c)) else {
             return (true, 0);
         };
         let n = args.len();
@@ -701,32 +730,82 @@ impl Query<'_> {
         let mut score = 0;
         for (a, (p, _)) in args.iter().zip(&params) {
             let (Some(a), Some(p)) = (a, p) else { continue };
-            score += self.arg_fit(a, p);
+            score += self.arg_fit(cx, a, p, true);
         }
         (fits, score)
     }
 
-    fn arg_fit(&self, arg: &Ty, param: &Ty) -> i32 {
-        if arg.head == param.head {
+    /// How well an argument of type `arg` fits a parameter of type `param`:
+    /// 2 same type, 1 derived-to-base or compatible built-ins, 0 through an
+    /// implicit conversion (when `conv`) or unknown, negative for a mismatch.
+    fn arg_fit(&self, cx: &Cx, arg: &Ty, param: &Ty, conv: bool) -> i32 {
+        let rec = |t: &Ty| self.resolve_records(self.lookup_ty(t)).first().copied();
+        let (ra, rp) = (rec(arg), rec(param));
+        if arg.ptr != param.ptr {
+            if param.head == "void" && param.ptr > 0 && arg.ptr > 0 {
+                return 0;
+            }
+            if conv && param.ptr == 0 && rp.is_some_and(|p| self.converts_via_ctor(cx, p, arg)) {
+                return 0;
+            }
+            // A bare template parameter or unresolved name could be a pointer itself.
+            let known = |t: &Ty, r: Option<SymbolId>| r.is_some() || t.head == "void" || PRIMS.contains(&t.head.as_str());
+            return if known(arg, ra) && known(param, rp) { -4 } else { 0 };
+        }
+        if arg.head == param.head && (ra.is_none() || rp.is_none() || ra == rp) {
             return 2;
         }
         let (ap, pp) = (PRIMS.contains(&arg.head.as_str()), PRIMS.contains(&param.head.as_str()));
-        let rec = |t: &Ty| self.resolve_records(self.lookup_ty(t)).first().copied();
-        match (rec(arg), rec(param)) {
+        match (ra, rp) {
             (Some(a), Some(p)) => {
                 if self.idx.hier.is_a(a, p) {
                     1
+                } else if conv && arg.ptr == 0 && (self.converts_via_ctor(cx, p, arg) || self.converts_via_operator(cx, a, param)) {
+                    0
                 } else {
                     -3
                 }
             }
-            (Some(_), None) if pp => -3,
-            (None, Some(_)) if ap => -3,
+            (Some(a), None) if pp => {
+                if conv && arg.ptr == 0 && self.converts_via_operator(cx, a, param) { 0 } else { -3 }
+            }
+            (None, Some(p)) if ap => {
+                if conv && self.converts_via_ctor(cx, p, arg) { 0 } else { -3 }
+            }
             (None, None) if ap && pp => {
                 if prim_family(&arg.head) == prim_family(&param.head) { 1 } else { -1 }
             }
             _ => 0,
         }
+    }
+
+    /// Whether a value of type `arg` converts to the class `target` through a
+    /// non-explicit constructor callable with one argument.
+    fn converts_via_ctor(&self, cx: &Cx, target: SymbolId, arg: &Ty) -> bool {
+        let db = &self.idx.db;
+        db.children(target).iter().copied().filter(|&m| db.symbol(m).kind == SymbolKind::Constructor && !db.symbol(m).flags.contains(crate::symbols::SymbolFlags::EXPLICIT)).any(|m| {
+            let Some((params, _)) = self.param_tys(cx, db.symbol(m)) else { return false };
+            let required = params.iter().filter(|p| !p.1).count();
+            required <= 1 && params.first().and_then(|p| p.0.as_ref()).is_some_and(|p| self.arg_fit(cx, arg, p, false) > 0)
+        })
+    }
+
+    /// Whether the class `source` has a non-explicit conversion operator to `target`.
+    fn converts_via_operator(&self, cx: &Cx, source: SymbolId, target: &Ty) -> bool {
+        let db = &self.idx.db;
+        let mut owners = vec![source];
+        self.idx.hier.all_bases(source, &mut owners);
+        owners.iter().any(|&o| {
+            db.children(o).iter().any(|&m| {
+                let s = db.symbol(m);
+                if s.kind != SymbolKind::Method || s.flags.contains(crate::symbols::SymbolFlags::EXPLICIT) {
+                    return false;
+                }
+                // Conversion operators are named by their target type: `operator int`, `operator const char*`.
+                let Some(to) = db.name(m).strip_prefix("operator ") else { return false };
+                !matches!(to, "new" | "delete" | "new[]" | "delete[]" | "co_await") && parse_ty(to).is_some_and(|t| self.arg_fit(cx, &t, target, false) > 0)
+            })
+        })
     }
 
     /// Type of member `name` (field type or method return type) of `owners` or their bases.
@@ -822,7 +901,7 @@ impl Query<'_> {
             let close = matching_fwd(&toks, i + 1)?;
             Some(split_args(&toks[i + 2..close], head))
         })?;
-        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written, qual: self.ty_of(base).qual }, derived, recv))
+        Some(self.instantiate(cx, Ty { head: bname.to_owned(), args: written, qual: self.ty_of(base).qual, ptr: 0 }, derived, recv))
     }
 
     /// `ty`, written inside template `owner`, as seen from `recv = owner<args>`.
@@ -844,7 +923,7 @@ impl Query<'_> {
                 })
                 .map(Option::unwrap_or_default)
                 .collect();
-            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args, qual: recv.qual.clone() }, 0);
+            return self.subst(cx, ty, owner, &params, &Ty { head: recv.head.clone(), args, qual: recv.qual.clone(), ptr: recv.ptr }, 0);
         }
         self.subst(cx, ty, owner, &params, recv, 0)
     }
@@ -854,7 +933,7 @@ impl Query<'_> {
             return ty;
         }
         if let Some(i) = params.iter().position(|p| *p == ty.head) {
-            return recv.args.get(i).and_then(|a| parse_ty(a)).unwrap_or(ty);
+            return recv.args.get(i).and_then(|a| parse_ty(a)).map(|t| Ty { ptr: t.ptr + ty.ptr, ..t }).unwrap_or(ty);
         }
         if ty.args.is_empty() {
             let own = self.idx.db.children(owner).iter().copied().find(|&m| self.idx.db.name(m) == ty.head && self.idx.db.symbol(m).kind == SymbolKind::TypeAlias);
@@ -878,7 +957,7 @@ impl Query<'_> {
                 None => a.clone(),
             })
             .collect();
-        Ty { head: ty.head.clone(), args, qual: ty.qual.clone() }
+        Ty { head: ty.head.clone(), args, qual: ty.qual.clone(), ptr: ty.ptr }
     }
 
     /// Source text of the file declaring `s`.
@@ -932,7 +1011,7 @@ impl Query<'_> {
         let db = &self.idx.db;
         let q = db.qualified_name(id);
         let scope = q.rfind("::").map_or("", |i| &q[..i]);
-        Ty { head: db.name(id).to_owned(), args: Vec::new(), qual: format!("::{scope}") }
+        Ty { head: db.name(id).to_owned(), args: Vec::new(), qual: format!("::{scope}"), ptr: 0 }
     }
 }
 
@@ -1074,11 +1153,13 @@ fn matching_back(toks: &[Token], i: usize) -> Option<usize> {
 /// `eastl::vector<Foo> *`, reduced to its leading template name and arguments.
 fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
     let mut i = toks.len();
+    let mut ptr = 0u8;
     // Out-of-line definitions: `Foo* Bar::baz` leaves `Bar::` before the name.
     while i >= 2 && toks[i - 1].kind == K::ColonColon && toks[i - 2].kind == K::Ident {
         i -= 2;
     }
     while i > 0 && (matches!(toks[i - 1].kind, K::Star | K::Amp | K::AmpAmp) || toks[i - 1].is_keyword(Keyword::Const)) {
+        ptr += (toks[i - 1].kind == K::Star) as u8;
         i -= 1;
     }
     let mut args = Vec::new();
@@ -1105,7 +1186,7 @@ fn declared_type_tail(toks: &[Token], text: &str) -> Option<Ty> {
         (true, true) => "::".to_owned(),
         (true, false) => format!("::{}", path.join("::")),
     };
-    let ty = Ty { head: toks[name].text(text).to_owned(), args, qual };
+    let ty = Ty { head: toks[name].text(text).to_owned(), args, qual, ptr };
     Some(trait_result(&ty).unwrap_or(ty))
 }
 

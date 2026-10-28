@@ -121,7 +121,7 @@ impl Query<'_> {
         let rank = |o: &Overload| {
             let n = o.info.params.len();
             let accepts = (active == 0 && n == 0) || o.variadic || active < n;
-            let score: i32 = typed.iter().zip(&o.tys).filter_map(|(a, p)| Some(self.arg_fit(a.as_ref()?, p.as_ref()?))).sum();
+            let score: i32 = typed.iter().zip(&o.tys).filter_map(|(a, p)| Some(self.arg_fit(&cx, a.as_ref()?, p.as_ref()?, true))).sum();
             (std::cmp::Reverse(accepts), std::cmp::Reverse(score), n, o.id)
         };
         overloads.sort_by_cached_key(rank);
