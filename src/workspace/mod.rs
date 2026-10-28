@@ -5,4 +5,4 @@
 pub mod compile_commands;
 pub mod depgraph;
 pub mod index;
-pub mod sysinc;
+pub(crate) mod sysinc;

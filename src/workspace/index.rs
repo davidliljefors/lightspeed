@@ -560,7 +560,7 @@ impl Index {
         if let (Some(c), Some(cs)) = (cache_cfg, cstats) {
             idx.stats.cache = Some(cs);
             if spill_failed {
-                eprintln!("lightspeed: cache not saved: cannot write {}", c.file().display());
+                crate::log!("lightspeed: cache not saved: cannot write {}", c.file().display());
             } else {
                 idx.save_cache(&c, snapshot, recs, spill);
             }
@@ -677,8 +677,8 @@ impl Index {
             self.saver = Some(std::thread::spawn(move || {
                 let t = std::time::Instant::now();
                 match store::save(job) {
-                    Ok(b) => eprintln!("lightspeed: cache saved, {} in {:.0} ms", crate::base::mem::mib(b as usize), t.elapsed().as_secs_f64() * 1e3),
-                    Err(e) => eprintln!("lightspeed: cache save failed: {e}"),
+                    Ok(b) => crate::log!("lightspeed: cache saved, {} in {:.0} ms", crate::base::mem::mib(b as usize), t.elapsed().as_secs_f64() * 1e3),
+                    Err(e) => crate::log!("lightspeed: cache save failed: {e}"),
                 }
             }));
         } else {
@@ -897,17 +897,15 @@ impl Index {
             let t = std::time::Instant::now();
             let was_dirty = self.dirty;
             let inc = self.absorb(&p, flag_entry, is_tu, a);
-            if std::env::var_os("LIGHTSPEED_QUIET").is_none() {
-                eprintln!(
-                    "lightspeed: reindex {p}: analyze {analyze_ms:.1} ms (preprocess {:.1}, parse {:.1}, lex {:.1}, scopes {:.1}), absorb {:.1} ms, {}",
-                    pp_us as f64 / 1e3,
-                    parse_us as f64 / 1e3,
-                    lex_us as f64 / 1e3,
-                    scope_us as f64 / 1e3,
-                    t.elapsed().as_secs_f64() * 1e3,
-                    if self.dirty && !was_dirty { "shape changed (full index rebuild pending)" } else { "same shape or already dirty" },
-                );
-            }
+            crate::log!(
+                "lightspeed: reindex {p}: analyze {analyze_ms:.1} ms (preprocess {:.1}, parse {:.1}, lex {:.1}, scopes {:.1}), absorb {:.1} ms, {}",
+                pp_us as f64 / 1e3,
+                parse_us as f64 / 1e3,
+                lex_us as f64 / 1e3,
+                scope_us as f64 / 1e3,
+                t.elapsed().as_secs_f64() * 1e3,
+                if self.dirty && !was_dirty { "shape changed (full index rebuild pending)" } else { "same shape or already dirty" },
+            );
             if self.cfg.index_headers {
                 pending.extend(inc.into_iter().map(|h| (h, flag_entry)));
             }
@@ -964,9 +962,7 @@ impl Index {
         let t = std::time::Instant::now();
         self.hier = Hierarchy::build(&mut self.db);
         self.dirty = false;
-        if std::env::var_os("LIGHTSPEED_QUIET").is_none() {
-            eprintln!("lightspeed: flush: indexes {idx_ms:.1} ms, hierarchy {:.1} ms ({} symbols)", t.elapsed().as_secs_f64() * 1e3, self.db.len());
-        }
+        crate::log!("lightspeed: flush: indexes {idx_ms:.1} ms, hierarchy {:.1} ms ({} symbols)", t.elapsed().as_secs_f64() * 1e3, self.db.len());
     }
 
     /// Live symbols declared in file `fi`.

@@ -20,7 +20,7 @@ pub mod lsp;
 pub mod parser;
 pub mod pp;
 pub mod query;
-pub mod scope_decls;
+pub(crate) mod scope_decls;
 pub mod store;
 pub mod symbols;
 #[doc(hidden)]

@@ -142,9 +142,9 @@ impl Server {
     }
 
     pub(in crate::lsp) fn install_index(&mut self, idx: Index, ms: f64) {
-        eprintln!("lightspeed: indexed {} files, {} symbols in {:.0} ms", idx.live_files().count(), idx.db.len(), ms);
-        eprintln!("{}", idx.stats.report(rayon::current_num_threads()));
-        eprintln!("{}", idx.memory_report());
+        crate::log!("lightspeed: indexed {} files, {} symbols in {:.0} ms", idx.live_files().count(), idx.db.len(), ms);
+        crate::log!("{}", idx.stats.report(rayon::current_num_threads()));
+        crate::log!("{}", idx.memory_report());
         self.index = Some(idx);
     }
 
@@ -176,7 +176,7 @@ impl Server {
         let load = |p: Option<PathBuf>| match p.as_ref().map(CompileDb::load) {
             Some(Ok(mut db)) => {
                 let n = db.add_system_includes();
-                eprintln!("lightspeed: {n} built-in include dirs discovered");
+                crate::log!("lightspeed: {n} built-in include dirs discovered");
                 db
             }
             Some(Err(e)) => {

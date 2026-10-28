@@ -5,5 +5,6 @@ pub mod csr;
 pub mod hash;
 pub mod ids;
 pub mod interner;
+pub mod log;
 pub mod mem;
 pub mod source;

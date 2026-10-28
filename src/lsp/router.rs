@@ -89,9 +89,8 @@ impl Server {
         let us = t0.elapsed().as_micros();
         if let Some(m) = method
             && (is_request || us >= 1000)
-            && std::env::var_os("LIGHTSPEED_QUIET").is_none()
         {
-            eprintln!("lightspeed: {m} {}.{:02} ms", us / 1000, us % 1000 / 10);
+            crate::log!("lightspeed: {m} {}.{:02} ms", us / 1000, us % 1000 / 10);
         }
     }
 
