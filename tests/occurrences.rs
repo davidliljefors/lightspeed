@@ -348,3 +348,51 @@ fn argument_of_an_unknown_all_caps_macro_is_not_a_use_of_the_same_named_method()
     let got = marked(&[], "struct Base { virtual void set_layer(int); };\nstruct D : Base {\n  EXBIND1(/*@*/set_layer, int)\n};\n");
     assert!(got.is_empty(), "{got:?}");
 }
+
+#[test]
+fn bare_call_in_an_out_of_line_member_of_a_namespaced_template_is_not_a_same_named_global_class() {
+    // graphite2: `Vector<T>::resize` calls `erase`; Godot has a global `Vector` with its own `erase`.
+    let global = "template <typename T> class Vector { public: void erase(int a); };\n";
+    let lib = "namespace g {\ntemplate <typename T> class Vector {\npublic:\n  void resize(int n);\n  void erase(int a, int b);\n};\ntemplate <typename T> void Vector<T>::resize(int n) {\n  if (n < 0) /*@*/erase(n, n);\n}\n}\n";
+    let got = marked(&[("v.h", global)], &format!("#include \"v.h\"\n{lib}"));
+    assert_eq!(got, ["g::Vector::erase"], "{got:?}");
+}
+
+/// Like `marked`, but the `/*@*/` marker sits in one of the `files` (a header) and `main` is the translation unit.
+fn marked_in_header(files: &[(&str, &str)], main: &str) -> Vec<String> {
+    let (hname, htext) = files.iter().find(|(_, t)| t.contains("/*@*/")).expect("marker");
+    let at = htext.find("/*@*/").unwrap();
+    let clean = htext.replacen("/*@*/", "", 1);
+    let len = clean[at..].find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(clean.len() - at);
+    let mut all: Vec<(&str, &str)> = files.iter().map(|&(n, t)| if n == *hname { (n, clean.as_str()) } else { (n, t) }).collect();
+    all.push(("a.cpp", main));
+    let ws = Ws::new(&all, &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let path = ws.path(hname);
+    let (occ, _) = q.build_occurrences();
+    let fi = idx.live_files().find(|(_, f)| f.path == path).map(|(i, _)| i).unwrap();
+    occ[fi].sites.iter().filter(|(o, _)| (*o as usize) >= at && (*o as usize) < at + len).map(|&(_, s)| idx.db.qualified_name(s)).collect()
+}
+
+#[test]
+fn bare_call_in_a_header_out_of_line_member_of_a_namespaced_template_is_not_a_same_named_global_class() {
+    let global = "template <typename T> class Vector { public: void erase(int a); };\n";
+    let lib = "namespace g {\ntemplate <typename T> class Vector {\npublic:\n  void resize(int n);\n  void erase(int a, int b);\n};\ntemplate <typename T> void Vector<T>::resize(int n) {\n  if (n < 0) /*@*/erase(n, n);\n}\n}\n";
+    let got = marked_in_header(&[("v.h", global), ("g.h", lib)], "#include \"v.h\"\n#include \"g.h\"\n");
+    assert!(!got.contains(&"Vector::erase".to_string()), "{got:?}");
+}
+
+#[test]
+fn out_of_line_member_goes_to_the_class_of_its_own_namespace_whichever_is_indexed_first() {
+    let global = "template <typename T> class Vector { public: void erase(int a); void resize(int n); };\n";
+    let lib = "namespace g {\ntemplate <typename T> class Vector {\npublic:\n  void resize(int n);\n  void erase(int a, int b);\n};\ntemplate <typename T> void Vector<T>::resize(int n) {\n  if (n < 0) /*@*/erase(n, n);\n}\n}\n";
+    for main in ["#include \"v.h\"\n#include \"g.h\"\n", "#include \"g.h\"\n#include \"v.h\"\n", "#include \"g.h\"\n"] {
+        let got = marked_in_header(&[("v.h", global), ("g.h", lib)], main);
+        assert!(!got.contains(&"Vector::erase".to_string()), "{main:?}: {got:?}");
+    }
+    // The global class is only reachable from another translation unit.
+    let ws_files = [("v.h", global), ("g.h", lib)];
+    let got = marked_in_header(&ws_files, "#include \"g.h\"\n");
+    assert!(!got.contains(&"Vector::erase".to_string()), "{got:?}");
+}

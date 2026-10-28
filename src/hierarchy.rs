@@ -40,7 +40,7 @@ pub struct HierarchyStats {
 #[derive(Default)]
 struct OutOfLineScratch {
     /// Class a qualifier (`A::B`) names; many definitions share one.
-    classes: FxHashMap<NameId, Option<SymbolId>>,
+    classes: FxHashMap<(NameId, Option<SymbolId>), Option<SymbolId>>,
     qname: String,
 }
 
@@ -56,11 +56,17 @@ fn match_out_of_line(
     sig: impl Fn(SymbolId) -> Option<(u16, u32)>,
     claimed: impl Fn(SymbolId) -> bool,
 ) -> Option<SymbolId> {
-    let class = (*scratch.classes.entry(q).or_insert_with(|| {
+    let ns = db.symbol(def).parent;
+    // The qualifier is looked up from the namespace the definition sits in, innermost first.
+    let class = (*scratch.classes.entry((q, ns)).or_insert_with(|| {
         let qual = db.names.get(q);
         let last = qual.rsplit("::").next().unwrap_or(qual);
         let ln = db.names.lookup(last)?;
-        let mut best: Option<(u32, SymbolId)> = None;
+        let mut def_ns = String::new();
+        if let Some(p) = ns {
+            db.write_qualified_name(p, &mut def_ns);
+        }
+        let mut best: Option<((usize, u32), SymbolId)> = None;
         for &c in db.lookup_id(ln) {
             if !db.symbol(c).kind.is_record() {
                 continue;
@@ -72,7 +78,12 @@ fn match_out_of_line(
             if !suffix_ok {
                 continue;
             }
-            let key = u32::from(is_definition(db, c)) + 1;
+            // 0: some other namespace; otherwise 1 + the length of the enclosing namespace it shares with the definition.
+            let prefix = &qname[..qname.len() - qual.len()];
+            let prefix = prefix.strip_suffix("::").unwrap_or(prefix);
+            let shared = prefix.is_empty() || def_ns == prefix || (def_ns.starts_with(prefix) && def_ns[prefix.len()..].starts_with("::"));
+            let rank = if shared { 1 + prefix.len() } else { 0 };
+            let key = (rank, u32::from(is_definition(db, c)) + 1);
             if best.is_none_or(|(k, _)| key > k) {
                 best = Some((key, c));
             }

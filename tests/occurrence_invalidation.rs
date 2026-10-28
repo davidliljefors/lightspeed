@@ -94,10 +94,12 @@ fn diff(base: &Snapshot, now: &Snapshot, edited: &str) {
     println!("  edited file itself: {b} -> {n} entries");
 }
 
+type Edit = Box<dyn Fn(&str) -> String>;
+
 #[test]
 #[ignore = "needs a Godot checkout and --release"]
 fn godot_edit_invalidation() {
-    let mut cdb = CompileDb::load(&format!("{ROOT}/compile_commands.json")).unwrap();
+    let mut cdb = CompileDb::load(format!("{ROOT}/compile_commands.json")).unwrap();
     cdb.add_system_includes();
     let mut idx = Index::build(cdb, Default::default());
     let t = std::time::Instant::now();
@@ -105,7 +107,7 @@ fn godot_edit_invalidation() {
     println!("baseline table in {:.1} s", t.elapsed().as_secs_f64());
 
     let read = |p: &str| std::fs::read_to_string(format!("{ROOT}/{p}")).unwrap();
-    let scenarios: Vec<(&str, &str, Box<dyn Fn(&str) -> String>)> = vec![
+    let scenarios: Vec<(&str, &str, Edit)> = vec![
         ("comment at top of a .cpp (offsets shift, no symbols change)", "scene/main/node.cpp", Box::new(|t| format!("// probe\n{t}"))),
         ("new free function appended to a .cpp", "scene/main/node.cpp", Box::new(|t| format!("{t}\nint zz_probe_function(int a) {{ return a; }}\n"))),
         ("new #include at top of a .cpp", "scene/main/node.cpp", Box::new(|t| format!("#include \"core/os/os.h\"\n{t}"))),
