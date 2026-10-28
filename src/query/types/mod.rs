@@ -26,9 +26,7 @@ use super::{Query, sig_tokens};
 use crate::lexer::{Keyword, Token, TokenKind as K};
 use crate::symbols::{SymbolId, SymbolKind};
 
-#[path = "signature.rs"]
 pub(super) mod signature;
-#[path = "nav.rs"]
 mod nav;
 
 const MAX_DEPTH: u8 = 4;
