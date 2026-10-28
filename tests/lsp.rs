@@ -317,6 +317,47 @@ void t(int n, const char* s, long l) {
         );
     }
 
+    /// Known gap: parameter types drop `*`/`&`, so overloads differing only in pointer-ness tie.
+    #[test]
+    #[ignore = "known gap: pointer-ness of types is not tracked"]
+    fn overloads_by_pointer_ness() {
+        check(
+            r#"
+struct Example { static Example* create(int n);  //=
+  static Example* create(int* p); };
+void t(int n, int* p) {
+  Example::create(n);  //=
+  Example::create(5);  //=
+  Example::create(p);
+  Example::create(&n);
+}
+"#,
+            "Example* create(",
+        );
+    }
+
+    /// Known gap: arguments only fit a parameter by identical name or inheritance, never by an
+    /// implicit conversion (converting constructor, conversion operator).
+    #[test]
+    #[ignore = "known gap: implicit conversions are not modelled"]
+    fn overloads_by_implicit_conversion() {
+        check(
+            r#"
+struct Name { Name(const char* s); };
+struct Meters { operator int() const; };
+struct Example { static Example* create(Name n);  //=
+  static Example* create(int n); };
+void t(Meters m, Name nm) {
+  Example::create("x");  //=
+  Example::create(nm);  //=
+  Example::create(m);
+  Example::create(3);
+}
+"#,
+            "Example* create(",
+        );
+    }
+
     #[test]
     fn scopes_inheritance_and_aliases() {
         check(
