@@ -229,6 +229,52 @@ fn type_hierarchy_and_inheritance_graph_over_rpc() {
 }
 
 #[test]
+fn declaration_implementation_and_type_definition_over_rpc() {
+    let (_d, root) = tmp();
+    let h = "#pragma once\nstruct Shape { virtual void draw() = 0; void name(); };\nstruct Circle : Shape { void draw() override; };\nstruct Sq : Shape { void draw() override; };\n";
+    let a = "#include \"h.h\"\nvoid Circle::draw() {}\nvoid Shape::name() {}\nShape g;\nvoid use(Shape* s, Circle& c) {\n  s->draw();\n  c.name();\n  auto loc = c;\n  loc.draw();\n  g.name();\n}\n";
+    let (hp, ap) = (format!("{root}/h.h"), format!("{root}/a.cpp"));
+    std::fs::write(&hp, h).unwrap();
+    std::fs::write(&ap, a).unwrap();
+    std::fs::write(
+        format!("{root}/compile_commands.json"),
+        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+    )
+    .unwrap();
+    let mut c = Client::new(&root);
+    c.open(&ap, a);
+    let at = |needle: &str, nth: usize, delta: usize| {
+        let mut p = pos_of(a, needle, nth);
+        p["character"] = json!(p["character"].as_u64().unwrap() + delta as u64);
+        json!({"textDocument": {"uri": path_to_uri(&ap)}, "position": p})
+    };
+    let places = |r: Value| -> Vec<String> {
+        let mut v: Vec<String> = r["result"].as_array().unwrap().iter().map(|l| format!("{}:{}", l["uri"].as_str().unwrap().rsplit('/').next().unwrap(), l["range"]["start"]["line"])).collect();
+        v.sort();
+        v
+    };
+
+    // Overrides of a pure virtual called through the base: Circle's body and Sq's declaration.
+    assert_eq!(places(c.request("textDocument/implementation", at("draw();", 0, 0))), ["a.cpp:1", "h.h:3"]);
+    // Classes: the derived ones.
+    assert_eq!(places(c.request("textDocument/implementation", at("Shape* s", 0, 0))), ["h.h:2", "h.h:3"]);
+    // A non-virtual function: its body.
+    assert_eq!(places(c.request("textDocument/implementation", at("name();", 0, 0))), ["a.cpp:2"]);
+
+    // Declaration: from a use and from the out-of-line definition, the in-class one.
+    assert_eq!(places(c.request("textDocument/declaration", at("name();", 0, 0))), ["h.h:1"]);
+    assert_eq!(places(c.request("textDocument/declaration", at("Circle::draw", 0, 8))), ["h.h:2"]);
+    // Definition still prefers the body.
+    assert_eq!(places(c.request("textDocument/definition", at("name();", 0, 0))), ["a.cpp:2"]);
+
+    // Type definition of a global, a parameter, an `auto` local, and a member call's receiver.
+    assert_eq!(places(c.request("textDocument/typeDefinition", at("g;", 0, 0))), ["h.h:1"]);
+    assert_eq!(places(c.request("textDocument/typeDefinition", at("c.name", 0, 0))), ["h.h:2"]);
+    assert_eq!(places(c.request("textDocument/typeDefinition", at("loc.draw", 0, 0))), ["h.h:2"]);
+    assert_eq!(places(c.request("textDocument/typeDefinition", at("Circle& c", 0, 0))), ["h.h:2"]);
+}
+
+#[test]
 fn completion_over_rpc_and_unknown_method() {
     let (_d, root) = tmp();
     let a = format!("{root}/a.cpp");

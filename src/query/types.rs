@@ -28,6 +28,8 @@ use crate::symbols::{SymbolId, SymbolKind};
 
 #[path = "signature.rs"]
 pub(super) mod signature;
+#[path = "nav.rs"]
+mod nav;
 
 const MAX_DEPTH: u8 = 4;
 const SMART_PTRS: &[&str] = &["unique_ptr", "shared_ptr", "weak_ptr", "intrusive_ptr", "scoped_ptr", "linked_ptr", "optional"];

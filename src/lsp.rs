@@ -533,6 +533,9 @@ impl Server {
                             "positionEncoding": "utf-16",
                             "textDocumentSync": {"openClose": true, "change": 1, "save": {}},
                             "definitionProvider": true,
+                            "declarationProvider": true,
+                            "implementationProvider": true,
+                            "typeDefinitionProvider": true,
                             "hoverProvider": true,
                             "typeHierarchyProvider": true,
                             "renameProvider": {"prepareProvider": true},
@@ -597,7 +600,7 @@ impl Server {
                     // While the index builds, answer with an empty result instead of an error popup.
                     let result = if self.building.is_some() {
                         match m {
-                            "textDocument/definition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" | "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes" | "typeHierarchy/subtypes" | "lightspeed/inheritanceGraph" => Some(Value::Null),
+                            "textDocument/definition" | "textDocument/declaration" | "textDocument/implementation" | "textDocument/typeDefinition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" | "textDocument/prepareTypeHierarchy" | "typeHierarchy/supertypes" | "typeHierarchy/subtypes" | "lightspeed/inheritanceGraph" => Some(Value::Null),
                             "textDocument/references" | "textDocument/documentSymbol" | "workspace/symbol" => Some(json!([])),
                             "textDocument/completion" => Some(json!({"isIncomplete": true, "items": []})),
                             "textDocument/rename" => {
@@ -618,6 +621,9 @@ impl Server {
                 self.apply_pending();
                 let result = match m {
                     "textDocument/definition" => self.definition(&params),
+                    "textDocument/declaration" => self.navigate(&params, true, |q, p, t, o| q.declarations(p, t, o)),
+                    "textDocument/implementation" => self.navigate(&params, false, |q, p, t, o| q.implementations(p, t, o)),
+                    "textDocument/typeDefinition" => self.navigate(&params, false, |q, p, t, o| q.type_definitions(p, t, o)),
                     "textDocument/hover" => self.hover(&params),
                     "textDocument/signatureHelp" => self.signature_help(&params),
                     "textDocument/prepareTypeHierarchy" => self.prepare_type_hierarchy(&params),
@@ -784,16 +790,22 @@ impl Server {
     }
 
     fn definition(&self, params: &Value) -> Option<Value> {
+        self.navigate(params, true, |q, p, t, o| q.definition(p, t, o))
+    }
+
+    /// Shared body of the "go to ..." requests. Locals are not indexed symbols,
+    /// so when `locals_here` the declaration of a local is the answer.
+    fn navigate(&self, params: &Value, locals_here: bool, find: impl Fn(&Query, &str, &str, u32) -> Vec<SymbolId>) -> Option<Value> {
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
         let overlay = Overlay(&self.docs);
         let q = Query::new(idx, &overlay);
-        if let Some(l) = q.local_at(&path, text.as_str(), off) {
+        if locals_here && let Some(l) = q.local_at(&path, text.as_str(), off) {
             let uri = params["textDocument"]["uri"].as_str()?;
             let range = Self::range_json(text.as_str(), &LineIndex::new(text.as_str()), l.decl);
             return Some(json!([{"uri": uri, "range": range}]));
         }
-        let locs: Vec<Location> = q.definition(&path, text.as_str(), off).into_iter().filter_map(|s| q.location(s)).collect();
+        let locs: Vec<Location> = find(&q, &path, text.as_str(), off).into_iter().filter_map(|s| q.location(s)).collect();
         Some(self.locations_json(&locs))
     }
 
