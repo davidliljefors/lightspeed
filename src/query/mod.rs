@@ -21,6 +21,7 @@ mod types;
 pub use hover::Hover;
 pub use locals::{Local, LocalKind};
 pub use refs::SymbolRefs;
+pub use types::signature::{SigHelp, SigInfo};
 
 use std::sync::Arc;
 

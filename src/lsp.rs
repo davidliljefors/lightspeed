@@ -77,6 +77,8 @@ pub struct Server {
     progress_started: bool,
     last_progress: ((u32, u32), std::time::Instant),
     shutdown: bool,
+    /// How many overloads signature help lists (`signatureHelp.maxOverloads`).
+    max_signatures: usize,
     pub exit_code: Option<i32>,
 }
 
@@ -246,7 +248,17 @@ impl Server {
             progress_started: false,
             last_progress: ((0, 0), std::time::Instant::now()),
             shutdown: false,
+            max_signatures: 3,
             exit_code: None,
+        }
+    }
+
+    /// Reads `{"signatureHelp": {"maxOverloads": n}}` from `initializationOptions`
+    /// or a `workspace/didChangeConfiguration` payload (optionally under `lightspeed`).
+    fn apply_settings(&mut self, v: &Value) {
+        let v = v.get("lightspeed").unwrap_or(v);
+        if let Some(n) = v.pointer("/signatureHelp/maxOverloads").and_then(Value::as_u64) {
+            self.max_signatures = (n as usize).clamp(1, 20);
         }
     }
 
@@ -508,6 +520,7 @@ impl Server {
                 // Index before replying so the first request never races the build
                 // (unless indexing runs in the background, see `Server::background`).
                 self.progress_ok = params["capabilities"]["window"]["workDoneProgress"].as_bool() == Some(true);
+                self.apply_settings(&params["initializationOptions"]);
                 let warning = self.start_index(root.as_deref());
                 if let Some(w) = warning {
                     out.push(json!({"jsonrpc": "2.0", "method": "window/showMessage", "params": {"type": 2, "message": w}}));
@@ -523,6 +536,7 @@ impl Server {
                             "renameProvider": {"prepareProvider": true},
                             "referencesProvider": true,
                             "completionProvider": {"triggerCharacters": [".", ":", ">"]},
+                            "signatureHelpProvider": {"triggerCharacters": ["(", ","], "retriggerCharacters": [","]},
                             "documentSymbolProvider": true,
                             "workspaceSymbolProvider": true,
                         },
@@ -568,6 +582,7 @@ impl Server {
                     self.docs.insert(path_key(&path), Doc { path, text: text.into(), dirty: true });
                 }
             }
+            ("workspace/didChangeConfiguration", _) => self.apply_settings(&params["settings"]),
             ("textDocument/didClose", _) => {
                 if let Some(path) = params["textDocument"]["uri"].as_str().and_then(uri_to_path)
                     && self.docs.remove(&path_key(&path)).is_some()
@@ -580,7 +595,7 @@ impl Server {
                     // While the index builds, answer with an empty result instead of an error popup.
                     let result = if self.building.is_some() {
                         match m {
-                            "textDocument/definition" | "textDocument/hover" | "textDocument/prepareRename" => Some(Value::Null),
+                            "textDocument/definition" | "textDocument/hover" | "textDocument/prepareRename" | "textDocument/signatureHelp" => Some(Value::Null),
                             "textDocument/references" | "textDocument/documentSymbol" | "workspace/symbol" => Some(json!([])),
                             "textDocument/completion" => Some(json!({"isIncomplete": true, "items": []})),
                             "textDocument/rename" => {
@@ -602,6 +617,7 @@ impl Server {
                 let result = match m {
                     "textDocument/definition" => self.definition(&params),
                     "textDocument/hover" => self.hover(&params),
+                    "textDocument/signatureHelp" => self.signature_help(&params),
                     "textDocument/prepareRename" => self.prepare_rename(&params),
                     "textDocument/rename" => match self.rename(&params) {
                         Ok((edit, warning)) => {
@@ -773,6 +789,26 @@ impl Server {
         }
         let locs: Vec<Location> = q.definition(&path, text.as_str(), off).into_iter().filter_map(|s| q.location(s)).collect();
         Some(self.locations_json(&locs))
+    }
+
+    fn signature_help(&self, params: &Value) -> Option<Value> {
+        let (path, text, off) = self.cursor(params)?;
+        let idx = self.index.as_ref()?;
+        let overlay = Overlay(&self.docs);
+        let h = Query::new(idx, &overlay).signature_help(&path, text.as_str(), off, self.max_signatures)?;
+        let more = (h.more > 0).then(|| json!({"kind": "markdown", "value": format!("… +{} more overload{}", h.more, if h.more == 1 { "" } else { "s" })}));
+        let signatures: Vec<Value> = h
+            .signatures
+            .iter()
+            .map(|s| {
+                let mut v = json!({"label": s.label, "parameters": s.params.iter().map(|&(a, b)| json!({"label": [a, b]})).collect::<Vec<_>>()});
+                if let Some(m) = &more {
+                    v["documentation"] = m.clone();
+                }
+                v
+            })
+            .collect();
+        Some(json!({"signatures": signatures, "activeSignature": 0, "activeParameter": h.active_param}))
     }
 
     fn hover(&self, params: &Value) -> Option<Value> {

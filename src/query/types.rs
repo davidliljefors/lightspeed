@@ -26,6 +26,9 @@ use super::{Query, sig_tokens};
 use crate::lexer::{Keyword, Token, TokenKind as K};
 use crate::symbols::{SymbolId, SymbolKind};
 
+#[path = "signature.rs"]
+pub(super) mod signature;
+
 const MAX_DEPTH: u8 = 4;
 const SMART_PTRS: &[&str] = &["unique_ptr", "shared_ptr", "weak_ptr", "intrusive_ptr", "scoped_ptr", "linked_ptr", "optional"];
 const MAKE_SMART: &[&str] = &["make_unique", "make_shared", "make_intrusive", "allocate_shared", "make_optional"];

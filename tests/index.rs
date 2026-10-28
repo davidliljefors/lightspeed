@@ -339,6 +339,39 @@ fn hover_evaluates_constants_macros_and_enums() {
 }
 
 #[test]
+fn signature_help_ranks_overloads_by_typed_arguments() {
+    let src = "struct Guid {}; struct Name {};\n\
+        void put(); void put(int a); void put(Guid g, int n); void put(Name n, int k, bool f); void put(Name n, Guid g);\n\
+        struct W { W(); W(int x); W(Guid g, Name n); };\n\
+        void use(Guid guid) {\n  put(\n  put(guid, \n  put(guid, 1, \n  W(\n}\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let after = |s: &str| (src.find(s).unwrap() + s.len()) as u32;
+
+    let h = q.signature_help(&p, src, after("  put("), 3).unwrap();
+    let labels: Vec<&str> = h.signatures.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["put()", "put(int a)", "put(Guid g, int n)"]);
+    assert_eq!((h.active_param, h.more), (0, 2));
+
+    // A typed `Guid` first argument selects the Guid overloads, shortest first.
+    let h = q.signature_help(&p, src, after("put(guid, "), 3).unwrap();
+    assert_eq!(h.active_param, 1);
+    assert_eq!(h.signatures[0].label, "put(Guid g, int n)");
+    let (a, b) = h.signatures[0].params[1];
+    assert_eq!(&h.signatures[0].label[a as usize..b as usize], "int n");
+
+    let h = q.signature_help(&p, src, after("put(guid, 1, "), 1).unwrap();
+    assert_eq!(h.active_param, 2);
+    assert_eq!(h.signatures.len(), 1);
+
+    let h = q.signature_help(&p, src, after("  W("), 2).unwrap();
+    assert_eq!(h.signatures[0].label, "W()");
+    assert!(q.signature_help(&p, src, after("struct Guid {}"), 3).is_none());
+}
+
+#[test]
 fn template_parameters_are_local_names() {
     let src = "struct T {};\ntemplate<class T, int N = 3> struct Box {\n T v; T get(T d) { return d; }\n int arr[N];\n};\n\
                template<typename U> U id(U x) { U y = x; return y; }\n\
