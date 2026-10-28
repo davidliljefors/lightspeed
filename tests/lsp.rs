@@ -276,7 +276,7 @@ fn declaration_implementation_and_type_definition_over_rpc() {
 
 /// Decodes `semanticTokens` data into `(line, col, len, type name, modifier bits)`.
 fn decode_tokens(r: &Value) -> Vec<(u32, u32, u32, String, u32)> {
-    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter"];
+    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter", "typeParameter"];
     let d: Vec<u32> = r["result"]["data"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
     let (mut line, mut col) = (0, 0);
     d.chunks(5)
@@ -327,6 +327,29 @@ fn semantic_tokens_over_rpc() {
 
     let part = decode_tokens(&c.request("textDocument/semanticTokens/range", json!({"textDocument": doc, "range": {"start": {"line": 4, "character": 0}, "end": {"line": 5, "character": 0}}})));
     assert!(!part.is_empty() && part.iter().all(|t| t.0 == 4), "{part:?}");
+}
+
+#[test]
+fn semantic_tokens_template_parameters_shadow_same_named_types() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    let txt = "struct T {};\ntemplate <typename T, int N> struct Box { T items[N]; };\ntemplate <class T> T first(T a) { T x = a; return x; }\nT global;\n";
+    std::fs::write(&a, txt).unwrap();
+    std::fs::write(
+        format!("{root}/compile_commands.json"),
+        serde_json::to_string(&json!([{"directory": root, "file": "a.cpp", "arguments": ["clang++", "-c", "a.cpp"]}])).unwrap(),
+    )
+    .unwrap();
+    let mut c = Client::new(&root);
+    c.open(&a, txt);
+    let all = decode_tokens(&c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": path_to_uri(&a)}})));
+    let ty = |line: u32, col: u32| all.iter().find(|t| t.0 == line && t.1 == col).unwrap_or_else(|| panic!("no token at {line}:{col}: {all:?}")).3.clone();
+    assert_eq!(ty(0, 7), "struct");
+    for (l, c) in [(1, 19), (1, 26), (1, 42), (1, 50), (2, 16), (2, 19), (2, 27), (2, 34)] {
+        assert_eq!(ty(l, c), "typeParameter", "{l}:{c}");
+    }
+    assert_eq!(ty(2, 36), "variable");
+    assert_eq!(ty(3, 0), "struct", "outside the template the global type is meant");
 }
 
 #[test]

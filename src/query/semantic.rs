@@ -10,7 +10,7 @@ use super::{LocalKind, Query, sig_tokens};
 use crate::lexer::{Keyword, TokenKind as K};
 use crate::symbols::{SymbolFlags, SymbolKind};
 
-pub const TOKEN_TYPES: [&str; 12] = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter"];
+pub const TOKEN_TYPES: [&str; 13] = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter", "typeParameter"];
 pub const MODIFIERS: [&str; 3] = ["static", "readonly", "abstract"];
 
 const NAMESPACE: u8 = 0;
@@ -25,6 +25,7 @@ const MACRO: u8 = 8;
 const TYPE: u8 = 9;
 const VARIABLE: u8 = 10;
 const PARAMETER: u8 = 11;
+const TYPE_PARAMETER: u8 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SemTok {
@@ -69,7 +70,12 @@ impl Query<'_> {
                 continue;
             }
             if let Some(k) = locals[i] {
-                out.push(SemTok { start: t.start, len: t.len, ty: if k == LocalKind::Param { PARAMETER } else { VARIABLE }, mods: 0 });
+                let ty = match k {
+                    LocalKind::Param => PARAMETER,
+                    LocalKind::Variable => VARIABLE,
+                    LocalKind::TemplateParam => TYPE_PARAMETER,
+                };
+                out.push(SemTok { start: t.start, len: t.len, ty, mods: 0 });
                 continue;
             }
             let cands = db.lookup(t.text(text));

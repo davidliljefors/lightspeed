@@ -95,6 +95,39 @@ pub(super) fn template_header(src: &str, decl_start: usize) -> Option<Header> {
 }
 
 impl Query<'_> {
+    /// Marks every token bound to a template parameter of the templates overlapping
+    /// `[lo, hi)`. Outer templates go first so an inner parameter of the same name wins.
+    pub(super) fn template_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32, kinds: &mut [Option<LocalKind>]) {
+        let (db, Some(fi)) = (&self.idx.db, self.idx.file_index(path)) else { return };
+        let mut templates: Vec<(u32, u32, Header)> = self
+            .idx
+            .file_symbols(fi)
+            .filter_map(|id| {
+                let s = db.symbol(id);
+                if !s.flags.contains(SymbolFlags::TEMPLATE) || s.extent_start >= hi || s.extent_end < lo {
+                    return None;
+                }
+                template_header(text, s.extent_start as usize).map(|h| (h.open, s.extent_end, h))
+            })
+            .collect();
+        templates.sort_by_key(|(open, end, _)| std::cmp::Reverse(end - open));
+        for (open, end, header) in &templates {
+            let a = toks.partition_point(|t| t.start < *open);
+            for i in a..toks.len() {
+                let t = &toks[i];
+                if t.end() > *end {
+                    break;
+                }
+                if t.kind == K::Ident
+                    && header.params.iter().any(|p| !p.name.is_empty() && p.name == t.text(text))
+                    && (i == 0 || !matches!(toks[i - 1].kind, K::Dot | K::Arrow | K::ColonColon))
+                {
+                    kinds[i] = Some(LocalKind::TemplateParam);
+                }
+            }
+        }
+    }
+
     /// The template parameter the identifier `toks[hit]` refers to, with all
     /// its occurrences: the innermost enclosing template that declares the name.
     pub(super) fn template_param_in(&self, toks: &[Token], path: &str, text: &str, hit: usize) -> Option<Local> {

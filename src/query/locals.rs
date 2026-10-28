@@ -250,6 +250,7 @@ impl Query<'_> {
     /// restricted to functions overlapping `[lo, hi)`. One pass per function.
     pub(super) fn local_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32) -> Vec<Option<LocalKind>> {
         let mut kinds = vec![None; toks.len()];
+        self.template_kinds(toks, text, path, lo, hi, &mut kinds);
         let (db, Some(fi)) = (&self.idx.db, self.idx.file_index(path)) else { return kinds };
         let mut funcs: Vec<SymbolId> = self.idx.file_symbols(fi).filter(|&id| {
             let s = db.symbol(id);
