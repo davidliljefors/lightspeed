@@ -20,7 +20,7 @@ mod refs;
 mod search;
 mod semantic;
 mod templates;
-mod types;
+pub(crate) mod types;
 
 pub use hover::Hover;
 pub use locals::{Local, LocalKind};

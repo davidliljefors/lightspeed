@@ -45,7 +45,7 @@ impl Query<'_> {
         let mut cands: Vec<SymbolId> = db.lookup(name).iter().map(|&c| hier.canonical(c)).filter(|&c| kind_ok(db.symbol(c).kind) && (!elaborated || db.symbol(c).kind.is_type())).collect();
         if member {
             let recv = toks[i - 1].start;
-            let types = self.receiver_types(path, text, recv, &scopes);
+            let types = self.receiver_types_in(path, text, &toks[..i - 1], recv as usize, &scopes);
             if !types.is_empty() {
                 let mut owners = Vec::new();
                 for &t in &types {
@@ -185,7 +185,8 @@ impl Query<'_> {
         }
 
         let mut picked = best.1;
-        if arity.is_some() && picked.len() > 1 && picked.iter().all(|&c| db.symbol(c).kind.is_callable()) {
+        let same_class = picked.iter().all(|&c| db.symbol(c).parent == db.symbol(picked[0]).parent);
+        if arity.is_some() && picked.len() > 1 && same_class && picked.iter().all(|&c| db.symbol(c).kind.is_callable()) {
             picked = self.best_overloads(path, text, toks, i, picked);
         }
         if picked.iter().any(|&c| is_forward_decl_kind(db, c) && db.symbol(c).flags.contains(SymbolFlags::DEFINITION)) {

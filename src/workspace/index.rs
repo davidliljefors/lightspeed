@@ -410,6 +410,7 @@ pub struct Index {
     shared: std::sync::Arc<crate::pp::SharedHeaders>,
     scope_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<crate::scope_decls::ScopeDecls>>>,
     reach_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<hashbrown::HashSet<u32, FxBuildHasher>>>>,
+    pub(crate) param_cache: crate::query::types::ParamCache,
     dirty: bool,
     dead_symbols: usize,
     /// Files that could not be read during the last build.
@@ -436,6 +437,7 @@ impl Index {
             shared,
             scope_cache: Default::default(),
             reach_cache: Default::default(),
+            param_cache: Default::default(),
             db,
             hier,
             files: Vec::new(),
@@ -777,6 +779,7 @@ impl Index {
                 f.decls = a.decls;
                 self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
                 self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+                self.param_cache.clear();
                 return a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect();
             }
         }
@@ -812,6 +815,7 @@ impl Index {
         self.dirty = !(was_clean && self.patch_in_place(old_range, base..base + n_new));
         self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.param_cache.clear();
         a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect()
     }
 
@@ -841,6 +845,7 @@ impl Index {
         self.dirty = true;
         self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.param_cache.clear();
     }
 
     /// Using-directives and namespace aliases that files included (directly

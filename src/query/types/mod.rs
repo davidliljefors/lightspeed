@@ -54,6 +54,16 @@ fn prim_family(name: &str) -> u8 {
 /// Parameter types with a has-default flag, and whether the function is variadic.
 type Params = (Vec<(Option<Ty>, bool)>, bool);
 
+/// Parsed parameter lists by symbol; they depend only on the declaration's text.
+#[derive(Default)]
+pub(crate) struct ParamCache(std::sync::RwLock<std::collections::HashMap<u32, Option<std::sync::Arc<Params>>>>);
+
+impl ParamCache {
+    pub(crate) fn clear(&mut self) {
+        self.0.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 /// A written type reduced to what member lookup needs: its leading name and,
 /// for templates, its arguments, each as normalized type text (`Foo`,
 /// `vector<Foo>`; `const` and `&` dropped, `*` counted in `ptr`) so they can be parsed again
@@ -340,9 +350,13 @@ impl Query<'_> {
     /// `->` that follows it) may denote.
     pub(super) fn receiver_types(&self, path: &str, text: &str, end: u32, scopes: &[SymbolId]) -> Vec<SymbolId> {
         let end = (end as usize).min(text.len());
+        self.receiver_types_in(path, text, &sig_tokens(&text[..end]), end, scopes)
+    }
+
+    /// [`Self::receiver_types`] given the tokens of `text` before `end`.
+    pub(super) fn receiver_types_in(&self, path: &str, text: &str, toks: &[Token], end: usize, scopes: &[SymbolId]) -> Vec<SymbolId> {
         let db = &self.idx.db;
-        let toks = sig_tokens(&text[..end]);
-        let start = expr_start(&toks);
+        let start = expr_start(toks);
         let expr = &toks[start..];
         if expr.is_empty() {
             return Vec::new();
@@ -720,7 +734,21 @@ impl Query<'_> {
 
     /// Parameter types of the function `s` declares (and whether each has a
     /// default), and whether it is variadic.
-    fn param_tys(&self, cx: &Cx, s: &crate::symbols::Symbol) -> Option<Params> {
+    fn param_tys(&self, cx: &Cx, id: SymbolId) -> Option<std::sync::Arc<Params>> {
+        let cache = &self.idx.param_cache.0;
+        if let Ok(c) = cache.read()
+            && let Some(hit) = c.get(&(id.index() as u32))
+        {
+            return hit.clone();
+        }
+        let parsed = self.parse_param_tys(cx, self.idx.db.symbol(id)).map(std::sync::Arc::new);
+        if let Ok(mut c) = cache.write() {
+            c.insert(id.index() as u32, parsed.clone());
+        }
+        parsed
+    }
+
+    fn parse_param_tys(&self, cx: &Cx, s: &crate::symbols::Symbol) -> Option<Params> {
         self.source_of(cx, s, |src| {
             let head = src.get(s.name_offset as usize..(s.name_offset as usize + 600).min(s.extent_end as usize).min(src.len()))?;
             let toks = sig_tokens(head);
@@ -746,14 +774,15 @@ impl Query<'_> {
     /// Whether `c` accepts `args.len()` arguments and how well its parameter
     /// types match the argument types (higher is better).
     fn call_fit(&self, cx: &Cx, c: SymbolId, args: &[Option<Ty>]) -> (bool, i32) {
-        let Some((params, variadic)) = self.param_tys(cx, self.idx.db.symbol(c)) else {
+        let Some(parsed) = self.param_tys(cx, c) else {
             return (true, 0);
         };
+        let (params, variadic) = (&parsed.0, parsed.1);
         let n = args.len();
         let required = params.iter().filter(|p| !p.1).count();
         let fits = n >= required && (variadic || n <= params.len());
         let mut score = 0;
-        for (a, (p, _)) in args.iter().zip(&params) {
+        for (a, (p, _)) in args.iter().zip(params.iter()) {
             let (Some(a), Some(p)) = (a, p) else { continue };
             score += self.arg_fit(cx, a, p, true);
         }
@@ -809,7 +838,8 @@ impl Query<'_> {
     fn converts_via_ctor(&self, cx: &Cx, target: SymbolId, arg: &Ty) -> bool {
         let db = &self.idx.db;
         db.children(target).iter().copied().filter(|&m| db.symbol(m).kind == SymbolKind::Constructor && !db.symbol(m).flags.contains(crate::symbols::SymbolFlags::EXPLICIT)).any(|m| {
-            let Some((params, _)) = self.param_tys(cx, db.symbol(m)) else { return false };
+            let Some(parsed) = self.param_tys(cx, m) else { return false };
+            let params = &parsed.0;
             let required = params.iter().filter(|p| !p.1).count();
             required <= 1 && params.first().and_then(|p| p.0.as_ref()).is_some_and(|p| self.arg_fit(cx, arg, p, false) > 0)
         })
