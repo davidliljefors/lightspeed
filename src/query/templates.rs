@@ -97,7 +97,7 @@ pub(super) fn template_header(src: &str, decl_start: usize) -> Option<Header> {
 impl Query<'_> {
     /// Marks every token bound to a template parameter of the templates overlapping
     /// `[lo, hi)`. Outer templates go first so an inner parameter of the same name wins.
-    pub(super) fn template_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32, kinds: &mut [Option<LocalKind>]) {
+    pub(super) fn template_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32, kinds: &mut [Option<(LocalKind, bool)>]) {
         let (db, Some(fi)) = (&self.idx.db, self.idx.file_index(path)) else { return };
         let mut templates: Vec<(u32, u32, Header)> = self
             .idx
@@ -122,7 +122,7 @@ impl Query<'_> {
                     && header.params.iter().any(|p| !p.name.is_empty() && p.name == t.text(text))
                     && (i == 0 || !matches!(toks[i - 1].kind, K::Dot | K::Arrow | K::ColonColon))
                 {
-                    kinds[i] = Some(LocalKind::TemplateParam);
+                    kinds[i] = Some((LocalKind::TemplateParam, header.params.iter().any(|p| p.name_at.0 == t.start)));
                 }
             }
         }

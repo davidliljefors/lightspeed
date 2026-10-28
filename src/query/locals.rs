@@ -246,9 +246,10 @@ impl Query<'_> {
         })
     }
 
-    /// Kind of local each token of the file is bound to (`None` for everything else),
-    /// restricted to functions overlapping `[lo, hi)`. One pass per function.
-    pub(super) fn local_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32) -> Vec<Option<LocalKind>> {
+    /// Kind of local each token of the file is bound to (`None` for everything else), and
+    /// whether the token is its declaration, restricted to functions overlapping `[lo, hi)`.
+    /// One pass per function.
+    pub(super) fn local_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32) -> Vec<Option<(LocalKind, bool)>> {
         let mut kinds = vec![None; toks.len()];
         self.template_kinds(toks, text, path, lo, hi, &mut kinds);
         let (db, Some(fi)) = (&self.idx.db, self.idx.file_index(path)) else { return kinds };
@@ -260,9 +261,12 @@ impl Query<'_> {
         funcs.sort_by_key(|&id| std::cmp::Reverse(db.symbol(id).extent_end - db.symbol(id).extent_start));
         for f in funcs {
             if let Some((decls, occ)) = self.bind_function(toks, text, f, None, None) {
+                let mut names: Vec<usize> = decls.iter().map(|d| d.name).collect();
+                names.sort_unstable();
                 for (tok, b) in occ {
                     if let Some(b) = b {
-                        kinds[tok] = Some(if decls[b].param { LocalKind::Param } else { LocalKind::Variable });
+                        let kind = if decls[b].param { LocalKind::Param } else { LocalKind::Variable };
+                        kinds[tok] = Some((kind, names.binary_search(&tok).is_ok()));
                     }
                 }
             }

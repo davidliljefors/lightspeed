@@ -11,7 +11,8 @@ use crate::lexer::{Keyword, TokenKind as K};
 use crate::symbols::{SymbolFlags, SymbolKind};
 
 pub const TOKEN_TYPES: [&str; 13] = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter", "typeParameter"];
-pub const MODIFIERS: [&str; 3] = ["static", "readonly", "abstract"];
+pub const MODIFIERS: [&str; 4] = ["static", "readonly", "abstract", "declaration"];
+const DECLARATION: u8 = 8;
 
 const NAMESPACE: u8 = 0;
 const CLASS: u8 = 1;
@@ -59,6 +60,9 @@ impl Query<'_> {
         let toks = sig_tokens(text);
         let (lo, hi) = range.unwrap_or((0, u32::MAX));
         let locals = self.local_kinds(&toks, text, path, lo, hi);
+        // Name offsets of the symbols this file declares, sorted.
+        let mut declared: Vec<u32> = self.idx.file_index(path).map(|fi| self.idx.file_symbols(fi).map(|id| db.name_range(id).0).collect()).unwrap_or_default();
+        declared.sort_unstable();
         let first = toks.partition_point(|t| t.end() <= lo);
         let mut out = Vec::new();
         for i in first..toks.len() {
@@ -69,13 +73,13 @@ impl Query<'_> {
             if t.kind != K::Ident || t.keyword == Keyword::Reserved {
                 continue;
             }
-            if let Some(k) = locals[i] {
+            if let Some((k, is_decl)) = locals[i] {
                 let ty = match k {
                     LocalKind::Param => PARAMETER,
                     LocalKind::Variable => VARIABLE,
                     LocalKind::TemplateParam => TYPE_PARAMETER,
                 };
-                out.push(SemTok { start: t.start, len: t.len, ty, mods: 0 });
+                out.push(SemTok { start: t.start, len: t.len, ty, mods: if is_decl { DECLARATION } else { 0 } });
                 continue;
             }
             let cands = db.lookup(t.text(text));
@@ -100,7 +104,7 @@ impl Query<'_> {
             };
             let Some(&c) = cands.iter().find(|&&c| fits(db.symbol(c).kind)) else { continue };
             let s = db.symbol(c);
-            let mut mods = 0u8;
+            let mut mods = if declared.binary_search(&t.start).is_ok() { DECLARATION } else { 0 };
             for (bit, flag) in [(1, SymbolFlags::STATIC), (2, SymbolFlags::CONST), (4, SymbolFlags::PURE)] {
                 if s.flags.contains(flag) {
                     mods |= bit;

@@ -308,8 +308,8 @@ fn semantic_tokens_over_rpc() {
     let find = |line: u32, col: u32| all.iter().find(|t| t.0 == line && t.1 == col).unwrap_or_else(|| panic!("no token at {line}:{col}: {all:?}"));
     assert_eq!(find(1, 10).3, "namespace");
     assert_eq!(find(1, 21).3, "struct");
-    assert_eq!((find(1, 36).3.as_str(), find(1, 36).4), ("variable", 1)); // static data member `count`
-    assert_eq!((find(1, 56).3.as_str(), find(1, 56).4), ("method", 4)); // pure virtual run
+    assert_eq!((find(1, 36).3.as_str(), find(1, 36).4), ("variable", 1 | 8)); // static data member `count`, declared here
+    assert_eq!((find(1, 56).3.as_str(), find(1, 56).4), ("method", 4 | 8)); // pure virtual run, declared here
     assert_eq!(find(3, 18).3, "macro"); // after the multi-byte comment, still the right UTF-16 column
     assert_eq!(find(3, 29).3, "enumMember");
     assert_eq!(find(4, 4).3, "method");
@@ -317,6 +317,10 @@ fn semantic_tokens_over_rpc() {
     assert_eq!(find(4, 17).3, "function");
     // Locals and parameters win over same-named members.
     assert_eq!(find(2, 12).3, "parameter");
+    // Only the declaration carries the `declaration` bit; uses do not.
+    assert_eq!((find(2, 12).4, find(4, 2).4), (8, 0));
+    assert_eq!((find(3, 14).4, find(6, 19).4, find(6, 35).4), (8, 8, 0));
+    assert_eq!((find(4, 4).4, find(4, 17).4), (4, 0), "uses of members: run is pure virtual, f is a use");
     assert_eq!(find(3, 14).3, "variable");
     assert_eq!(find(4, 2).3, "parameter");
     assert_eq!(find(6, 10).3, "parameter");
@@ -345,6 +349,8 @@ fn semantic_tokens_template_parameters_shadow_same_named_types() {
     let all = decode_tokens(&c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": path_to_uri(&a)}})));
     let ty = |line: u32, col: u32| all.iter().find(|t| t.0 == line && t.1 == col).unwrap_or_else(|| panic!("no token at {line}:{col}: {all:?}")).3.clone();
     assert_eq!(ty(0, 7), "struct");
+    assert_eq!(all.iter().find(|t| (t.0, t.1) == (1, 19)).unwrap().4, 8, "template parameter declaration");
+    assert_eq!(all.iter().find(|t| (t.0, t.1) == (1, 42)).unwrap().4, 0, "template parameter use");
     for (l, c) in [(1, 19), (1, 26), (1, 42), (1, 50), (2, 16), (2, 19), (2, 27), (2, 34)] {
         assert_eq!(ty(l, c), "typeParameter", "{l}:{c}");
     }
