@@ -359,11 +359,16 @@ impl HeaderEntry {
 
 const SHARED_SHARDS: usize = 64;
 
+/// One header's slot: empty while some worker is loading it, then the entry
+/// (`None` when the file could not be read).
+type HeaderSlot = Arc<std::sync::OnceLock<Option<Arc<HeaderEntry>>>>;
+
 /// Header directive streams shared by every worker, so each header is read and
-/// lexed once per build instead of once per thread. Sharded; lookups are read
-/// locks and workers keep a private first-level cache in front of it.
+/// lexed once per build instead of once per thread. Sharded; each header has a
+/// compute-once slot, so workers that want a header somebody is already
+/// loading wait for it instead of repeating the work.
 pub struct SharedHeaders {
-    shards: Vec<std::sync::RwLock<HashMap<u64, Arc<HeaderEntry>, FxBuildHasher>>>,
+    shards: Vec<std::sync::RwLock<HashMap<u64, HeaderSlot, FxBuildHasher>>>,
 }
 
 impl Default for SharedHeaders {
@@ -373,7 +378,7 @@ impl Default for SharedHeaders {
 }
 
 impl SharedHeaders {
-    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, Arc<HeaderEntry>, FxBuildHasher>> {
+    fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, HeaderSlot, FxBuildHasher>> {
         &self.shards[(key >> 7) as usize % SHARED_SHARDS]
     }
 
@@ -382,7 +387,7 @@ impl SharedHeaders {
         let mut s = (0, 0, 0);
         for sh in &self.shards {
             if let Ok(m) = sh.read() {
-                for e in m.values() {
+                for e in m.values().filter_map(|slot| slot.get()?.as_ref()) {
                     s.0 += 1;
                     s.1 += e.text.capacity();
                     s.2 += e.toks.capacity() * std::mem::size_of::<Token>();
@@ -397,21 +402,36 @@ impl SharedHeaders {
         let mut out = Vec::new();
         for sh in &self.shards {
             if let Ok(m) = sh.read() {
-                out.extend(m.iter().map(|(&k, e)| (k, e.path.clone(), e.hash)));
+                out.extend(m.iter().filter_map(|(&k, slot)| slot.get()?.as_ref().map(|e| (k, e.path.clone(), e.hash))));
             }
         }
         out
     }
 
-    fn get(&self, key: u64) -> Option<Arc<HeaderEntry>> {
-        self.shard(key).read().ok()?.get(&key).cloned()
-    }
-
-    fn insert(&self, key: u64, e: Arc<HeaderEntry>) -> Arc<HeaderEntry> {
-        match self.shard(key).write() {
-            Ok(mut m) => m.entry(key).or_insert(e).clone(),
-            Err(_) => e,
+    /// The entry for `key`, loading it with `load` if no worker has yet.
+    /// Returns whether this call did the loading. Concurrent callers for the
+    /// same key block until the loader finishes. `load` must not call back in.
+    fn get_or_load(&self, key: u64, load: impl FnOnce() -> Option<Arc<HeaderEntry>>) -> (Option<Arc<HeaderEntry>>, bool) {
+        let sh = self.shard(key);
+        let existing = sh.read().ok().and_then(|m| m.get(&key).cloned());
+        let slot = match existing {
+            Some(s) => s,
+            None => match sh.write() {
+                Ok(mut m) => m.entry(key).or_default().clone(),
+                Err(_) => return (load(), true),
+            },
+        };
+        let mut loaded = false;
+        let r = slot.get_or_init(|| {
+            loaded = true;
+            load()
+        });
+        let r = r.clone();
+        if r.is_none() && loaded {
+            // Do not remember a failed read: the file may appear later.
+            self.invalidate(key);
         }
+        (r, loaded)
     }
 
     /// Forgets one file (it changed on disk).
@@ -890,6 +910,28 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         f.dir_idx = dir_idx;
     }
 
+    /// Reads and lexes the header whose normalized path is in `path_buf`,
+    /// keeping only its directive lines.
+    fn load_header(&mut self) -> Option<Arc<HeaderEntry>> {
+        let fs = self.fs;
+        let ph = self.prof.enter(Phase::Load);
+        let loaded = fs.load(&self.path_buf);
+        self.prof.leave(ph);
+        let sf = loaded?;
+        let ph = self.prof.enter(Phase::Lex);
+        let src = sf.text();
+        self.prof.count(Count::HeaderLoads, 1);
+        self.prof.count(Count::HeaderBytes, src.len() as u64);
+        let mut toks = self.tok_pool.pop().unwrap_or_default();
+        lex_into(src, &mut toks);
+        let guard = directives::detect_guard(src, &toks).map(str::to_owned);
+        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::base::hash::hash_bytes(src.as_bytes()) };
+        directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
+        self.tok_pool.push(toks);
+        self.prof.leave(ph);
+        Some(Arc::new(e))
+    }
+
     /// Loads the file whose normalized path is in `path_buf` and scans it for
     /// directives (tokens are not emitted).
     pub(super) fn enter_file(&mut self, key: u64, dir_idx: u32, out: &mut PpOutput) {
@@ -921,36 +963,18 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 e
             }
             None => {
-                let shared = self.shared.as_ref().and_then(|s| s.get(key));
-                let e = match shared {
-                    Some(e) => {
-                        out.stats.header_cache_hits += 1;
+                let shared = self.shared.clone();
+                let loaded = match shared {
+                    Some(s) => {
+                        let (e, did_load) = s.get_or_load(key, || self.load_header());
+                        if !did_load && e.is_some() {
+                            out.stats.header_cache_hits += 1;
+                        }
                         e
                     }
-                    None => {
-                        let fs = self.fs;
-                        let ph = self.prof.enter(Phase::Load);
-                        let loaded = fs.load(&self.path_buf);
-                        self.prof.leave(ph);
-                        let Some(sf) = loaded else { return };
-                        let ph = self.prof.enter(Phase::Lex);
-                        let src = sf.text();
-                        self.prof.count(Count::HeaderLoads, 1);
-                        self.prof.count(Count::HeaderBytes, src.len() as u64);
-                        let mut toks = self.tok_pool.pop().unwrap_or_default();
-                        lex_into(src, &mut toks);
-                        let guard = directives::detect_guard(src, &toks).map(str::to_owned);
-                        let mut e = HeaderEntry { text: String::new(), toks: Vec::new(), guard, path: self.path_buf.clone(), hash: crate::base::hash::hash_bytes(src.as_bytes()) };
-                        directives::compact_directives(src, &toks, &mut e.text, &mut e.toks);
-                        self.tok_pool.push(toks);
-                        self.prof.leave(ph);
-                        let e = Arc::new(e);
-                        match &self.shared {
-                            Some(s) => s.insert(key, e),
-                            None => e,
-                        }
-                    }
+                    None => self.load_header(),
                 };
+                let Some(e) = loaded else { return };
                 if !self.guards.contains_key(&key) {
                     let g = e.guard.as_deref().map(|name| {
                         let o = self.guard_text.len() as u32;
