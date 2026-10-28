@@ -48,6 +48,13 @@ enum Pick {
 }
 
 impl Query<'_> {
+    /// Every record of the entity `sym` names (declarations, definitions, overrides).
+    pub fn entity_records(&self, sym: SymbolId) -> Vec<SymbolId> {
+        let mut out = vec![sym];
+        self.equivalents(sym, &mut out);
+        out
+    }
+
     /// For every file, the files whose declarations some translation unit including it can see:
     /// the union of the reachable sets of every root translation unit above it. A header that
     /// relies on what its includer pulled in first is judged by all of its includers.

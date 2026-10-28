@@ -62,6 +62,37 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
             mib(after.0),
             mib(after.1)
         );
+        if let Some(p) = args.iter().position(|a| a == "--sample-out").and_then(|i| args.get(i + 1)) {
+            let q = Query::new(&idx, &DiskText);
+            let lc = |path: &str, off: u32| -> (usize, usize) {
+                let t = std::fs::read_to_string(path).unwrap_or_default();
+                let head = &t[..(off as usize).min(t.len())];
+                (head.matches('\n').count(), head.len() - head.rfind('\n').map_or(0, |n| n + 1))
+            };
+            let mut out = String::new();
+            for (fi, f) in idx.live_files() {
+                if fi % 25 != 0 || occ[fi].sites.is_empty() {
+                    continue;
+                }
+                let step = (occ[fi].sites.len() / 20).max(1);
+                for &(off, sym) in occ[fi].sites.iter().step_by(step) {
+                    let Some(loc) = q.location(sym) else { continue };
+                    let dpath = idx.files[loc.file as usize].path.as_str();
+                    let ((l, c), (dl, dc)) = (lc(&f.path, off), lc(dpath, loc.start));
+                    let recs: Vec<String> = q
+                        .entity_records(sym)
+                        .into_iter()
+                        .filter_map(|r| q.location(r))
+                        .map(|rl| {
+                            let p = idx.files[rl.file as usize].path.as_str();
+                            format!("{p}:{}", lc(p, rl.start).0)
+                        })
+                        .collect();
+                    out.push_str(&format!("{}\t{l}\t{c}\t{}\t{dpath}\t{dl}\t{dc}\t{}\n", f.path, idx.db.qualified_name(sym), recs.join(";")));
+                }
+            }
+            std::fs::write(p, out).unwrap();
+        }
         drop(occ);
     }
     0
