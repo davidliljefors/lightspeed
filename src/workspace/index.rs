@@ -450,6 +450,8 @@ impl Index {
     pub fn build_with(cdb: CompileDb, cfg: IndexConfig, progress: Option<&Progress>) -> Self {
         use std::sync::atomic::Ordering::Relaxed;
         let mut idx = Self::empty(cdb, cfg);
+        // Bulk build: skip per-file patching; one flush builds the indexes and hierarchy.
+        idx.dirty = true;
         idx.flag_fps = idx.cdb.flag_sets.iter().map(FlagSet::hash).collect();
         idx.default_fp = FlagSet::default().hash();
         let cache_cfg = idx.cfg.cache.clone();
