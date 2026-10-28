@@ -396,3 +396,10 @@ fn out_of_line_member_goes_to_the_class_of_its_own_namespace_whichever_is_indexe
     let got = marked_in_header(&ws_files, "#include \"g.h\"\n");
     assert!(!got.contains(&"Vector::erase".to_string()), "{got:?}");
 }
+
+#[test]
+fn identifier_in_a_define_body_is_not_a_use_of_the_same_named_method() {
+    // Godot's variant_utility.cpp declares `get_type` inside a macro body, a different function from Variant::get_type.
+    let got = marked(&[], "struct Variant { int get_type() const; };\n#define DECL(m) \\\n  struct U { \\\n    static int /*@*/get_type() { return m; } \\\n  };\n");
+    assert!(got.is_empty(), "{got:?}");
+}

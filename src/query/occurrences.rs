@@ -38,6 +38,35 @@ fn in_include_directive(text: &str, at: usize) -> bool {
     })
 }
 
+/// Byte ranges of `#define` directives, continuation lines included. What their identifiers mean depends on where the macro expands.
+fn define_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let (mut pos, mut open) = (0, None::<usize>);
+    for line in text.split_inclusive('\n') {
+        let end = pos + line.len();
+        let continues = line.trim_end().ends_with('\\');
+        match open {
+            Some(_) => {}
+            None => {
+                if line.trim_start().strip_prefix('#').is_some_and(|d| d.trim_start().starts_with("define")) {
+                    open = Some(pos);
+                }
+            }
+        }
+        if let Some(start) = open
+            && !continues
+        {
+            out.push((start, end));
+            open = None;
+        }
+        pos = end;
+    }
+    if let Some(start) = open {
+        out.push((start, text.len()));
+    }
+    out
+}
+
 enum Pick {
     One(SymbolId),
     /// Every same-named candidate is declared where this file cannot see it: the name is
@@ -155,6 +184,7 @@ impl Query<'_> {
                 let Some(t) = self.texts.text(path) else { return (fi, out, st) };
                 let text = t.as_str();
                 let toks = sig_tokens(text);
+                let defines = define_ranges(text);
                 let vis = &contexts[fi];
                 // Identifiers inside a macro invocation's arguments mean whatever the expansion makes them.
                 let mut in_macro_args = vec![false; toks.len()];
@@ -226,7 +256,9 @@ impl Query<'_> {
                         continue;
                     }
                     st.candidates += 1;
-                    if in_macro_args[i] {
+                    let at = tok.start as usize;
+                    let in_define = defines.get(defines.partition_point(|&(_, e)| e <= at)).is_some_and(|&(s, _)| s <= at);
+                    if in_macro_args[i] || in_define {
                         st.ambiguous += 1;
                         continue;
                     }

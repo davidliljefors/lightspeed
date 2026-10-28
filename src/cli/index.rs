@@ -94,10 +94,11 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
             }
             std::fs::write(p, out).unwrap();
         }
-        if let Some(name) = args.iter().position(|a| a == "--refs-of").and_then(|i| args.get(i + 1)) {
+        if let Some(names) = args.iter().position(|a| a == "--refs-of").and_then(|i| args.get(i + 1)) {
+          for name in names.split(',') {
             let q = Query::new(&idx, &DiskText);
             let last = name.rsplit("::").next().unwrap_or(name);
-            for &seed in idx.db.lookup(last).iter().filter(|&&c| idx.db.qualified_name(c) == *name).take(1) {
+            for &seed in idx.db.lookup(last).iter().filter(|&&c| idx.db.qualified_name(c) == name && q.location(c).is_some()).take(1) {
                 let loc = q.location(seed).unwrap();
                 let (path, off) = (idx.files[loc.file as usize].path.as_str(), loc.start);
                 let text = std::fs::read_to_string(path).unwrap();
@@ -125,6 +126,7 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
                     println!("  only inference: {}:{o}", idx.files[f as usize].path);
                 }
             }
+          }
         }
         drop(occ);
     }
