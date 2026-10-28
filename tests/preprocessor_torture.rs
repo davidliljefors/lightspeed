@@ -681,6 +681,31 @@ fn depgraph_invalidates_on_modify_delete_and_create() {
     assert_eq!(q("/t/tu2.cpp"), [2]);
 }
 
+#[test]
+fn shared_force_include_prologue_matches_inline_and_keeps_deps() {
+    use std::sync::Arc;
+    let fs = fs_with(&[("pre.h", "#pragma once\n#include \"inner.h\"\n#define PRE INNER+1\n"), ("inner.h", "#define INNER 7\n")]);
+    let mut f = flags(&["/t"]);
+    f.force_includes.push("/t/pre.h".into());
+    let src = "#include \"pre.h\"\nPRE __COUNTER__\n";
+    let shared = Arc::new(lightspeed::pp::SharedHeaders::default());
+    let mut results = Vec::new();
+    for use_shared in [false, true, true] {
+        let mut pp = Preprocessor::new(&fs, cfg());
+        if use_shared {
+            pp.set_shared(shared.clone());
+        }
+        pp.set_flags(&f);
+        let mut out = PpOutput::default();
+        pp.run(MAIN, src, &mut out);
+        results.push((norm(&out.render(src)), out.deps.clone(), out.includes.len(), out.defines.len()));
+    }
+    assert_eq!(results[0].0, "7 + 1 0");
+    assert_eq!(results[0], results[1]);
+    assert_eq!(results[1], results[2]);
+    assert!(results[0].1.contains(&key("/t/pre.h")) && results[0].1.contains(&key("/t/inner.h")));
+}
+
 // ---- flags
 
 fn with_flags(macros: Vec<MacroOp>, std: Option<&str>, src: &str) -> String {

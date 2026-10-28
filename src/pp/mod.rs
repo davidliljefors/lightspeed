@@ -367,17 +367,32 @@ type HeaderSlot = Arc<std::sync::OnceLock<Option<Arc<HeaderEntry>>>>;
 /// lexed once per build instead of once per thread. Sharded; each header has a
 /// compute-once slot, so workers that want a header somebody is already
 /// loading wait for it instead of repeating the work.
+type PrologueSlot = Arc<std::sync::OnceLock<Arc<Prologue>>>;
+
 pub struct SharedHeaders {
     shards: Vec<std::sync::RwLock<HashMap<u64, HeaderSlot, FxBuildHasher>>>,
+    prologues: std::sync::Mutex<HashMap<u64, PrologueSlot, FxBuildHasher>>,
 }
 
 impl Default for SharedHeaders {
     fn default() -> Self {
-        Self { shards: (0..SHARED_SHARDS).map(|_| std::sync::RwLock::new(HashMap::with_hasher(FxBuildHasher))).collect() }
+        Self {
+            shards: (0..SHARED_SHARDS).map(|_| std::sync::RwLock::new(HashMap::with_hasher(FxBuildHasher))).collect(),
+            prologues: std::sync::Mutex::new(HashMap::with_hasher(FxBuildHasher)),
+        }
     }
 }
 
 impl SharedHeaders {
+    /// The force-include prologue of flag set `key`, built by whichever
+    /// worker asks first (the others wait for it).
+    fn get_or_build_prologue(&self, key: u64, build: impl FnOnce() -> Prologue) -> Arc<Prologue> {
+        let slot = match self.prologues.lock() {
+            Ok(mut m) => m.entry(key).or_default().clone(),
+            Err(_) => return Arc::new(build()),
+        };
+        slot.get_or_init(|| Arc::new(build())).clone()
+    }
     fn shard(&self, key: u64) -> &std::sync::RwLock<HashMap<u64, HeaderSlot, FxBuildHasher>> {
         &self.shards[(key >> 7) as usize % SHARED_SHARDS]
     }
@@ -436,6 +451,9 @@ impl SharedHeaders {
 
     /// Forgets one file (it changed on disk).
     pub fn invalidate(&self, key: u64) {
+        if let Ok(mut m) = self.prologues.lock() {
+            m.retain(|_, slot| slot.get().is_none_or(|p| !p.deps.contains(&key)));
+        }
         if let Ok(mut m) = self.shard(key).write() {
             m.remove(&key);
         }
@@ -489,6 +507,39 @@ struct Snapshot {
     stats: PpStats,
 }
 
+/// What a flag set's force-includes leave behind: the macro table every TU
+/// starts from, plus the records and state replayed at the start of each TU.
+/// Computed once per flag set and shared by all workers.
+struct Prologue {
+    base: MacroTable,
+    once: FxHashSet<u64>,
+    counter: u32,
+    deps: Vec<u64>,
+    includes: Vec<IncludeRecord>,
+    defines: Vec<DefineRecord>,
+    skipped: Vec<(u32, u32)>,
+    diagnostics: Vec<PpDiag>,
+    pool: String,
+    stats: PpStats,
+}
+
+impl Default for Prologue {
+    fn default() -> Self {
+        Self {
+            base: MacroTable::new(),
+            once: FxHashSet::default(),
+            counter: 0,
+            deps: Vec::new(),
+            includes: Vec::new(),
+            defines: Vec::new(),
+            skipped: Vec::new(),
+            diagnostics: Vec::new(),
+            pool: String::new(),
+            stats: PpStats::default(),
+        }
+    }
+}
+
 const MAX_SNAPSHOTS: usize = 16;
 const RESOLVE_CACHE_ENTRIES: usize = 50_000;
 
@@ -499,7 +550,10 @@ pub struct Preprocessor<'fs, P: FileProvider> {
 
     snapshots: HashMap<u64, Snapshot, FxBuildHasher>,
     snapshotting: bool,
-    base: MacroTable,
+    /// Predefined macros of the flag set; `base` is this plus the force-includes.
+    base0: MacroTable,
+    prologue: Arc<Prologue>,
+    prologue_stale: bool,
     base_key: Option<u64>,
     pub(super) dirs: Vec<IncludeDir>,
     force_includes: Vec<String>,
@@ -566,7 +620,9 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             cfg,
             snapshots: HashMap::with_hasher(FxBuildHasher),
             snapshotting: false,
-            base: MacroTable::new(),
+            base0: MacroTable::new(),
+            prologue: Arc::new(Prologue::default()),
+            prologue_stale: false,
             base_key: None,
             dirs: Vec::new(),
             force_includes: Vec::new(),
@@ -650,7 +706,8 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
                 self.define_line(&format!("{} {}", m.name, m.value.as_deref().unwrap_or("1")));
             }
         }
-        self.base = self.t.clone();
+        self.base0 = std::mem::replace(&mut self.t, MacroTable::new());
+        self.prologue_stale = true;
     }
 
     /// Forget cached include resolutions (call when files appear/disappear).
@@ -675,7 +732,7 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     /// Approximate retained heap bytes: `(resolve cache, macro tables, header/guard caches)`.
     pub fn heap_breakdown(&self) -> (usize, usize, usize) {
         let resolve = self.resolve_cache.capacity() * (8 + std::mem::size_of::<ResolveEntry>() + 1) + self.resolved_paths.capacity() + self.probes.capacity() * 8;
-        let macros = self.t.heap_bytes() + self.base.heap_bytes() + self.snapshots.values().map(|s| s.t.heap_bytes() + s.pool.capacity()).sum::<usize>();
+        let macros = self.t.heap_bytes() + self.prologue.base.heap_bytes() + self.snapshots.values().map(|s| s.t.heap_bytes() + s.pool.capacity()).sum::<usize>();
         let caches = self.header_cache.capacity() * 17 + self.guards.capacity() * 21 + self.guard_text.capacity() + self.tok_pool.iter().map(|v| v.capacity() * std::mem::size_of::<Token>()).sum::<usize>();
         (resolve, macros, caches)
     }
@@ -695,20 +752,12 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
     pub fn run(&mut self, path: &str, src: &str, out: &mut PpOutput) {
         self.prof.begin();
         self.bound_resolve_cache();
+        if self.prologue_stale {
+            self.build_prologue();
+        }
         out.clear();
-        self.t.reset_from(&self.base);
-        self.ctx.clear();
-        self.pushback = None;
-        self.in_if = false;
-        self.budget = self.cfg.max_expansion_tokens;
-        self.expand_depth = 0;
-        self.cond.clear();
-        self.cond_base = 0;
-        self.once.clear();
-        self.counter = 0;
-        self.call_line = 0;
-        self.pushed_macros.clear();
-        self.file_depth = 0;
+        self.t.reset_from(&self.prologue.base);
+        self.reset_tu_state();
 
         let mut main_path = path.to_owned();
         normalize_path(&mut main_path);
@@ -724,17 +773,16 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         if first {
             self.deps.clear();
             self.deps.push(key);
-            for k in 0..self.force_includes.len() {
-                self.path_buf.clear();
-                self.path_buf.push_str(&self.force_includes[k]);
-                normalize_path(&mut self.path_buf);
-                let key = path_key(&self.path_buf);
-                self.deps.push(key);
-                if self.cfg.follow_includes && self.fs.exists_keyed(&self.path_buf, key) {
-                    self.enter_file(key, NONE, out);
-                }
-            }
-            self.file_depth = 0;
+            let p = &*self.prologue;
+            self.deps.extend_from_slice(&p.deps);
+            self.once.clone_from(&p.once);
+            self.counter = p.counter;
+            out.includes.extend_from_slice(&p.includes);
+            out.defines.extend_from_slice(&p.defines);
+            out.skipped.extend_from_slice(&p.skipped);
+            out.diagnostics.extend_from_slice(&p.diagnostics);
+            out.pool.push_str(&p.pool);
+            out.stats = p.stats;
         }
 
         let expand_ph = self.prof.enter(Phase::Expand);
@@ -769,6 +817,74 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
         out.deps.extend_from_slice(&self.deps);
         self.prof.leave(tail);
         self.prof.flush();
+    }
+
+    fn reset_tu_state(&mut self) {
+        self.ctx.clear();
+        self.pushback = None;
+        self.in_if = false;
+        self.budget = self.cfg.max_expansion_tokens;
+        self.expand_depth = 0;
+        self.cond.clear();
+        self.cond_base = 0;
+        self.once.clear();
+        self.counter = 0;
+        self.call_line = 0;
+        self.pushed_macros.clear();
+        self.file_depth = 0;
+    }
+
+    /// Selects this flag set's prologue, computing it if no worker has yet.
+    fn build_prologue(&mut self) {
+        self.prologue_stale = false;
+        let key = self.base_key.unwrap_or(0);
+        self.prologue = match self.shared.clone() {
+            Some(s) => s.get_or_build_prologue(key, || self.compute_prologue()),
+            None => Arc::new(self.compute_prologue()),
+        };
+    }
+
+    /// Runs the flag set's force-included files once, so every TU starts from
+    /// the macro table they leave (like a precompiled header) instead of
+    /// re-executing them.
+    fn compute_prologue(&mut self) -> Prologue {
+        let mut p = Prologue { base: self.base0.clone(), ..Prologue::default() };
+        if self.force_includes.is_empty() || !self.cfg.follow_includes {
+            return p;
+        }
+        let mut out = PpOutput::default();
+        self.t.reset_from(&self.base0);
+        self.reset_tu_state();
+        self.set_file(0, "<command-line>", 0, NONE);
+        self.deps.clear();
+        for k in 0..self.force_includes.len() {
+            self.path_buf.clear();
+            self.path_buf.push_str(&self.force_includes[k]);
+            normalize_path(&mut self.path_buf);
+            let key = path_key(&self.path_buf);
+            self.deps.push(key);
+            if self.fs.exists_keyed(&self.path_buf, key) {
+                self.enter_file(key, NONE, &mut out);
+            }
+        }
+        self.file_depth = 0;
+        for c in &self.cond {
+            out.diagnostics.push(PpDiag { loc: c.loc, kind: DiagKind::UnterminatedIf });
+        }
+        self.cond.clear();
+        self.deps.sort_unstable();
+        self.deps.dedup();
+        p.once = std::mem::take(&mut self.once);
+        p.counter = self.counter;
+        p.deps = std::mem::take(&mut self.deps);
+        p.includes = out.includes;
+        p.defines = out.defines;
+        p.skipped = out.skipped;
+        p.diagnostics = out.diagnostics;
+        p.pool = out.pool;
+        p.stats = out.stats;
+        p.base.clone_from(&self.t);
+        p
     }
 
     fn take_snapshot(&mut self, key: u64, t: &ExpTok, toks: &[Token], src: &str, out: &PpOutput) {
@@ -1027,12 +1143,16 @@ impl<'fs, P: FileProvider> Preprocessor<'fs, P> {
             s.invalidate(key);
         }
         self.guards.remove(&key);
+        if self.prologue.deps.contains(&key) {
+            self.prologue_stale = true;
+        }
         self.snapshots.retain(|&k, s| k == key || !s.deps.contains(&key));
         self.clear_resolve_cache();
     }
 
     /// Drops all cached header and resolution state.
     pub fn clear_caches(&mut self) {
+        self.prologue_stale = true;
         self.snapshots.clear();
         self.header_cache.clear();
         self.header_cache_bytes = 0;
