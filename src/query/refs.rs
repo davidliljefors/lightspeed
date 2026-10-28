@@ -46,7 +46,7 @@ fn is_label(toks: &[crate::lexer::Token], text: &str, i: usize) -> bool {
 
 impl Query<'_> {
     /// All symbols equivalent to `id` for renaming purposes.
-    fn equivalents(&self, id: SymbolId, out: &mut Vec<SymbolId>) {
+    pub(super) fn equivalents(&self, id: SymbolId, out: &mut Vec<SymbolId>) {
         let (db, hier) = (&self.idx.db, &self.idx.hier);
         let mut seed = hier.canonical(id);
         if matches!(db.symbol(seed).kind, SymbolKind::Constructor | SymbolKind::Destructor)

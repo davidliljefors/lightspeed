@@ -28,6 +28,15 @@ pub struct OccurrenceStats {
     pub bytes: usize,
 }
 
+/// Whether `at` lies on a `#include`/`#import` line, where `foo.h` is a path, not a member access.
+fn in_include_directive(text: &str, at: usize) -> bool {
+    let line = text[..at].rsplit('\n').next().unwrap_or("").trim_start();
+    line.strip_prefix('#').is_some_and(|d| {
+        let d = d.trim_start();
+        d.starts_with("include") || d.starts_with("import")
+    })
+}
+
 impl Query<'_> {
     /// Resolves every candidate identifier of every live file in parallel.
     pub fn build_occurrences(&self) -> (Vec<FileOccurrences>, OccurrenceStats) {
@@ -46,7 +55,7 @@ impl Query<'_> {
                         continue;
                     }
                     let name = tok.text(text);
-                    if idx.db.lookup(name).is_empty() {
+                    if idx.db.lookup(name).is_empty() || in_include_directive(text, tok.start as usize) {
                         continue;
                     }
                     st.candidates += 1;
@@ -62,7 +71,27 @@ impl Query<'_> {
                     match r.as_slice() {
                         [] => st.unresolved += 1,
                         [one] => out.sites.push((tok.start, *one)),
-                        _ => st.ambiguous += 1,
+                        _ => {
+                            // Several records of one entity (forward declarations, definitions, overrides) are still one symbol.
+                            let mut group = Vec::new();
+                            self.equivalents(r[0], &mut group);
+                            if r.iter().all(|c| group.contains(c)) {
+                                out.sites.push((tok.start, idx.hier.canonical(r[0])));
+                            } else {
+                                // Of same-named symbols, only those declared in files this one can see.
+                                let seen = idx.reachable_files(fi);
+                                let visible: Vec<SymbolId> = r.iter().copied().filter(|&c| self.location(c).is_some_and(|l| seen.contains(&l.file))).collect();
+                                let mut group = Vec::new();
+                                if let Some(&first) = visible.first() {
+                                    self.equivalents(first, &mut group);
+                                }
+                                if !visible.is_empty() && visible.iter().all(|c| group.contains(c)) {
+                                    out.sites.push((tok.start, idx.hier.canonical(visible[0])));
+                                } else {
+                                    st.ambiguous += 1;
+                                }
+                            }
+                        }
                     }
                 }
                 st.files = 1;
