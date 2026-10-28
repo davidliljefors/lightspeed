@@ -119,3 +119,171 @@ fn alias_qualifier_is_not_shadowed_by_a_class_elsewhere() {
     let got = stored(&ws, &["a.cpp"], "a.cpp", "get();");
     assert!(got.iter().all(|s| s.starts_with("Real::get")), "{got:?}");
 }
+
+/// What is stored for the identifier right after the `/*@*/` marker in `a.cpp`.
+fn marked(files: &[(&str, &str)], src: &str) -> Vec<String> {
+    let at = src.find("/*@*/").expect("marker");
+    let clean = src.replacen("/*@*/", "", 1);
+    let len = clean[at..].find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(clean.len() - at);
+    let mut all: Vec<(&str, &str)> = files.to_vec();
+    all.push(("a.cpp", &clean));
+    let ws = Ws::new(&all, &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let path = ws.path("a.cpp");
+    let (occ, _) = q.build_occurrences();
+    let fi = idx.live_files().find(|(_, f)| f.path == path).map(|(i, _)| i).unwrap();
+    occ[fi]
+        .sites
+        .iter()
+        .filter(|(o, _)| (*o as usize) >= at && (*o as usize) < at + len)
+        .map(|&(_, s)| idx.db.qualified_name(s))
+        .collect()
+}
+
+#[test]
+fn member_of_an_anonymous_struct_typedef_is_not_another_structs_member() {
+    // zstd: `typedef struct { ... seqStore; } Ldm;` and an unrelated `Ctx::seqStore`.
+    let got = marked(&[], "struct Ctx { int store; };\ntypedef struct { int store; } Ldm;\nint f(Ldm* p) { return p->/*@*/store; }\n");
+    assert!(!got.contains(&"Ctx::store".to_string()), "{got:?}");
+}
+
+#[test]
+fn member_of_a_function_local_struct_is_not_the_only_indexed_member_of_that_name() {
+    // Jolt: `struct MyCollector { BodyID mGroundBodyID; } collector;` inside a function.
+    let got = marked(&[], "struct Base { int id; };\nint f() {\n  struct Local { int id; };\n  Local c;\n  return c./*@*/id;\n}\n");
+    assert!(!got.contains(&"Base::id".to_string()), "{got:?}");
+}
+
+#[test]
+fn member_through_an_inherited_result_type_is_not_a_same_named_member_elsewhere() {
+    // Jolt: `RayCastResult hit; hit.mBodyID` where the member comes from a base struct.
+    let got = marked(&[], "struct CastResult { int body; };\nstruct RayResult : CastResult { float f; };\nstruct Transformed { int body; };\nvoid f() { RayResult hit; hit./*@*/body = 1; }\n");
+    assert!(!got.contains(&"Transformed::body".to_string()), "{got:?}");
+}
+
+#[test]
+fn member_of_a_class_member_pointer_resolves_through_the_hierarchy() {
+    // Godot: `ItemList* list = nullptr;` then `list->connect(..)` is `Node::connect`, not `Signal::connect`.
+    let got = marked(
+        &[],
+        "struct Signal { int connect(int); };\nstruct Object { virtual int connect(int); };\nstruct Node : Object { int connect(int) override; };\nstruct ItemList : Node {};\nstruct Editor { ItemList* list = nullptr; void build(); };\nvoid Editor::build() { list->/*@*/connect(1); }\n",
+    );
+    assert!(!got.contains(&"Signal::connect".to_string()), "{got:?}");
+}
+
+#[test]
+fn macro_argument_is_not_a_use_of_the_same_named_method() {
+    // Godot: `SceneStringName(toggled)` expands to `Names::get()->toggled`, not `Button::toggled`.
+    let got = marked(
+        &[],
+        "struct Names { int toggled; static Names* get(); };\n#define NAME(m) Names::get()->m\nstruct Button { void toggled(); };\nint f() { return NAME(/*@*/toggled); }\n",
+    );
+    assert!(!got.contains(&"Button::toggled".to_string()), "{got:?}");
+}
+
+#[test]
+fn using_namespace_picks_the_namespace_not_a_same_named_class_elsewhere() {
+    // Godot: `using namespace RendererDummy; LightStorage* LightStorage::singleton`.
+    let got = marked(
+        &[("rd.h", "namespace RD { struct Store { static Store* singleton; }; }\n"), ("dummy.h", "namespace Dummy { struct Store { static Store* singleton; }; }\n")],
+        "#include \"rd.h\"\n#include \"dummy.h\"\nusing namespace Dummy;\nStore* Store::singleton = nullptr;\nvoid f() { /*@*/Store* s = nullptr; }\n",
+    );
+    assert!(!got.contains(&"RD::Store".to_string()), "{got:?}");
+}
+
+#[test]
+fn qualified_nested_type_of_a_class_with_an_export_macro_is_not_another_classes_nested_type() {
+    // Jolt: `class JPH_EXPORT ConvexHullBuilder { class Face; }` and an unrelated `ConvexHullShape::Face`.
+    let got = marked(
+        &[("b.h", "#define EXPORT __attribute__ ((visibility (\"default\")))\nclass EXPORT Builder : public Base {\npublic:\n  class Face;\n  class Face : public Base {};\n};\n"), ("o.h", "struct Other { struct Face {}; };\n")],
+        "#include \"b.h\"\n#include \"o.h\"\nvoid f() { Builder::/*@*/Face* p = nullptr; }\n",
+    );
+    assert!(!got.contains(&"Other::Face".to_string()), "{got:?}");
+}
+
+#[test]
+fn bare_name_in_a_function_local_struct_is_not_an_outer_members() {
+    // Jolt: a collector struct declared inside a member function, with a field of the outer class's name.
+    let got = marked(&[], "struct Base { int id; void f(); };\nvoid Base::f() {\n  struct L { int id; void set() { /*@*/id = 1; } };\n}\n");
+    assert!(!got.contains(&"Base::id".to_string()), "{got:?}");
+}
+
+#[test]
+fn constructor_initializer_names_the_field() {
+    let got = marked(&[], "struct P { int plural; P(int v); };\nP::P(int v) : /*@*/plural(v) {}\n");
+    assert_eq!(got, ["P::plural"]);
+}
+
+#[test]
+fn class_with_an_empty_export_macro_is_still_a_class() {
+    let got = marked(
+        &[("b.h", "#define EXPORT\nclass EXPORT Builder { public: class Face; };\n"), ("o.h", "struct Other { struct Face {}; };\n")],
+        "#include \"b.h\"\n#include \"o.h\"\nvoid f() { /*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["Builder"]);
+}
+
+#[test]
+fn namespace_opened_after_msvc_pragma_operators_keeps_its_scope() {
+    // Jolt on MSVC: `#define NS_BEGIN __pragma(warning(push)) namespace N {`.
+    let got = marked(
+        &[("b.h", "#define PUSH __pragma(warning (push))\n#define NS_BEGIN PUSH __pragma(warning (disable : 4100)) namespace N {\nNS_BEGIN\nclass Builder { public: class Face; };\n}\n")],
+        "#include \"b.h\"\nvoid f() { N::/*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["N::Builder"]);
+}
+
+#[test]
+fn namespace_opened_after_an_indirect_pragma_operator_keeps_its_scope() {
+    let got = marked(
+        &[("b.h", "#define PRAGMA(x) __pragma(x)\n#define PUSH PRAGMA(warning (push))\nPUSH\nnamespace N {\nclass Builder {};\n}\n")],
+        "#include \"b.h\"\nvoid f() { N::/*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["N::Builder"]);
+}
+
+#[test]
+fn namespace_opened_after_macros_that_expand_to_nothing_keeps_its_scope() {
+    let got = marked(
+        &[("b.h", "#define SUP(w)\n#define NOTHING\n#define IFN(x)\n#define ALL SUP(\"-Wa\") SUP(\"-Wb\") NOTHING IFN(SUP(\"-Wc\")) SUP(\"-Wd\")\n#define NS_BEGIN ALL namespace N {\nNS_BEGIN\nclass Builder { public: class Face; };\n}\n")],
+        "#include \"b.h\"\nvoid f() { N::/*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["N::Builder"]);
+}
+
+#[test]
+fn namespace_opened_after_a_macro_with_commented_continuation_lines() {
+    let got = marked(
+        &[("b.h", "#define SUP(w)\n#define ALL \\\n\tSUP(1) /* 'X' : unreferenced formal parameter */\t\t\\\n\tSUP(2) /* class 'X' needs to have DLL-interface to 'Y' */ \\\n\tSUP(3) /* last 'X': one */\n#define NS_BEGIN ALL namespace N {\nNS_BEGIN\nclass Builder { public: class Face; };\n}\n")],
+        "#include \"b.h\"\nvoid f() { N::/*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["N::Builder"]);
+}
+
+#[test]
+fn namespace_opened_after_parameterised_pragma_macros_keeps_its_scope() {
+    let got = marked(
+        &[("b.h", "#define PRAGMA(x) __pragma(x)\n#define MSVC(w) PRAGMA(warning (disable : w))\n#define ALL MSVC(4619) MSVC(4514)\n#define NS_BEGIN ALL namespace N {\nNS_BEGIN\nclass Builder {};\n}\n")],
+        "#include \"b.h\"\nvoid f() { N::/*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["N::Builder"]);
+}
+
+#[test]
+fn namespace_opened_after_stringified_pragma_operators_keeps_its_scope() {
+    let got = marked(
+        &[("b.h", "#define PRAGMA(x) _Pragma(#x)\n#define SUP(w) PRAGMA(clang diagnostic ignored w)\n#define ALL PRAGMA(clang diagnostic push) SUP(\"-Wfoo\") SUP(\"-Wbar\")\n#define NS_BEGIN ALL namespace N {\nNS_BEGIN\nclass Builder {};\n}\n")],
+        "#include \"b.h\"\nvoid f() { N::/*@*/Builder* b = nullptr; }\n",
+    );
+    assert_eq!(got, ["N::Builder"]);
+}
+
+#[test]
+fn qualifier_naming_nothing_we_index_does_not_pick_a_same_named_stranger() {
+    let got = marked(
+        &[("a.h", "namespace Other { struct Face {}; }\n")],
+        "#include \"a.h\"\nvoid f() { Unknown::/*@*/Face* x = nullptr; }\n",
+    );
+    assert!(got.is_empty(), "{got:?}");
+}

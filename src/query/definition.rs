@@ -22,6 +22,18 @@ impl Query<'_> {
 
     /// [`Self::definition_in`] considering only symbols whose kind satisfies `kind_ok`.
     pub(super) fn definition_of_kind(&self, toks: &[Token], path: &str, text: &str, i: usize, kind_ok: &dyn Fn(crate::symbols::SymbolKind) -> bool) -> Vec<SymbolId> {
+        self.resolve_identifier(toks, path, text, i, kind_ok, &mut false)
+    }
+
+    /// [`Self::definition_in`] that also says whether it had to guess: `guessed` is set for a member
+    /// access whose receiver type is unknown, which then matches every member of that name.
+    pub(super) fn definition_checked(&self, toks: &[Token], path: &str, text: &str, i: usize) -> (Vec<SymbolId>, bool) {
+        let mut guessed = false;
+        let r = self.resolve_identifier(toks, path, text, i, &|_| true, &mut guessed);
+        (r, guessed)
+    }
+
+    fn resolve_identifier(&self, toks: &[Token], path: &str, text: &str, i: usize, kind_ok: &dyn Fn(crate::symbols::SymbolKind) -> bool, guessed: &mut bool) -> Vec<SymbolId> {
         let offset = toks[i].start;
         let name = toks[i].text(text);
         let (db, hier) = (&self.idx.db, &self.idx.hier);
@@ -46,6 +58,7 @@ impl Query<'_> {
         if member {
             let recv = toks[i - 1].start;
             let types = self.receiver_types_in(path, text, &toks[..i - 1], recv as usize, &scopes);
+            *guessed = types.is_empty();
             if !types.is_empty() {
                 let mut owners = Vec::new();
                 for &t in &types {
@@ -55,6 +68,8 @@ impl Query<'_> {
                 let typed: Vec<SymbolId> = cands.iter().copied().filter(|c| db.symbol(*c).parent.is_some_and(|p| owners.contains(&p))).collect();
                 if !typed.is_empty() {
                     cands = typed;
+                } else {
+                    *guessed = true;
                 }
             }
         }
@@ -124,7 +139,10 @@ impl Query<'_> {
                 filtered.sort_unstable();
                 filtered.dedup();
             }
-            if !filtered.is_empty() {
+            if filtered.is_empty() {
+                // Nothing lives under the written qualifier, so any survivor is a same-named stranger.
+                *guessed = true;
+            } else {
                 cands = filtered;
             }
         }

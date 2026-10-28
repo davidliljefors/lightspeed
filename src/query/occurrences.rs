@@ -156,6 +156,24 @@ impl Query<'_> {
                 let text = t.as_str();
                 let toks = sig_tokens(text);
                 let vis = &contexts[fi];
+                // Identifiers inside a macro invocation's arguments mean whatever the expansion makes them.
+                let mut in_macro_args = vec![false; toks.len()];
+                let mut parens: Vec<bool> = Vec::new();
+                let mut open_macros = 0usize;
+                for (i, tok) in toks.iter().enumerate() {
+                    in_macro_args[i] = open_macros > 0;
+                    match tok.kind {
+                        K::LParen => {
+                            let is_macro = i > 0
+                                && toks[i - 1].kind == K::Ident
+                                && idx.db.lookup(toks[i - 1].text(text)).iter().any(|&c| idx.db.symbol(c).kind == SymbolKind::Macro);
+                            open_macros += is_macro as usize;
+                            parens.push(is_macro);
+                        }
+                        K::RParen => open_macros -= parens.pop().unwrap_or(false) as usize,
+                        _ => {}
+                    }
+                }
                 // Aliases a qualifier may be spelled through; spelled anywhere in the file or its includes.
                 let file_aliases = std::cell::OnceCell::new();
                 let qualifier_is_alias = |i: usize| {
@@ -180,6 +198,10 @@ impl Query<'_> {
                         continue;
                     }
                     st.candidates += 1;
+                    if in_macro_args[i] {
+                        st.ambiguous += 1;
+                        continue;
+                    }
                     let scoped = i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow | K::ColonColon);
                     if i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow) {
                         st.members += 1;
@@ -188,9 +210,13 @@ impl Query<'_> {
                         st.locals += 1;
                         continue;
                     }
-                    let r = self.definition_in(&toks, path, text, i);
+                    let (r, guessed) = self.definition_checked(&toks, path, text, i);
                     if r.is_empty() {
                         st.unresolved += 1;
+                        continue;
+                    }
+                    if guessed {
+                        st.ambiguous += 1;
                         continue;
                     }
                     if qualifier_is_alias(i) {
