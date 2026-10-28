@@ -169,6 +169,9 @@ fn parse_decl(toks: &[Token], text: &str, s: usize, limit: usize, param: bool, c
     }
 }
 
+/// Declarations of one function and every identifier occurrence with the declaration it binds to.
+type Bindings = (Vec<Declared>, Vec<(usize, Option<usize>)>);
+
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
     Brace,
@@ -220,6 +223,56 @@ impl Query<'_> {
             }
         }
         let function = best?.1;
+        let (decls, occ) = self.bind_function(toks, text, function, Some(name), Some(hit))?;
+        let hit_binding = occ.iter().find(|(tok, _)| *tok == hit)?.1?;
+        let d = &decls[hit_binding];
+        let uses: Vec<(u32, u32)> = occ.iter().filter(|(_, b)| *b == Some(hit_binding)).map(|&(tok, _)| (toks[tok].start, toks[tok].end())).collect();
+        let span = |a: usize, b: usize| &text[toks[a].start as usize..toks[b - 1].end() as usize];
+        let signature = if d.decl_start == d.ty_end {
+            squash(span(d.ty_start, d.end))
+        } else {
+            format!("{} {}", squash(span(d.ty_start, d.ty_end)), squash(span(d.decl_start, d.end)))
+        };
+        Some(Local {
+            kind: if d.param { LocalKind::Param } else { LocalKind::Variable },
+            name: name.to_owned(),
+            signature,
+            auto: toks[d.ty_start..d.ty_end].iter().any(|t| t.text(text) == "auto"),
+            function,
+            decl: (toks[d.name].start, toks[d.name].end()),
+            uses,
+            hovered: (toks[hit].start, toks[hit].end()),
+            decl_offset: if d.binding { toks[d.ty_start].start } else { toks[d.name].start },
+        })
+    }
+
+    /// Kind of local each token of the file is bound to (`None` for everything else),
+    /// restricted to functions overlapping `[lo, hi)`. One pass per function.
+    pub(super) fn local_kinds(&self, toks: &[Token], text: &str, path: &str, lo: u32, hi: u32) -> Vec<Option<LocalKind>> {
+        let mut kinds = vec![None; toks.len()];
+        let (db, Some(fi)) = (&self.idx.db, self.idx.file_index(path)) else { return kinds };
+        let mut funcs: Vec<SymbolId> = self.idx.file_symbols(fi).filter(|&id| {
+            let s = db.symbol(id);
+            s.kind.is_callable() && s.extent_start < hi && s.extent_end >= lo
+        }).collect();
+        // Outer functions first, so a nested one (a local class's method) overrides them.
+        funcs.sort_by_key(|&id| std::cmp::Reverse(db.symbol(id).extent_end - db.symbol(id).extent_start));
+        for f in funcs {
+            if let Some((decls, occ)) = self.bind_function(toks, text, f, None, None) {
+                for (tok, b) in occ {
+                    if let Some(b) = b {
+                        kinds[tok] = Some(if decls[b].param { LocalKind::Param } else { LocalKind::Variable });
+                    }
+                }
+            }
+        }
+        kinds
+    }
+
+    /// Declarations and bound occurrences inside `function`. With `name` set only
+    /// that name is tracked; `hit` (a token index) must lie inside the function.
+    fn bind_function(&self, toks: &[Token], text: &str, function: SymbolId, name: Option<&str>, hit: Option<usize>) -> Option<Bindings> {
+        let db = &self.idx.db;
         let name_tok = toks.binary_search_by_key(&db.symbol(function).name_offset, |t| t.start).ok()?;
 
         // Parameter list.
@@ -248,7 +301,7 @@ impl Query<'_> {
             j += 1;
         }
         let (body_open, end) = body.unwrap_or((rparen + 1, rparen));
-        if hit < lparen || hit > end {
+        if hit.is_some_and(|h| h < lparen || h > end) {
             return None;
         }
 
@@ -267,7 +320,7 @@ impl Query<'_> {
                         depth: usize,
                         in_header: bool| {
             for d in scratch.drain(..) {
-                if toks[d.name].text(text) != name {
+                if name.is_some_and(|n| toks[d.name].text(text) != n) {
                     continue;
                 }
                 let di = decls.len();
@@ -299,8 +352,9 @@ impl Query<'_> {
             k += 1;
         }
 
-        let lookup = |pending: &[(usize, usize)], scopes: &[Vec<usize>]| -> Option<usize> {
-            pending.last().map(|&(_, d)| d).or_else(|| scopes.iter().rev().find_map(|s| s.last().copied()))
+        let lookup = |decls: &[Declared], pending: &[(usize, usize)], scopes: &[Vec<usize>], ident: &str| -> Option<usize> {
+            let same = |d: &usize| toks[decls[*d].name].text(text) == ident;
+            pending.iter().rev().map(|&(_, d)| d).find(same).or_else(|| scopes.iter().rev().find_map(|s| s.iter().rev().copied().find(same)))
         };
 
         let mut i = rparen + 1;
@@ -351,11 +405,11 @@ impl Query<'_> {
                     let d = groups.len() + 1;
                     pending.retain(|&(pd, _)| pd != d);
                 }
-                K::Ident if t.text(text) == name => {
+                K::Ident if name.is_none_or(|n| t.text(text) == n) => {
                     let skip = i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow | K::ColonColon);
                     let member_init = i < body_open && matches!(toks[i - 1].kind, K::Colon | K::Comma) && toks.get(i + 1).is_some_and(|n| matches!(n.kind, K::LParen | K::LBrace));
                     if !skip && !member_init && !decls.iter().any(|d| d.name == i) {
-                        occ.push((i, lookup(&pending, &scopes)));
+                        occ.push((i, lookup(&decls, &pending, &scopes, t.text(text))));
                     }
                 }
                 _ => {}
@@ -363,26 +417,7 @@ impl Query<'_> {
             i += 1;
         }
 
-        let hit_binding = occ.iter().find(|(tok, _)| *tok == hit)?.1?;
-        let d = &decls[hit_binding];
-        let uses: Vec<(u32, u32)> = occ.iter().filter(|(_, b)| *b == Some(hit_binding)).map(|&(tok, _)| (toks[tok].start, toks[tok].end())).collect();
-        let span = |a: usize, b: usize| &text[toks[a].start as usize..toks[b - 1].end() as usize];
-        let signature = if d.decl_start == d.ty_end {
-            squash(span(d.ty_start, d.end))
-        } else {
-            format!("{} {}", squash(span(d.ty_start, d.ty_end)), squash(span(d.decl_start, d.end)))
-        };
-        Some(Local {
-            kind: if d.param { LocalKind::Param } else { LocalKind::Variable },
-            name: name.to_owned(),
-            signature,
-            auto: toks[d.ty_start..d.ty_end].iter().any(|t| t.text(text) == "auto"),
-            function,
-            decl: (toks[d.name].start, toks[d.name].end()),
-            uses,
-            hovered: (toks[hit].start, toks[hit].end()),
-            decl_offset: if d.binding { toks[d.ty_start].start } else { toks[d.name].start },
-        })
+        Some((decls, occ))
     }
 }
 

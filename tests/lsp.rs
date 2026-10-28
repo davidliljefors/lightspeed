@@ -276,7 +276,7 @@ fn declaration_implementation_and_type_definition_over_rpc() {
 
 /// Decodes `semanticTokens` data into `(line, col, len, type name, modifier bits)`.
 fn decode_tokens(r: &Value) -> Vec<(u32, u32, u32, String, u32)> {
-    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable"];
+    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter"];
     let d: Vec<u32> = r["result"]["data"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
     let (mut line, mut col) = (0, 0);
     d.chunks(5)
@@ -292,7 +292,7 @@ fn decode_tokens(r: &Value) -> Vec<(u32, u32, u32, String, u32)> {
 fn semantic_tokens_over_rpc() {
     let (_d, root) = tmp();
     let a = format!("{root}/a.cpp");
-    let txt = "#define LIMIT 4\nnamespace N { struct S { static int count; virtual void run() = 0; int v; }; enum E { One }; }\nint f(N::S& s) {\n  /* é */ int x = LIMIT + N::One;\n  s.run(); s.v = f(s); return N::S::count;\n}\n";
+    let txt = "#define LIMIT 4\nnamespace N { struct S { static int count; virtual void run() = 0; int v; }; enum E { One }; }\nint f(N::S& s) {\n  /* é */ int x = LIMIT + N::One;\n  s.run(); s.v = f(s); return N::S::count;\n}\nint g(int v) { int run = v; return run; }\n";
     std::fs::write(&a, txt).unwrap();
     std::fs::write(
         format!("{root}/compile_commands.json"),
@@ -315,6 +315,14 @@ fn semantic_tokens_over_rpc() {
     assert_eq!(find(4, 4).3, "method");
     assert_eq!(find(4, 13).3, "property");
     assert_eq!(find(4, 17).3, "function");
+    // Locals and parameters win over same-named members.
+    assert_eq!(find(2, 12).3, "parameter");
+    assert_eq!(find(3, 14).3, "variable");
+    assert_eq!(find(4, 2).3, "parameter");
+    assert_eq!(find(6, 10).3, "parameter");
+    assert_eq!(find(6, 19).3, "variable");
+    assert_eq!(find(6, 25).3, "parameter");
+    assert_eq!(find(6, 35).3, "variable");
     assert!(all.windows(2).all(|w| (w[0].0, w[0].1) < (w[1].0, w[1].1)), "tokens must be ordered");
 
     let part = decode_tokens(&c.request("textDocument/semanticTokens/range", json!({"textDocument": doc, "range": {"start": {"line": 4, "character": 0}, "end": {"line": 5, "character": 0}}})));

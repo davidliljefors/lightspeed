@@ -1074,7 +1074,7 @@ impl Server {
             (at(&params["range"]["start"]), at(&params["range"]["end"]))
         });
         let overlay = Overlay(&self.docs);
-        let toks = Query::new(idx, &overlay).semantic_tokens(text, range);
+        let toks = Query::new(idx, &overlay).semantic_tokens(&path, text, range);
         let mut data = Vec::with_capacity(toks.len() * 5);
         let (mut pl, mut pc) = (0u32, 0u32);
         for t in toks {

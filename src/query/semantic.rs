@@ -3,14 +3,14 @@
 //!
 //! No per-token resolution happens here. When every symbol with that name has
 //! the same kind the answer is a hash lookup; otherwise cheap syntactic hints
-//! (`name(`, `.name`, `name::`) narrow the candidates. Locals and parameters
-//! are not classified yet.
+//! (`name(`, `.name`, `name::`) narrow the candidates. Parameters and locals
+//! come first, from one binding pass per function (see `Query::local_kinds`).
 
-use super::{Query, sig_tokens};
+use super::{LocalKind, Query, sig_tokens};
 use crate::lexer::{Keyword, TokenKind as K};
 use crate::symbols::{SymbolFlags, SymbolKind};
 
-pub const TOKEN_TYPES: [&str; 11] = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable"];
+pub const TOKEN_TYPES: [&str; 12] = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter"];
 pub const MODIFIERS: [&str; 3] = ["static", "readonly", "abstract"];
 
 const NAMESPACE: u8 = 0;
@@ -24,6 +24,7 @@ const PROPERTY: u8 = 7;
 const MACRO: u8 = 8;
 const TYPE: u8 = 9;
 const VARIABLE: u8 = 10;
+const PARAMETER: u8 = 11;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SemTok {
@@ -52,10 +53,11 @@ fn token_type(k: SymbolKind) -> u8 {
 
 impl Query<'_> {
     /// Classified identifiers of `text` that start inside `range` (all if `None`), in source order.
-    pub fn semantic_tokens(&self, text: &str, range: Option<(u32, u32)>) -> Vec<SemTok> {
+    pub fn semantic_tokens(&self, path: &str, text: &str, range: Option<(u32, u32)>) -> Vec<SemTok> {
         let db = &self.idx.db;
         let toks = sig_tokens(text);
         let (lo, hi) = range.unwrap_or((0, u32::MAX));
+        let locals = self.local_kinds(&toks, text, path, lo, hi);
         let first = toks.partition_point(|t| t.end() <= lo);
         let mut out = Vec::new();
         for i in first..toks.len() {
@@ -64,6 +66,10 @@ impl Query<'_> {
                 break;
             }
             if t.kind != K::Ident || t.keyword == Keyword::Reserved {
+                continue;
+            }
+            if let Some(k) = locals[i] {
+                out.push(SemTok { start: t.start, len: t.len, ty: if k == LocalKind::Param { PARAMETER } else { VARIABLE }, mods: 0 });
                 continue;
             }
             let cands = db.lookup(t.text(text));
