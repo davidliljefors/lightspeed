@@ -198,6 +198,17 @@ fn fields_multi_declarators_initializers_function_pointers() {
 }
 
 #[test]
+fn member_function_pointers_do_not_declare_their_return_type() {
+    let p = parse_src("typedef unsigned long long uint64_t; struct S { uint64_t size() const; uint64_t (S::*pfn)(void) const; void (S::*next)(void); bool (S::*&ref)(int); };");
+    let dump = p.dump();
+    assert!(!dump.iter().any(|k| k.ends_with(" uint64_t") && !k.starts_with("TypeAlias")), "{dump:?}");
+    assert_eq!(p.kind("S::size"), SymbolKind::Method);
+    for f in ["pfn", "next", "ref"] {
+        assert_eq!(p.kind(&format!("S::{f}")), SymbolKind::Field, "{f}: {dump:?}");
+    }
+}
+
+#[test]
 fn static_members_and_globals() {
     let p = parse_src("struct S { static int s; static const int k = 5; }; int g = 1; extern int e; const char* name = \"x\"; static int fs();");
     assert_eq!(p.kind("S::s"), SymbolKind::Variable);

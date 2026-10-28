@@ -376,6 +376,29 @@ struct Job {
     is_tu: bool,
 }
 
+/// A resolved `#include` in an open buffer: the byte range of the header name (without its delimiters) and the file it names.
+pub struct IncludeLink {
+    pub start: u32,
+    pub end: u32,
+    pub path: String,
+}
+
+/// Byte range of the name in the `#include "x"` / `#include <x>` directive whose `#` is at `hash`.
+pub fn include_name_span(text: &str, hash: u32) -> Option<(u32, u32)> {
+    let rest = text.get(hash as usize..)?;
+    let line = &rest[..rest.find('\n').unwrap_or(rest.len())];
+    let after_hash = line.strip_prefix('#')?.trim_start();
+    let after_kw = after_hash.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_').trim_start();
+    let close = match after_kw.chars().next()? {
+        '"' => '"',
+        '<' => '>',
+        _ => return None,
+    };
+    let start = line.len() - after_kw.len() + 1;
+    let len = line[start..].find(close)?;
+    Some((hash + start as u32, hash + (start + len) as u32))
+}
+
 pub struct Index {
     pub db: SymbolDb,
     pub hier: Hierarchy,
@@ -395,6 +418,8 @@ pub struct Index {
     flag_fps: Vec<u64>,
     default_fp: u64,
     saver: Option<std::thread::JoinHandle<()>>,
+    /// Include links of the open buffers, keyed by [`path_key`].
+    links: HashMap<u64, Vec<IncludeLink>, FxBuildHasher>,
 }
 
 impl Index {
@@ -424,7 +449,38 @@ impl Index {
             flag_fps: Vec::new(),
             default_fp: 0,
             saver: None,
+            links: HashMap::with_hasher(FxBuildHasher),
         }
+    }
+
+    /// Records the resolved includes of the file the worker just preprocessed.
+    fn capture_links(&mut self, path: &str, text: &str) {
+        let out = &self.worker.out;
+        let links = out
+            .includes
+            .iter()
+            .filter_map(|r| {
+                let target = out.include_path(r)?;
+                let (start, end) = include_name_span(text, r.loc)?;
+                let mut path = target.to_owned();
+                normalize_path(&mut path);
+                Some(IncludeLink { start, end, path })
+            })
+            .collect();
+        self.links.insert(path_key(path), links);
+    }
+
+    /// Resolved includes of an open buffer, in source order.
+    pub fn include_links(&self, path: &str) -> &[IncludeLink] {
+        let mut p = path.to_owned();
+        normalize_path(&mut p);
+        self.links.get(&path_key(&p)).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn forget_links(&mut self, path: &str) {
+        let mut p = path.to_owned();
+        normalize_path(&mut p);
+        self.links.remove(&path_key(&p));
     }
 
     /// Blocks until a background cache write (if any) finished.
@@ -884,7 +940,7 @@ impl Index {
                     }
                 },
             };
-            first = false;
+            let is_root = std::mem::replace(&mut first, false);
             let existing = self.by_path.get(&path_key(&p)).map(|&i| i as usize);
             let (flag_entry, is_tu) = match existing {
                 Some(i) => (self.files[i].flag_entry, self.files[i].is_tu),
@@ -897,6 +953,9 @@ impl Index {
             let (flags, hash) = flags_of(&self.cdb, flag_entry);
             let t = std::time::Instant::now();
             let a = self.worker.analyze(&p, src, flags, hash, None);
+            if is_root {
+                self.capture_links(&p, src);
+            }
             let analyze_ms = t.elapsed().as_secs_f64() * 1e3;
             let [_, pp_us, parse_us, lex_us, scope_us, _] = a.times;
             let t = std::time::Instant::now();
@@ -929,6 +988,7 @@ impl Index {
         };
         let (flags, hash) = flags_of(&self.cdb, flag_entry);
         self.worker.warm(&p, text, flags, hash);
+        self.capture_links(&p, text);
     }
 
     pub fn remove(&mut self, path: &str) {

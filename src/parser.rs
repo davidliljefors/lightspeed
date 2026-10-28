@@ -182,6 +182,19 @@ impl<'a> Parser<'a> {
         j
     }
 
+    /// `open` is a `(`: true when it starts `(Class::*name)`, a pointer-to-member declarator.
+    fn member_ptr_declarator(&self, open: usize) -> bool {
+        let mut k = open + 1;
+        while k < self.t.len() {
+            match self.t[k].kind {
+                K::Ident | K::ColonColon => k += 1,
+                K::Lt => k = self.skip_angles(k),
+                _ => break,
+            }
+        }
+        k > open + 1 && self.k(k - 1) == Some(K::ColonColon) && matches!(self.k(k), Some(K::Star | K::Amp | K::AmpAmp))
+    }
+
     /// From `i`, the index of the next top-level `;` (not consumed), `,` or `}`.
     /// Template argument lists (`is_same_v<A, B>`) are skipped whole so their
     /// commas don't look like more declarators.
@@ -875,8 +888,8 @@ impl<'a> Parser<'a> {
                         j = close;
                         continue;
                     }
-                    if matches!(self.k(j + 1), Some(K::Star | K::Amp | K::AmpAmp)) {
-                        // `void (*callback)(int)`
+                    if matches!(self.k(j + 1), Some(K::Star | K::Amp | K::AmpAmp)) || self.member_ptr_declarator(j) {
+                        // `void (*callback)(int)`, `uint64_t (Class::*member)() const`
                         if let Some(nm) = (j + 1..close).rev().find(|&x| self.t[x].kind == K::Ident) {
                             name = Some(nm);
                             chain = nm;

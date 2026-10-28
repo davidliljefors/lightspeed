@@ -17,6 +17,11 @@ impl Query<'_> {
 
     /// [`Self::definition`] for the identifier token `toks[i]` of an already lexed file.
     pub(super) fn definition_in(&self, toks: &[Token], path: &str, text: &str, i: usize) -> Vec<SymbolId> {
+        self.definition_of_kind(toks, path, text, i, &|_| true)
+    }
+
+    /// [`Self::definition_in`] considering only symbols whose kind satisfies `kind_ok`.
+    pub(super) fn definition_of_kind(&self, toks: &[Token], path: &str, text: &str, i: usize, kind_ok: &dyn Fn(crate::symbols::SymbolKind) -> bool) -> Vec<SymbolId> {
         let offset = toks[i].start;
         let name = toks[i].text(text);
         let (db, hier) = (&self.idx.db, &self.idx.hier);
@@ -36,7 +41,8 @@ impl Query<'_> {
         let scopes = self.scopes_at(fi, offset);
         let (in_scope, in_bases) = self.scope_set(&scopes);
 
-        let mut cands: Vec<SymbolId> = db.lookup(name).iter().map(|&c| hier.canonical(c)).collect();
+        let elaborated = i > 0 && matches!(toks[i - 1].keyword, crate::lexer::Keyword::Class | crate::lexer::Keyword::Struct | crate::lexer::Keyword::Union | crate::lexer::Keyword::Enum);
+        let mut cands: Vec<SymbolId> = db.lookup(name).iter().map(|&c| hier.canonical(c)).filter(|&c| kind_ok(db.symbol(c).kind) && (!elaborated || db.symbol(c).kind.is_type())).collect();
         if member {
             let recv = toks[i - 1].start;
             let types = self.receiver_types(path, text, recv, &scopes);
@@ -111,6 +117,13 @@ impl Query<'_> {
         }
         if !member && qual.is_empty() && !(i > 0 && toks[i - 1].kind == TokenKind::ColonColon) {
             cands.retain(|&c| db.symbol(c).kind.is_callable() || self.visible_unqualified(c, &in_scope, &in_bases, || decls_at()));
+            // A bare name never reaches a method of a class we are not inside of when something else can be meant.
+            let in_class = |c: SymbolId| db.symbol(c).parent.is_some_and(|p| db.symbol(p).kind.is_record());
+            let reachable = |c: SymbolId| db.symbol(c).parent.is_some_and(|p| in_scope.iter().any(|&x| self.same_scope(x, p)) || in_bases.contains(&p));
+            let kept: Vec<SymbolId> = cands.iter().copied().filter(|&c| !(db.symbol(c).kind.is_callable() && in_class(c) && !reachable(c))).collect();
+            if !kept.is_empty() {
+                cands = kept;
+            }
         }
 
         let mut best: (i32, Vec<SymbolId>) = (i32::MIN, Vec::new());

@@ -21,6 +21,29 @@ pub struct SymbolRefs {
     pub uncertain: Vec<Location>,
 }
 
+/// Symbols of different classes never share references, whatever their spelling.
+fn kind_class(k: SymbolKind) -> u8 {
+    use SymbolKind::*;
+    match k {
+        Method | Constructor | Destructor => 1,
+        Function => 2,
+        Field | Variable => 3,
+        Class | Struct | Union | Enum | TypeAlias => 4,
+        Namespace => 5,
+        EnumConstant => 6,
+        Macro => 7,
+    }
+}
+
+/// `goto name;` or a `name:` label at the start of a statement.
+fn is_label(toks: &[crate::lexer::Token], text: &str, i: usize) -> bool {
+    let prev = i.checked_sub(1).map(|p| &toks[p]);
+    if prev.is_some_and(|p| p.kind == K::Ident && p.text(text) == "goto") {
+        return true;
+    }
+    toks.get(i + 1).is_some_and(|n| n.kind == K::Colon) && prev.is_none_or(|p| matches!(p.kind, K::Semi | K::LBrace | K::RBrace))
+}
+
 impl Query<'_> {
     /// All symbols equivalent to `id` for renaming purposes.
     fn equivalents(&self, id: SymbolId, out: &mut Vec<SymbolId>) {
@@ -59,10 +82,16 @@ impl Query<'_> {
             return None;
         }
         let name = toks[hit].text(text);
-        let seeds = self.definition_in(&toks, path, text, hit);
+        let at_decl: Vec<SymbolId> = match self.idx.file_index(path) {
+            // The name being declared here is the symbol; no need to guess from its spelling.
+            Some(f) => self.idx.db.lookup(name).iter().copied().filter(|&c| self.location(c).is_some_and(|l| l.file as usize == f && l.start == toks[hit].start)).collect(),
+            None => Vec::new(),
+        };
+        let seeds = if at_decl.is_empty() { self.definition_in(&toks, path, text, hit) } else { at_decl };
         if seeds.is_empty() {
             return None;
         }
+        let class = kind_class(self.idx.db.symbol(seeds[0]).kind);
         let mut targets = Vec::new();
         for s in seeds {
             self.equivalents(s, &mut targets);
@@ -71,6 +100,9 @@ impl Query<'_> {
         targets.dedup();
         let mut decl_sites: Vec<Location> = targets.iter().filter_map(|&t| self.location(t)).collect();
         decl_sites.sort_unstable();
+        // Declarations of other symbols with this spelling are never occurrences of ours.
+        let mut other_sites: Vec<Location> = self.idx.db.lookup(name).iter().filter(|c| targets.binary_search(c).is_err()).filter_map(|&c| self.location(c)).collect();
+        other_sites.sort_unstable();
 
         let files: Vec<(usize, &str)> =
             self.idx.live_files().filter(|(_, f)| f.may_contain(name)).map(|(i, f)| (i, f.path.as_str())).collect();
@@ -93,11 +125,23 @@ impl Query<'_> {
                         certain.push(loc);
                         continue;
                     }
+                    if other_sites.binary_search_by(|d| (d.file, d.start).cmp(&(loc.file, loc.start))).is_ok() {
+                        continue;
+                    }
                     let scoped = i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow | K::ColonColon);
                     if !scoped && self.local_in(&toks, path, text, i).is_some() {
                         continue;
                     }
-                    let r = self.definition_in(&toks, path, text, i);
+                    if is_label(&toks, text, i) {
+                        continue;
+                    }
+                    let mut r = self.definition_in(&toks, path, text, i);
+                    // A different kind of symbol with the same spelling is never this symbol.
+                    let had = !r.is_empty();
+                    r.retain(|c| targets.binary_search(c).is_ok() || kind_class(self.idx.db.symbol(*c).kind) == class);
+                    if had && r.is_empty() {
+                        continue;
+                    }
                     let inside = r.iter().filter(|c| targets.binary_search(c).is_ok()).count();
                     if r.is_empty() || (inside > 0 && inside < r.len()) {
                         uncertain.push(loc);

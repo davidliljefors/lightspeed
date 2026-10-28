@@ -3,6 +3,7 @@
 mod completion;
 mod hierarchy;
 mod hover;
+mod links;
 mod navigation;
 mod rename;
 mod semantic_tokens;

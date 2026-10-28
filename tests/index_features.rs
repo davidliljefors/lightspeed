@@ -187,6 +187,64 @@ int use(Thing* t, Other& o, Base* b) { b->tick(1); t->tick(2); o.tick(3); o.coun
 }
 
 #[test]
+fn references_to_a_method_only_return_methods() {
+    let src = "struct Job { void done(); int n; };\n\
+struct Flags { bool done; };\n\
+void done();\n\
+void Job::done() { n = 1; }\n\
+void run(Job& j, Flags& f, int k) {\n  j.done(); f.done = true; done();\n  int done = 0; done++;\n  if (k) goto done;\n  k = 2;\ndone:\n  return;\n}\n\
+void other(Job* j) { j->done(); auto done = [] {}; done(); }\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let nth = |needle: &str, n: usize| src.match_indices(needle).nth(n).unwrap().0 as u32;
+    let r = q.symbol_refs(&p, src, nth("done", 0) + 1).unwrap();
+    let all: Vec<u32> = r.certain.iter().chain(&r.uncertain).map(|l| l.start).collect();
+    let want = [nth("done();", 0), nth("Job::done", 0) + 5, nth("j.done", 0) + 2, nth("j->done", 0) + 3];
+    let mut want = want.to_vec();
+    want.sort_unstable();
+    assert_eq!(all.iter().copied().collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>(), want, "certain {:?} uncertain {:?}", r.certain.iter().map(|l| l.start).collect::<Vec<_>>(), r.uncertain.iter().map(|l| l.start).collect::<Vec<_>>());
+}
+
+#[test]
+fn references_never_cross_symbol_kinds() {
+    // (source, [(occurrence of `zed` to click, occurrences that must be returned)])
+    type Case = (&'static str, &'static [(usize, &'static [usize])]);
+    let cases: &[Case] = &[
+        // type vs function
+        ("struct zed { int a; };\nint zed(int);\nvoid f() { struct zed v; zed(1); }\n", &[(0, &[0, 2]), (1, &[1, 3])]),
+        // global variable vs field
+        ("int zed;\nstruct S { int zed; void m(); };\nvoid S::m() { zed = 1; }\nvoid g(S& s) { zed = 2; s.zed = 3; }\n", &[(0, &[0, 3]), (1, &[1, 2, 4])]),
+        // enum constant vs field
+        ("enum E { zed };\nstruct T { int zed; };\nint f(T t) { return zed + t.zed; }\n", &[(0, &[0, 2]), (1, &[1, 3])]),
+        // namespace vs field
+        ("namespace zed { int q; }\nint f() { return zed::q; }\nstruct S { int zed; };\n", &[(0, &[0, 1]), (2, &[2])]),
+        // alias vs field
+        ("using zed = int;\nstruct S { int zed; };\nzed a;\n", &[(0, &[0, 2]), (1, &[1])]),
+        // functions in different namespaces
+        ("namespace A { void zed(); }\nnamespace B { void zed(); }\nvoid f() { A::zed(); B::zed(); }\n", &[(0, &[0, 2]), (1, &[1, 3])]),
+        // class with its constructor and destructor vs a method of another class
+        ("struct zed { zed(); ~zed(); };\nzed::zed() {}\nzed::~zed() {}\nstruct O { void zed(); };\nvoid f(O& o) { zed a; o.zed(); }\n", &[(0, &[0, 1, 2, 3, 4, 5, 6, 8]), (7, &[7, 9])]),
+        // method vs field of another class vs label
+        ("struct A { void zed(); };\nstruct B { int zed; };\nvoid f(A& a, B& b, int k) { a.zed(); b.zed = 1; if (k) goto zed; k = 2;\nzed: return; }\n", &[(0, &[0, 2]), (1, &[1, 3])]),
+    ];
+    for (n, (src, clicks)) in cases.iter().enumerate() {
+        let ws = Ws::new(&[("a.cpp", src)], &[]);
+        let idx = ws.index(&["a.cpp"]);
+        let q = Query::new(&idx, &DiskText);
+        let p = ws.path("a.cpp");
+        let at: Vec<u32> = src.match_indices("zed").map(|(o, _)| o as u32).collect();
+        for &(click, want) in *clicks {
+            let r = q.symbol_refs(&p, src, at[click] + 1).unwrap_or_else(|| panic!("case {n}: nothing at occurrence {click}"));
+            let mut got: Vec<usize> = r.certain.iter().chain(&r.uncertain).map(|l| at.iter().position(|&o| o == l.start).unwrap()).collect();
+            got.sort_unstable();
+            assert_eq!(got, want, "case {n}, from occurrence {click}: {src}");
+        }
+    }
+}
+
+#[test]
 fn symbol_refs_cover_macros_and_enum_constants() {
     let hdr = "#pragma once\n#define MAX_ITEMS 16\n#define SQUARE(x) ((x) * (x))\nenum class Mode { Fast, Slow };\nenum Plain { Fast, Other };\n";
     let src = "#include \"h.h\"\nint a[MAX_ITEMS];\nint f(int v) { return SQUARE(v) + MAX_ITEMS; }\n\
@@ -261,7 +319,7 @@ fn forward_declarations_are_not_listed_and_do_not_change_colour() {
     // `Widget` is declared `class` in the header but defined as a struct.
     assert_eq!(ty_at("Widget", 1), ty_at("Widget", 0));
     assert_eq!(ty_at("Gadget", 1), ty_at("Gadget", 0));
-    assert_ne!(ty_at("Widget", 1), ty_at("Gadget", 1), "struct vs class definitions keep their own colour");
+    assert_eq!(ty_at("Widget", 1), ty_at("Gadget", 1), "struct and class definitions share a colour");
 }
 
 #[test]
@@ -293,4 +351,69 @@ fn hover_reports_declaration_docs_and_hierarchy() {
     assert!(h.notes.iter().any(|n| n.contains("1 direct subclass")), "{:?}", h.notes);
 
     assert!(q.hover(&p, "   ", 1).is_none());
+}
+
+#[test]
+fn forward_declared_names_stay_types_next_to_their_constructors() {
+    let a = "class Ctx;\nstruct Both;\nCtx::Ctx() {}\nBoth::Both() {}\nenum class E;\nvoid f(Ctx* c, Both* b, E e);\n";
+    let b = "class Ctx { public: Ctx(); };\nstruct Both { Both(); };\nenum class E { X };\n";
+    let ws = Ws::new(&[("a.cpp", a), ("b.cpp", b)], &[]);
+    let idx = ws.index(&["a.cpp", "b.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let toks = q.semantic_tokens(&ws.path("a.cpp"), a, None);
+    let ty_at = |needle: &str, nth: usize| {
+        let at = a.match_indices(needle).nth(nth).unwrap().0 as u32;
+        toks.iter().find(|t| t.start == at).map(|t| t.ty)
+    };
+    let (class, strukt, enm) = (Some(1), Some(1), Some(3));
+    // Forward declarations and parameter types are types, never the constructor's method colour.
+    assert_eq!((ty_at("Ctx", 0), ty_at("Ctx", 3)), (class, class));
+    assert_eq!((ty_at("Both", 0), ty_at("Both", 3)), (strukt, strukt));
+    assert_eq!(ty_at("E;", 0), enm);
+    assert_eq!(ty_at("E e", 0), enm);
+}
+
+#[test]
+fn same_named_symbols_elsewhere_do_not_change_a_typedef_colour() {
+    let a = "namespace ns {\ntypedef unsigned u32;\nstruct V { u32 x[4]; };\nu32 f(u32 a);\n}\n";
+    let b = "struct Other { int u32; };\nnamespace lib { int u32; }\nenum { u32 = 1 };\n";
+    for order in [["a.cpp", "b.cpp"], ["b.cpp", "a.cpp"]] {
+        let ws = Ws::new(&[("a.cpp", a), ("b.cpp", b)], &[]);
+        let idx = ws.index(&order);
+        let q = Query::new(&idx, &DiskText);
+        let toks = q.semantic_tokens(&ws.path("a.cpp"), a, None);
+        // Declaration, member type, return type and parameter type all name `ns::u32`.
+        for n in 0..4 {
+            let at = a.match_indices("u32").nth(n).unwrap().0 as u32;
+            assert_eq!(toks.iter().find(|t| t.start == at).map(|t| t.ty), Some(9), "use {n}, order {order:?}");
+        }
+    }
+}
+
+#[test]
+fn include_names_are_one_string_token() {
+    let src = "namespace core { int utils; }\n#include <pkg.core/utils.h>\n  # include \"core/utils.h\"\nint x = utils;\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let toks = q.semantic_tokens(&ws.path("a.cpp"), src, None);
+    let at = |needle: &str| src.find(needle).unwrap() as u32;
+    let strings: Vec<_> = toks.iter().filter(|t| t.ty == 13).map(|t| (t.start, t.len)).collect();
+    assert_eq!(strings, [(at("pkg.core"), 16), (at("core/utils.h\""), 12)]);
+    // Nothing inside the directives is classified separately; later code is unaffected.
+    assert!(toks.iter().all(|t| t.ty == 13 || t.start < at("#include") || t.start > at("int x")), "{toks:?}");
+    assert!(toks.windows(2).all(|w| w[0].start < w[1].start));
+    assert!(toks.iter().any(|t| t.start == at("utils;")));
+}
+
+#[test]
+fn include_lookalikes_in_comments_and_raw_strings_are_not_strings() {
+    let src = "/*\n#include <in_block.h>\n*/\nconst char* a = R\"x(\n#include <in_raw.h>\n)x\";\nconst char* b = \"\\\n#include <in_str.h>\";\n// #include <in_line.h>\n// continued \\\n#include <in_cont.h>\n#include <real.h> // #include <tail.h>\nint z;\n";
+    let ws = Ws::new(&[("a.cpp", src)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let toks = q.semantic_tokens(&ws.path("a.cpp"), src, None);
+    let at = |needle: &str| src.find(needle).unwrap() as u32;
+    let strings: Vec<_> = toks.iter().filter(|t| t.ty == 13).map(|t| t.start).collect();
+    assert_eq!(strings, [at("real.h")]);
 }

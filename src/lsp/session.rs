@@ -107,6 +107,9 @@ impl Server {
                             idx.warm(&d.path, &d.text);
                         }
                     }
+                    for (id, p) in std::mem::take(&mut self.deferred_links) {
+                        out.push(super::transport::respond(&id, self.document_links(&p).unwrap_or_else(|| json!([]))));
+                    }
                 }
                 Ok(Msg::Eof) | Err(RecvTimeoutError::Disconnected) => return i32::from(!self.shutdown),
                 Err(RecvTimeoutError::Timeout) => {

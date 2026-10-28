@@ -131,6 +131,36 @@ fn definition_references_and_live_edits() {
 }
 
 #[test]
+fn includes_are_document_links() {
+    let (_d, root) = tmp();
+    let (q, s) = (format!("{root}/q.h"), format!("{root}/sys.h"));
+    std::fs::write(&q, "#pragma once\n").unwrap();
+    std::fs::write(&s, "#pragma once\n").unwrap();
+    let a = format!("{root}/a.cpp");
+    let txt = "#include \"q.h\"\n  #  include <sys.h>\n#include \"missing.h\"\n#define H \"q.h\"\n#include H\n#if 0\n#include \"q.h\"\n#endif\nint x;\n";
+    std::fs::write(&a, txt).unwrap();
+    common::write_cdb(&root, true);
+
+    let mut c = Client::new(&root);
+    c.open(&a, txt);
+    let r = c.request("textDocument/documentLink", json!({"textDocument": {"uri": path_to_uri(&a)}}));
+    let links = r["result"].as_array().unwrap();
+    assert_eq!(links.len(), 2, "{r}");
+    let span = |l: &Value| {
+        let (line, s, e) = (l["range"]["start"]["line"].as_u64().unwrap() as usize, l["range"]["start"]["character"].as_u64().unwrap() as usize, l["range"]["end"]["character"].as_u64().unwrap() as usize);
+        txt.lines().nth(line).unwrap()[s..e].to_owned()
+    };
+    assert_eq!((span(&links[0]), links[0]["target"].clone()), ("q.h".to_owned(), json!(path_to_uri(&q))));
+    assert_eq!((span(&links[1]), links[1]["target"].clone()), ("sys.h".to_owned(), json!(path_to_uri(&s))));
+
+    // Edits shift the links with the buffer.
+    let edited = format!("// new\n{txt}");
+    c.change(&a, &edited);
+    let r = c.request("textDocument/documentLink", json!({"textDocument": {"uri": path_to_uri(&a)}}));
+    assert_eq!(r["result"][0]["range"]["start"]["line"], 1, "{r}");
+}
+
+#[test]
 fn type_hierarchy_and_inheritance_graph_over_rpc() {
     let (_d, root) = tmp();
     let a = format!("{root}/a.cpp");
@@ -266,7 +296,7 @@ fn declaration_implementation_and_type_definition_over_rpc() {
 
 /// Decodes `semanticTokens` data into `(line, col, len, type name, modifier bits)`.
 fn decode_tokens(r: &Value) -> Vec<(u32, u32, u32, String, u32)> {
-    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter", "typeParameter"];
+    let legend = ["namespace", "class", "struct", "enum", "enumMember", "function", "method", "property", "macro", "type", "variable", "parameter", "typeParameter", "string"];
     let d: Vec<u32> = r["result"]["data"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
     let (mut line, mut col) = (0, 0);
     d.chunks(5)
@@ -293,7 +323,7 @@ fn semantic_tokens_over_rpc() {
     let all = decode_tokens(&c.request("textDocument/semanticTokens/full", json!({"textDocument": doc})));
     let find = |line: u32, col: u32| all.iter().find(|t| t.0 == line && t.1 == col).unwrap_or_else(|| panic!("no token at {line}:{col}: {all:?}"));
     assert_eq!(find(1, 10).3, "namespace");
-    assert_eq!(find(1, 21).3, "struct");
+    assert_eq!(find(1, 21).3, "class"); // structs share the class colour
     assert_eq!((find(1, 36).3.as_str(), find(1, 36).4), ("variable", 1 | 8)); // static data member `count`, declared here
     assert_eq!((find(1, 56).3.as_str(), find(1, 56).4), ("method", 4 | 8)); // pure virtual run, declared here
     assert_eq!(find(3, 18).3, "macro"); // after the multi-byte comment, still the right UTF-16 column
@@ -330,14 +360,14 @@ fn semantic_tokens_template_parameters_shadow_same_named_types() {
     c.open(&a, txt);
     let all = decode_tokens(&c.request("textDocument/semanticTokens/full", json!({"textDocument": {"uri": path_to_uri(&a)}})));
     let ty = |line: u32, col: u32| all.iter().find(|t| t.0 == line && t.1 == col).unwrap_or_else(|| panic!("no token at {line}:{col}: {all:?}")).3.clone();
-    assert_eq!(ty(0, 7), "struct");
+    assert_eq!(ty(0, 7), "class");
     assert_eq!(all.iter().find(|t| (t.0, t.1) == (1, 19)).unwrap().4, 8, "template parameter declaration");
     assert_eq!(all.iter().find(|t| (t.0, t.1) == (1, 42)).unwrap().4, 0, "template parameter use");
     for (l, c) in [(1, 19), (1, 26), (1, 42), (1, 50), (2, 16), (2, 19), (2, 27), (2, 34)] {
         assert_eq!(ty(l, c), "typeParameter", "{l}:{c}");
     }
     assert_eq!(ty(2, 36), "variable");
-    assert_eq!(ty(3, 0), "struct", "outside the template the global type is meant");
+    assert_eq!(ty(3, 0), "class", "outside the template the global type is meant");
 }
 
 #[test]
@@ -831,4 +861,29 @@ fn stdio_smoke_test() {
     let mut rest = String::new();
     let _ = stdout.read_to_string(&mut rest);
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn document_link_asked_during_startup_is_answered_after_the_build() {
+    let (_d, root) = tmp();
+    std::fs::write(format!("{root}/q.h"), "#pragma once\n").unwrap();
+    let a = format!("{root}/a.cpp");
+    let txt = "#include \"q.h\"\nint x;\n";
+    std::fs::write(&a, txt).unwrap();
+    common::write_cdb(&root, true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lightspeed")).arg("lsp").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": path_to_uri(&root)}})).unwrap();
+    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": path_to_uri(&a), "text": txt}}})).unwrap();
+    write_frame(&mut stdin, &json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentLink", "params": {"textDocument": {"uri": path_to_uri(&a)}}})).unwrap();
+    let r = loop {
+        let v: Value = serde_json::from_slice(&read_frame(&mut stdout).unwrap().unwrap()).unwrap();
+        if v["id"] == 2 && v.get("method").is_none() {
+            break v;
+        }
+    };
+    assert_eq!(r["result"].as_array().map(Vec::len), Some(1), "{r}");
+    let _ = child.kill();
+    let _ = child.wait();
 }
