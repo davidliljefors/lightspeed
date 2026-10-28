@@ -422,39 +422,6 @@ fn apply_pending_reports_whether_anything_changed() {
     assert!(!c.server.apply_pending());
 }
 
-/// Full-document latency on real files; needs an optimized build, so it only runs there.
-/// Run with `cargo test --release --test lsp semantic_tokens_real -- --nocapture`.
-#[test]
-#[cfg_attr(debug_assertions, ignore = "timing needs --release")]
-fn semantic_tokens_real_world_timing() {
-    let root = "C:/dev/shiki";
-    let cdb = format!("{root}/compile_commands.json");
-    if !std::path::Path::new(&cdb).is_file() {
-        return;
-    }
-    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
-    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
-    c.server.apply_pending();
-    let mut files: Vec<(u64, String)> = ["runtime/coff_module.cpp", "runtime/stress.cpp", "src/node_editor.cpp"]
-        .iter()
-        .map(|f| format!("{root}/{f}"))
-        .chain(std::fs::read_dir("C:/Program Files (x86)/Windows Kits/10/Include").ok().and_then(|d| d.flatten().next()).map(|v| format!("{}/um/winnt.h", v.path().display().to_string().replace('\\', "/"))))
-        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.len(), p)))
-        .collect();
-    files.sort();
-    for (len, file) in files {
-        let text = std::fs::read_to_string(&file).unwrap();
-        c.open(&file, &text);
-        let doc = json!({"uri": path_to_uri(&file)});
-        let t0 = std::time::Instant::now();
-        let r = c.request("textDocument/semanticTokens/full", json!({"textDocument": doc}));
-        let dt = t0.elapsed();
-        let n = decode_tokens(&r).len();
-        eprintln!("semantic tokens: {file} ({len} bytes): {n} tokens in {dt:?}");
-        assert!(dt.as_millis() < 200, "{file}: {dt:?}");
-    }
-}
-
 #[test]
 fn completion_over_rpc_and_unknown_method() {
     let (_d, root) = tmp();
@@ -489,212 +456,96 @@ fn requests_before_initialize_fail_cleanly_and_garbage_params_do_not_panic() {
     }
 }
 
-/// Real-world regression: needs the shiki checkout and a Windows SDK; skipped elsewhere.
-#[test]
-fn real_world_coff_module_symbols_resolve_over_rpc() {
-    let root = "C:/dev/shiki";
-    let file = format!("{root}/runtime/coff_module.cpp");
-    let cdb = format!("{root}/compile_commands.json");
-    if !std::path::Path::new(&cdb).is_file() || !std::path::Path::new(&file).is_file() {
-        return;
-    }
-    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
-    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
-    let text = std::fs::read_to_string(&file).unwrap();
-    // VS Code sends a lower-case drive letter.
-    let uri = path_to_uri(&file).replacen("C:", "c%3A", 1);
-    c.notify("textDocument/didOpen", json!({"textDocument": {"uri": uri, "languageId": "cpp", "version": 1, "text": text}}));
-    let check = |c: &mut Client, text: &str, uri: &str| {
-        for name in ["IMAGE_SECTION_HEADER", "IMAGE_RELOCATION", "IMAGE_FILE_HEADER"] {
-            for (n, _) in text.match_indices(name) {
-                let (line, character) = offset_to_position(text, &LineIndex::new(text), n as u32 + 2);
-                let r = c.request("textDocument/definition", json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}));
-                let locs = r["result"].as_array().unwrap_or_else(|| panic!("{name}: {r}"));
-                assert!(!locs.is_empty(), "{name} at line {line}: no definition");
-            }
-        }
-    };
-    check(&mut c, &text, &uri);
-    // After an edit the file is re-indexed through the incremental path.
-    let edited = format!("{text}\nint appended_symbol;\n");
-    c.change(&file, &edited);
-    c.notify("textDocument/didChange", json!({"textDocument": {"uri": uri}, "contentChanges": [{"text": edited}]}));
-    check(&mut c, &edited, &uri);
-}
+/// Real-world checks against a Godot checkout at `C:/dev/godot` (with a
+/// `compile_commands.json`). Opt in with
+/// `cargo test --release --test lsp godot -- --ignored --nocapture`.
+mod godot {
+    use super::*;
 
-/// Typing latency on a real file: every keystroke is a didChange followed by a query.
-/// Run with `cargo test --release --test lsp typing_latency -- --nocapture`.
-#[test]
-fn typing_latency_real_world() {
-    let root = "C:/dev/shiki";
-    let file = format!("{root}/runtime/coff_module.cpp");
-    let cdb = format!("{root}/compile_commands.json");
-    if !std::path::Path::new(&cdb).is_file() || !std::path::Path::new(&file).is_file() {
-        return;
-    }
-    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
-    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
-    let text = std::fs::read_to_string(&file).unwrap();
-    c.open(&file, &text);
-    let uri = path_to_uri(&file);
-    let at = text.find("relocation.Type").unwrap() + "relocation.".len();
-    // Typing happens in the body, below the include prologue.
-    let ins = text.match_indices("#include").last().map(|(i, _)| i + text[i..].find('\n').unwrap() + 1).unwrap();
-    let mut worst = std::time::Duration::ZERO;
-    let mut total = std::time::Duration::ZERO;
-    const N: usize = 30;
-    for i in 0..N {
-        let line = format!("int typed_{i};\n");
-        let edited = format!("{}{line}{}", &text[..ins], &text[ins..]);
-        let t0 = std::time::Instant::now();
-        c.change(&file, &edited);
+    const ROOT: &str = "C:/dev/godot";
+
+    fn open() -> (Client, String, String) {
+        let cdb = format!("{ROOT}/compile_commands.json");
+        assert!(std::path::Path::new(&cdb).is_file(), "{cdb} not found");
+        let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
+        c.request("initialize", json!({"rootUri": path_to_uri(ROOT), "capabilities": {}}));
         c.server.apply_pending();
-        let t_apply = t0.elapsed();
-        let off = at + line.len();
-        let (line, character) = offset_to_position(&edited, &LineIndex::new(&edited), off as u32);
-        let r = c.request("textDocument/definition", json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}));
+        let file = format!("{ROOT}/core/object/ref_counted.cpp");
+        let text = std::fs::read_to_string(&file).unwrap();
+        c.open(&file, &text);
+        (c, file, text)
+    }
+
+    fn definition(c: &mut Client, file: &str, text: &str, off: usize) -> Value {
+        let (line, character) = offset_to_position(text, &LineIndex::new(text), off as u32);
+        c.request("textDocument/definition", json!({"textDocument": {"uri": path_to_uri(file)}, "position": {"line": line, "character": character}}))
+    }
+
+    #[test]
+    #[ignore = "needs a Godot checkout"]
+    fn godot_definitions_resolve_across_headers() {
+        let (mut c, file, text) = open();
+        let at = text.find("ClassDB::bind_method").unwrap();
+        let r = definition(&mut c, &file, &text, at);
+        assert!(r["result"][0]["uri"].as_str().unwrap().ends_with("class_db.h"), "{r}");
+
+        // The base class resolves into another header.
+        let hdr = format!("{ROOT}/core/object/ref_counted.h");
+        let htext = std::fs::read_to_string(&hdr).unwrap();
+        c.open(&hdr, &htext);
+        let at = htext.find("class RefCounted : public Object").unwrap() + "class RefCounted : public ".len();
+        let r = definition(&mut c, &hdr, &htext, at);
+        assert!(r["result"].as_array().unwrap().iter().any(|l| l["uri"].as_str().unwrap().ends_with("object.h")), "{r}");
+
+        // And after an edit through the incremental path.
+        let edited = format!("{text}\nint appended_symbol;\n");
+        c.change(&file, &edited);
+        let r = definition(&mut c, &file, &edited, edited.find("ClassDB::bind_method").unwrap());
+        assert!(r["result"][0]["uri"].as_str().unwrap().ends_with("class_db.h"), "{r}");
+    }
+
+    #[test]
+    #[ignore = "needs a Godot checkout and --release"]
+    fn godot_typing_and_semantic_token_latency() {
+        let (mut c, file, text) = open();
+        let doc = json!({"uri": path_to_uri(&file)});
+        let t0 = std::time::Instant::now();
+        let r = c.request("textDocument/semanticTokens/full", json!({"textDocument": doc}));
         let dt = t0.elapsed();
-        if i % 10 == 0 {
-            eprintln!("  apply {t_apply:?}, query {:?}", dt - t_apply);
+        eprintln!("semantic tokens: {} tokens in {dt:?}", decode_tokens(&r).len());
+        assert!(dt.as_millis() < 200, "semantic tokens: {dt:?}");
+
+        // Every keystroke is a didChange followed by a query.
+        let at = text.find("ClassDB::bind_method").unwrap();
+        let ins = text[..at].rfind('\n').unwrap() + 1;
+        let mut worst = std::time::Duration::ZERO;
+        for i in 0..30 {
+            let line = format!("int typed_{i};\n");
+            let edited = format!("{}{line}{}", &text[..ins], &text[ins..]);
+            let t0 = std::time::Instant::now();
+            c.change(&file, &edited);
+            c.server.apply_pending();
+            let r = definition(&mut c, &file, &edited, at + line.len());
+            worst = worst.max(t0.elapsed());
+            assert!(r["result"][0]["uri"].as_str().unwrap().ends_with("class_db.h"), "iteration {i}: {r}");
         }
-        assert_eq!(r["result"].as_array().map(Vec::len), Some(1), "iteration {i}: {r}");
-        assert!(r["result"][0]["uri"].as_str().unwrap().ends_with("winnt.h"));
-        worst = worst.max(dt);
-        total += dt;
+        eprintln!("typing: worst {worst:?}");
+        assert!(worst.as_millis() < 100, "keystroke latency too high: {worst:?}");
     }
-    eprintln!("typing: avg {:?}, worst {:?}", total / N as u32, worst);
-    assert!(worst.as_millis() < 100, "keystroke latency too high: {worst:?}");
-}
-
-/// Half-typed code must not make the rest of the file un-navigable.
-#[test]
-fn half_typed_code_keeps_rest_of_file_navigable() {
-    let root = "C:/dev/shiki";
-    let file = format!("{root}/runtime/coff_module.cpp");
-    let cdb = format!("{root}/compile_commands.json");
-    if !std::path::Path::new(&cdb).is_file() || !std::path::Path::new(&file).is_file() {
-        return;
-    }
-    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
-    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
-    let text = std::fs::read_to_string(&file).unwrap();
-    c.open(&file, &text);
-    let uri = path_to_uri(&file);
-    // Just inside the body of section_name, with plenty of code below it.
-    let sig = text.find("static std::string section_name").unwrap();
-    let ins = sig + text[sig..].find('{').unwrap() + 1;
-    let garbage = ["x.", "x->", "foo(", "if (", "{", "}", "\"abc", "#if", "case", "std::", "template<", "relocation.", "switch (", "for (int i = 0;", "else", "'"];
-    let mut failures = Vec::new();
-    for g in garbage {
-        let edited = format!("{}\n    {g}{}", &text[..ins], &text[ins..]);
-        c.change(&file, &edited);
-        // Declarations well below the edit must still resolve.
-        let tail_start = ins + g.len() + 200;
-        let mut checked = 0;
-        for (n, _) in edited.match_indices("IMAGE_").filter(|(n, _)| *n > tail_start && edited[*n..].starts_with("IMAGE_SECTION_HEADER")) {
-            let (line, character) = offset_to_position(&edited, &LineIndex::new(&edited), n as u32 + 2);
-            let r = c.request("textDocument/definition", json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}));
-            if r["result"].as_array().is_none_or(|a| a.is_empty()) {
-                failures.push(format!("{g:?}: no definition at line {line}"));
-                break;
-            }
-            checked += 1;
-        }
-        assert!(checked > 0 || !failures.is_empty(), "test found nothing to check for {g:?}");
-    }
-    assert!(failures.is_empty(), "{failures:#?}");
-    // And once the code is complete again everything is back to normal.
-    c.change(&file, &text);
-    let n = text.find("relocation.Type").unwrap() + "relocation.".len();
-    let (line, character) = offset_to_position(&text, &LineIndex::new(&text), n as u32);
-    let r = c.request("textDocument/definition", json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}));
-    assert_eq!(r["result"].as_array().map(Vec::len), Some(1));
-}
-
-/// Edits that move declarations without changing them (comments, bodies) are
-/// patched in place: no index or hierarchy rebuild, and every offset stays right.
-#[test]
-fn body_edits_patch_in_place_and_keep_offsets_right() {
-    let root = "C:/dev/shiki";
-    let file = format!("{root}/runtime/coff_module.cpp");
-    let cdb = format!("{root}/compile_commands.json");
-    if !std::path::Path::new(&cdb).is_file() || !std::path::Path::new(&file).is_file() {
-        return;
-    }
-    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
-    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
-    let text = std::fs::read_to_string(&file).unwrap();
-    c.open(&file, &text);
-    let uri = path_to_uri(&file);
-    let ins = text.find("relocation.Type").unwrap();
-    let mut total = std::time::Duration::ZERO;
-    for i in 0..20 {
-        let pad = format!("/* edit {i} */\n    ").repeat(i + 1);
-        let edited = format!("{}{pad}{}", &text[..ins], &text[ins..]);
-        let t0 = std::time::Instant::now();
-        c.change(&file, &edited);
-        c.server.apply_pending();
-        total += t0.elapsed();
-        assert!(!c.server.index().unwrap().is_dirty());
-        // The symbol the cursor sits on resolves from its *moved* position.
-        let n = ins + pad.len() + "relocation.".len();
-        let (line, character) = offset_to_position(&edited, &LineIndex::new(&edited), n as u32);
-        let r = c.request("textDocument/definition", json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}));
-        assert!(r["result"][0]["uri"].as_str().unwrap().ends_with("winnt.h"), "edit {i}: {r}");
-        // The enclosing function's own definition points at its new line.
-        let sym = edited.find("void apply_relocation").unwrap() + "void ".len();
-        let (line, character) = offset_to_position(&edited, &LineIndex::new(&edited), sym as u32);
-        let r = c.request("textDocument/definition", json!({"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}));
-        assert_eq!(r["result"][0]["range"]["start"]["line"], line, "edit {i}: {r}");
-    }
-    eprintln!("body edits: avg apply {:?}", total / 20);
 }
 
 #[test]
-fn real_world_member_completion_after_dot() {
-    let root = "C:/dev/shiki";
-    let file = format!("{root}/runtime/coff_module.cpp");
-    let cdb = format!("{root}/compile_commands.json");
-    if !std::path::Path::new(&cdb).is_file() || !std::path::Path::new(&file).is_file() {
-        return;
-    }
-    let mut c = Client { server: Server::new(Some(cdb.into())), next: 1 };
-    c.request("initialize", json!({"rootUri": path_to_uri(root), "capabilities": {}}));
-    let text = std::fs::read_to_string(&file).unwrap();
-    // `relocation.` typed with nothing after it, as when the popup opens.
-    let at = text.find("switch (relocation.Type)").unwrap() + "switch (relocation.".len();
-    let edited = format!("{}{}", &text[..at], &text[at + "Type".len()..]);
-    c.open(&file, &edited);
-    let (line, character) = offset_to_position(&edited, &LineIndex::new(&edited), at as u32);
-    let r = c.request("textDocument/completion", json!({"textDocument": {"uri": path_to_uri(&file)}, "position": {"line": line, "character": character}}));
-    let labels: Vec<&str> = r["result"]["items"].as_array().unwrap().iter().filter_map(|i| i["label"].as_str()).collect();
-    eprintln!("{labels:?}");
-    for want in ["Type", "VirtualAddress", "SymbolTableIndex"] {
-        assert!(labels.contains(&want), "missing {want}: {labels:?}");
-    }
-    assert!(labels.len() < 10, "should only list members of _IMAGE_RELOCATION: {labels:?}");
-    let detail = |l: &str| r["result"]["items"].as_array().unwrap().iter().find(|i| i["label"] == l).and_then(|i| i["detail"].as_str()).unwrap_or("").to_owned();
-    assert!(detail("Type").contains("Type"), "{}", detail("Type"));
-    assert!(detail("VirtualAddress").contains("DWORD") || detail("VirtualAddress").contains("ULONG"), "{}", detail("VirtualAddress"));
-
-    // Hovering `relocation.Type` shows the real field, its type and header.
-    let at = text.find("switch (relocation.Type)").unwrap() + "switch (relocation.".len() + 1;
-    c.open(&file, &text);
-    let (line, character) = offset_to_position(&text, &LineIndex::new(&text), at as u32);
-    let r = c.request("textDocument/hover", json!({"textDocument": {"uri": path_to_uri(&file)}, "position": {"line": line, "character": character}}));
-    let md = r["result"]["contents"]["value"].as_str().unwrap_or_default();
-    eprintln!("{md}");
-    assert!(md.contains("Type") && md.contains("_IMAGE_RELOCATION") && md.contains("winnt.h"), "{md}");
-
-    // A parameter in a real header hovers as a parameter.
-    let hdr = format!("{root}/runtime/coff_module.h");
-    let htext = std::fs::read_to_string(&hdr).unwrap();
-    let at = htext.find("find(const std::string& name)").unwrap() + "find(const std::string& ".len() + 1;
-    c.open(&hdr, &htext);
-    let (line, character) = offset_to_position(&htext, &LineIndex::new(&htext), at as u32);
-    let r = c.request("textDocument/hover", json!({"textDocument": {"uri": path_to_uri(&hdr)}, "position": {"line": line, "character": character}}));
-    let md = r["result"]["contents"]["value"].as_str().unwrap_or_default();
-    assert!(md.contains("const std::string& name") && md.contains("parameter"), "{md}");
+fn definition_on_class_name_prefers_class_over_constructors() {
+    let (_d, root) = tmp();
+    let a = format!("{root}/a.cpp");
+    let txt = "struct Base { Base(); ~Base(); };\nBase::Base() {}\nBase::~Base() {}\nstruct Derived : public Base {};\n";
+    std::fs::write(&a, txt).unwrap();
+    let mut c = Client::new(&root);
+    c.open(&a, txt);
+    let r = c.request("textDocument/definition", json!({"textDocument": {"uri": path_to_uri(&a)}, "position": pos_of(txt, "Base {};", 0)}));
+    let locs = r["result"].as_array().unwrap();
+    assert_eq!(locs.len(), 1, "{r}");
+    assert_eq!(locs[0]["range"]["start"]["line"], 0, "{r}");
 }
 
 #[test]

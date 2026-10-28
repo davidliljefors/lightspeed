@@ -126,6 +126,15 @@ impl Query<'_> {
             }
         }
 
+        if arity.is_none() && !member && qual.is_empty() && cands.iter().any(|&c| db.symbol(c).kind.is_record()) {
+            // Without a call, a class name means the class, not its constructors.
+            let is_ctor = |c: SymbolId| {
+                let s = db.symbol(c);
+                s.kind.is_callable() && s.parent.is_some_and(|p| db.symbol(p).kind.is_record() && db.symbol(p).name == s.name)
+            };
+            cands.retain(|&c| !is_ctor(c));
+        }
+
         let mut best: (i32, Vec<SymbolId>) = (i32::MIN, Vec::new());
         for &c in &cands {
             let s = db.symbol(c);
