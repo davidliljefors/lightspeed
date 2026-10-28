@@ -80,6 +80,9 @@ impl Query<'_> {
                 notes.push(format!("virtual family of {n} methods"));
             }
         }
+        if let Some(v) = self.const_value(id) {
+            notes.push(format!("value: {}", v.display()));
+        }
         if s.kind.is_record() {
             let mut bases = Vec::new();
             hier.all_bases(id, &mut bases);

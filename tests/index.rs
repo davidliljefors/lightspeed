@@ -307,6 +307,38 @@ fn std_containers_substitute_template_arguments() {
 }
 
 #[test]
+fn hover_evaluates_constants_macros_and_enums() {
+    let hdr = "#pragma once\nnamespace cfg { constexpr int Base = 40; }\n#define BASE_MACRO (cfg::Base + 2)\n";
+    let src = "#include \"h.h\"\n\
+        #define TWICE (BASE_MACRO * 2)\n#define FN(x) (x)\n\
+        const int a = 5 + cfg::Base;\nstatic constexpr unsigned mask = 1u << 4 | sizeof(int);\n\
+        const int cyc1 = cyc2;\nconst int cyc2 = cyc1;\nint plain = 3;\nconst double d = 1.5 * 2;\n\
+        enum E { A, B = 10, C, D = B + 5, F };\n\
+        struct S { static constexpr int K = a + 1; };\nconst int viaS = S::K * 2;\nconst int call = foo(1);\n\
+        const int u0 = a; const int u1 = TWICE; const int u2 = mask; const int u3 = cyc1; const int u4 = plain;\n\
+        const int u5 = d; const int u6 = C; const int u7 = F; const int u8 = viaS; const int u9 = call; const int u10 = FN;\n";
+    let ws = Ws::new(&[("a.cpp", src), ("h.h", hdr)], &[]);
+    let idx = ws.index(&["a.cpp"]);
+    let q = Query::new(&idx, &DiskText);
+    let p = ws.path("a.cpp");
+    let note = |name: &str| {
+        let off = src.find(&format!("= {name};")).unwrap() as u32 + 2;
+        q.hover(&p, src, off).and_then(|h| h.notes.into_iter().find(|n| n.starts_with("value: ")))
+    };
+    assert_eq!(note("a").as_deref(), Some("value: 45 (0x2D)"));
+    assert_eq!(note("TWICE").as_deref(), Some("value: 84 (0x54)"));
+    assert_eq!(note("mask").as_deref(), Some("value: 20 (0x14)"));
+    assert_eq!(note("cyc1"), None);
+    assert_eq!(note("plain"), None);
+    assert_eq!(note("d").as_deref(), Some("value: 3.0"));
+    assert_eq!(note("C").as_deref(), Some("value: 11"));
+    assert_eq!(note("F").as_deref(), Some("value: 16 (0x10)"));
+    assert_eq!(note("viaS").as_deref(), Some("value: 92 (0x5C)"));
+    assert_eq!(note("call"), None);
+    assert_eq!(note("FN"), None);
+}
+
+#[test]
 fn template_parameters_are_local_names() {
     let src = "struct T {};\ntemplate<class T, int N = 3> struct Box {\n T v; T get(T d) { return d; }\n int arr[N];\n};\n\
                template<typename U> U id(U x) { U y = x; return y; }\n\

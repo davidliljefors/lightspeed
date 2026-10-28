@@ -10,6 +10,7 @@
 //! narrowed by scope, qualifier, member access and call arity.
 
 mod completion;
+mod consteval;
 mod hover;
 mod locals;
 mod refs;

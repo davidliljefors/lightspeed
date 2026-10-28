@@ -322,6 +322,7 @@ fn storm_with(name: &str, mut idx: Index, iters: u64, seed: u64, every: u64) {
 }
 
 #[test]
+#[ignore = "heavy: cargo test --release --test edit_fuzz -- --ignored"]
 fn edit_storm_eastl() {
     if let Some(idx) = eastl() {
         storm("eastl", idx);
@@ -329,6 +330,7 @@ fn edit_storm_eastl() {
 }
 
 #[test]
+#[ignore = "heavy: cargo test --release --test edit_fuzz -- --ignored"]
 fn edit_storm_sdl_with_system_headers() {
     if let Some(idx) = sdl() {
         storm("sdl", idx);
@@ -336,6 +338,7 @@ fn edit_storm_sdl_with_system_headers() {
 }
 
 #[test]
+#[ignore = "heavy: cargo test --release --test edit_fuzz -- --ignored"]
 fn edit_storm_msvc_stl() {
     if let Some(idx) = stl() {
         storm("msvc-stl", idx);
@@ -345,6 +348,7 @@ fn edit_storm_msvc_stl() {
 /// Seed that once left a family empty: a definition written inside another
 /// class's body shares its declaration's family but is a child of that class.
 #[test]
+#[ignore = "heavy: cargo test --release --test edit_fuzz -- --ignored"]
 fn edit_storm_regression_definition_inside_other_class() {
     if let Some(idx) = stl() {
         storm_with("msvc-stl regression", idx, 360, 7919, 1);
