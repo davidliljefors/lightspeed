@@ -784,6 +784,7 @@ impl Index {
             }
         }
         let was_clean = !self.dirty;
+        let t0 = std::time::Instant::now();
         let mut old_range = 0..0;
         let slot = match self.by_path.get(&key) {
             Some(&i) => {
@@ -800,7 +801,10 @@ impl Index {
                 self.files.len() - 1
             }
         };
+        let kill_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let t1 = std::time::Instant::now();
         let base = self.db.merge(&a.shard);
+        let merge_ms = t1.elapsed().as_secs_f64() * 1e3;
         let n_new = a.shard.len();
         let f = &mut self.files[slot];
         f.path = path.to_owned();
@@ -812,7 +816,17 @@ impl Index {
         f.content_hash = a.content_hash;
         f.includes = a.includes.iter().map(|p| path_key(p)).collect();
         f.decls = a.decls;
-        self.dirty = !(was_clean && self.patch_in_place(old_range, base..base + n_new));
+        let t2 = std::time::Instant::now();
+        let (old_len, patched) = (old_range.len(), was_clean && self.patch_in_place(old_range, base..base + n_new));
+        self.dirty = !patched;
+        crate::log!(
+            "lightspeed: absorb {path}: kill {kill_ms:.1} ms, merge {merge_ms:.1} ms, patch {:.1} ms ({} old / {n_new} new symbols, {}; dead {} of {})",
+            t2.elapsed().as_secs_f64() * 1e3,
+            old_len,
+            if patched { "patched in place" } else if !was_clean { "skipped: index already dirty" } else { "skipped: too many dead symbols" },
+            self.dead_symbols,
+            self.db.len(),
+        );
         self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         self.param_cache.clear();
@@ -826,8 +840,12 @@ impl Index {
         if self.dead_symbols * 100 > self.db.len() * self.cfg.compact_percent {
             return false;
         }
+        let t = std::time::Instant::now();
         self.db.patch_indexes(old.clone(), new.clone());
+        let idx_ms = t.elapsed().as_secs_f64() * 1e3;
+        let t = std::time::Instant::now();
         self.hier.patch(&mut self.db, old, new);
+        crate::log!("lightspeed: patch: indexes {idx_ms:.1} ms, hierarchy {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         true
     }
 
