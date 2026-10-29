@@ -48,10 +48,10 @@ pub fn run(mut args: Vec<String>) -> i32 {
             if rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20).build_global().is_err() {
                 eprintln!("lightspeed: thread pool already initialised");
             }
-            lightspeed::lsp::serve_stdio(cdb)
+            lightspeed::lsp::serve_stdio(cdb, !rest.iter().any(|a| a == "--fuzzy-refs"))
         }
         _ => {
-            eprintln!("usage: lightspeed lex [-j threads] <file|dir>... | gen <dir> <files> <bytes> | cdb <compile_commands.json> | pp|parse|index [-j threads] <compile_commands.json> | lsp [--cdb compile_commands.json]");
+            eprintln!("usage: lightspeed lex [-j threads] <file|dir>... | gen <dir> <files> <bytes> | cdb <compile_commands.json> | pp|parse|index [-j threads] <compile_commands.json> | lsp [--cdb compile_commands.json] [--fuzzy-refs]");
             2
         }
     }

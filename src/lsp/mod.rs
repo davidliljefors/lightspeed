@@ -156,6 +156,11 @@ impl Server {
         }
     }
 
+    /// Starting value of `references.certainOnly`; client settings still override it.
+    pub fn set_certain_only(&mut self, on: bool) {
+        self.settings.certain_only = on;
+    }
+
     pub fn index(&self) -> Option<&Index> {
         self.index.as_ref()
     }
