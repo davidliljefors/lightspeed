@@ -775,10 +775,16 @@ impl Index {
                 f.is_tu |= is_tu;
                 f.idents = a.idents;
                 f.content_hash = a.content_hash;
-                f.includes = a.includes.iter().map(|p| path_key(p)).collect();
+                let includes: Vec<_> = a.includes.iter().map(|p| path_key(p)).collect();
+                // The include-graph caches are costly to refill, so keep them
+                // when the file's includes and scope declarations are unchanged.
+                let graph_changed = f.includes != includes || f.decls != a.decls;
+                f.includes = includes;
                 f.decls = a.decls;
-                self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
-                self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+                if graph_changed {
+                    self.scope_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+                    self.reach_cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+                }
                 self.param_cache.clear();
                 return a.includes.into_iter().filter(|p| !self.by_path.contains_key(&path_key(p))).collect();
             }
