@@ -190,7 +190,7 @@ impl Query<'_> {
         // Of several same-named types, only those reachable through the includes can be meant.
         if ty.vis != 0 && hits.len() > 1 {
             let seen = self.idx.reachable_files(ty.vis as usize - 1);
-            let visible: Vec<SymbolId> = hits.iter().copied().filter(|&c| seen.contains(&(db.symbol(c).file.index() as u32))).collect();
+            let visible: Vec<SymbolId> = hits.iter().copied().filter(|&c| self.idx.file_index(db.files.path(db.symbol(c).file)).is_some_and(|f| seen.contains(&(f as u32)))).collect();
             if !visible.is_empty() {
                 hits = visible;
             }
@@ -247,7 +247,7 @@ impl Query<'_> {
                 let q = self.idx.db.qualified_name(id);
                 q.rfind("::").map_or(String::new(), |i| q[..i].to_owned())
             },
-            Some(self.idx.db.symbol(id).file.index()),
+            self.idx.file_index(self.idx.db.files.path(self.idx.db.symbol(id).file)),
         )
     }
 

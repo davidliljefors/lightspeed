@@ -1236,3 +1236,27 @@ template <class T> struct Traits { using Value = typename T::Value; };\ntemplate
         );
     }
 }
+/// A type written in a header is told apart from same-named ones by the files that header can see,
+/// whatever order the files were indexed in.
+#[test]
+fn member_type_of_a_header_is_judged_by_that_headers_includes() {
+    let (_d, root) = tmp();
+    let files = [
+        ("empty.h", "#pragma once\n"),
+        ("x.h", "#pragma once\nstruct Foo { void go(); };\n"),
+        ("y.h", "#pragma once\nstruct Foo { void go(); };\n"),
+        ("holder.h", "#pragma once\n#include \"x.h\"\nstruct Holder { Foo f; };\n"),
+        ("a.cpp", "#include \"empty.h\"\n#include \"holder.h\"\nvoid a(Holder h) { h.f.go(); }\n"),
+        ("b.cpp", "#include \"y.h\"\nvoid b(Foo f) { f.go(); }\n"),
+    ];
+    for (n, t) in files {
+        std::fs::write(format!("{root}/{n}"), t).unwrap();
+    }
+    write_cdb_for(&root, &["a.cpp", "b.cpp"]);
+    let mut c = Client::new(&root);
+    let x = format!("{root}/x.h");
+    let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&x)}, "position": pos_of(files[1].1, "go", 0), "context": {"includeDeclaration": true}}));
+    let paths: Vec<String> = r["result"].as_array().unwrap().iter().map(|l| l["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_owned()).collect();
+    assert!(paths.contains(&"a.cpp".to_owned()), "{paths:?}");
+    assert!(!paths.contains(&"b.cpp".to_owned()), "{paths:?}");
+}
