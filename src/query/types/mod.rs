@@ -262,6 +262,15 @@ impl Query<'_> {
     /// looked up by bare name, so a name like `type` or `T` fans out to thousands
     /// of aliases and would otherwise explode (and read every file they live in).
     pub(super) fn resolve_records(&self, ids: impl IntoIterator<Item = SymbolId>) -> Vec<SymbolId> {
+        self.resolve_kinds(ids, |k| k.is_record())
+    }
+
+    /// [`Self::resolve_records`] that also stops at enums, which can be written before `::`.
+    pub(super) fn resolve_qualifiers(&self, ids: impl IntoIterator<Item = SymbolId>) -> Vec<SymbolId> {
+        self.resolve_kinds(ids, |k| k.is_record() || k == SymbolKind::Enum)
+    }
+
+    fn resolve_kinds(&self, ids: impl IntoIterator<Item = SymbolId>, terminal: fn(SymbolKind) -> bool) -> Vec<SymbolId> {
         const MAX_ALIAS_EXPANSIONS: usize = 24;
         const MAX_FANOUT: usize = 32;
         let db = &self.idx.db;
@@ -274,13 +283,13 @@ impl Query<'_> {
                 continue;
             }
             match db.symbol(id).kind {
-                k if k.is_record() => out.push(id),
+                k if terminal(k) => out.push(id),
                 SymbolKind::TypeAlias if depth < 6 && expansions < MAX_ALIAS_EXPANSIONS => {
                     expansions += 1;
                     if let Some(t) = self.alias_target(id) {
                         let cands = self.scoped_candidates(id, &t);
                         // Records first: they end the chain, so aliases are only followed when none exist.
-                        let records: Vec<_> = cands.iter().copied().filter(|&c| db.symbol(c).kind.is_record()).collect();
+                        let records: Vec<_> = cands.iter().copied().filter(|&c| terminal(db.symbol(c).kind)).collect();
                         if !records.is_empty() {
                             work.extend(records.into_iter().take(MAX_FANOUT).map(|c| (c, depth + 1)));
                         } else if cands.len() <= MAX_FANOUT {

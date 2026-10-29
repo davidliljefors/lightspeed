@@ -98,17 +98,27 @@ impl Query<'_> {
         }
         if !qual.is_empty() {
             let mut buf = String::new();
+            let enclosing: Vec<String> = scopes.iter().map(|&s| db.qualified_name(s)).collect();
             let mut by_qualifier = |want: &str, cands: &[SymbolId]| -> Vec<SymbolId> {
-                cands
-                    .iter()
-                    .copied()
-                    .filter(|&c| {
-                        let Some(p) = db.symbol(c).parent else { return false };
-                        buf.clear();
-                        db.write_qualified_name(p, &mut buf);
-                        buf == want || (!global && buf.strip_suffix(want).is_some_and(|r| r.ends_with("::")))
-                    })
-                    .collect()
+                // (length of the namespace prefix before the written qualifier, whether an enclosing scope spells it)
+                let mut hits: Vec<(SymbolId, usize, bool)> = Vec::new();
+                for &c in cands {
+                    let Some(p) = db.symbol(c).parent else { continue };
+                    buf.clear();
+                    db.write_qualified_name(p, &mut buf);
+                    if buf == want {
+                        hits.push((c, 0, true));
+                    } else if !global && let Some(r) = buf.strip_suffix(want).and_then(|r| r.strip_suffix("::")) {
+                        hits.push((c, r.len() + 2, enclosing.iter().any(|e| e == r)));
+                    }
+                }
+                // `X::` written inside `n` means `n::X` (innermost wins); from outside it means the global `X`,
+                // and only when nothing else is spelled that way may a `using namespace` reach a deeper one.
+                let valid = hits.iter().filter(|h| h.2).map(|h| h.1).max();
+                match valid {
+                    Some(len) => hits.iter().filter(|h| h.2 && h.1 == len).map(|h| h.0).collect(),
+                    None => hits.iter().map(|h| h.0).collect(),
+                }
             };
             let mut filtered = by_qualifier(&qual.join("::"), &cands);
             if filtered.is_empty()
@@ -125,7 +135,7 @@ impl Query<'_> {
             if filtered.is_empty() {
                 // `using RD = RenderingDevice;` makes `RD::` mean `RenderingDevice::`.
                 let aliases: Vec<SymbolId> = db.lookup(qual[0]).iter().copied().filter(|&c| db.symbol(c).kind == crate::symbols::SymbolKind::TypeAlias).collect();
-                let mut targets = self.resolve_records(aliases);
+                let mut targets = self.resolve_qualifiers(aliases);
                 for &m in db.lookup(qual[0]).iter().filter(|&&c| db.symbol(c).kind == crate::symbols::SymbolKind::Macro) {
                     if let Some(t) = self.object_macro_target(m) {
                         let last = t.rsplit("::").next().unwrap_or(&t);

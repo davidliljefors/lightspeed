@@ -1163,3 +1163,76 @@ fn stdio_smoke_test() {
     let _ = stdout.read_to_string(&mut rest);
     assert!(child.wait().unwrap().success());
 }
+
+/// Find-references on the symbol at the `/*@*/` marker. Lines ending in `//=` are the only lines that may be returned.
+mod exact_refs {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn check(src: &str, certain_only: bool) {
+        let at = src.find("/*@*/").expect("marker");
+        let src = src.replacen("/*@*/", "", 1);
+        let (_d, root) = tmp();
+        let a = format!("{root}/a.cpp");
+        std::fs::write(&a, &src).unwrap();
+        write_cdb_for(&root, &["a.cpp"]);
+        let mut c = Client::new(&root);
+        c.open(&a, &src);
+        if certain_only {
+            c.notify("workspace/didChangeConfiguration", json!({"settings": {"references": {"certainOnly": true}}}));
+        }
+        let (line, character) = offset_to_position(&src, &LineIndex::new(&src), at as u32);
+        let r = c.request("textDocument/references", json!({"textDocument": {"uri": path_to_uri(&a)}, "position": {"line": line, "character": character}, "context": {"includeDeclaration": true}}));
+        let got: BTreeSet<usize> = r["result"].as_array().unwrap().iter().map(|l| l["range"]["start"]["line"].as_u64().unwrap() as usize).collect();
+        let lines: Vec<&str> = src.lines().collect();
+        let want: BTreeSet<usize> = (0..lines.len()).filter(|&i| lines[i].trim_end().ends_with("//=")).collect();
+        let mut errors = Vec::new();
+        errors.extend(want.difference(&got).map(|&i| format!("missing: {}", lines[i].trim())));
+        errors.extend(got.difference(&want).map(|&i| format!("extra:   {}", lines[i].trim())));
+        assert!(errors.is_empty(), "certainOnly={certain_only}\n{}", errors.join("\n"));
+    }
+
+    fn both(src: &str) {
+        check(src, true);
+        check(src, false);
+    }
+
+    const ENUMS: &str = "enum class X { /*@*/SomeEnumeration,  //=\n  Other };\nenum class Y { SomeEnumeration, Other2 };\nenum Plain { PlainOne, SomeEnumerationPlain };\nstruct S { int SomeEnumeration; static const int Other = 1; };\nnamespace n { enum class X { SomeEnumeration }; }\n";
+
+    #[test]
+    fn enum_class_constant_from_its_declaration() {
+        both(&format!(
+            "{ENUMS}int a = (int)X::SomeEnumeration;  //=\nint b = (int)Y::SomeEnumeration;\nint c(S s) {{ return s.SomeEnumeration; }}\nbool d(X x) {{ return x == X::SomeEnumeration; }}  //=\nint e = (int)n::X::SomeEnumeration;\nint f(Y y) {{ switch (y) {{ case Y::SomeEnumeration: return 1; default: return 0; }} }}\nint g(X x) {{ switch (x) {{ case X::SomeEnumeration: return 1; default: return 0; }} }}  //=\n"
+        ));
+    }
+
+    #[test]
+    fn enum_class_constant_from_a_use() {
+        both(&format!(
+            "{}int a = (int)X::/*@*/SomeEnumeration;  //=\nint b = (int)Y::SomeEnumeration;\nint c(S s) {{ return s.SomeEnumeration; }}\nint e = (int)n::X::SomeEnumeration;\nusing XA = X;\nint h = (int)XA::SomeEnumeration;  //=\n",
+            ENUMS.replacen("/*@*/", "", 1)
+        ));
+    }
+
+    #[test]
+    fn enum_constant_inside_a_class_is_not_the_global_enums() {
+        both(
+            "enum class X { SomeEnumeration };\nstruct Q {\n  enum class X { /*@*/SomeEnumeration };  //=\n  int f() { return (int)X::SomeEnumeration; }  //=\n};\nint a = (int)X::SomeEnumeration;\nint b = (int)Q::X::SomeEnumeration;  //=\n",
+        );
+    }
+
+    /// A call through something only known at instantiation time is not proven to be the method.
+    const NESTED: &str = "struct A { void /*@*/f();  //=\n};\nstruct B { void f(); };\n\
+template <class T> struct W1 { T v; };\ntemplate <class T> struct W2 { W1<T> v; };\ntemplate <class T> struct W3 { W2<W1<T>> v; };\ntemplate <class T, class U> struct Pair { T first; U second; };\n\
+template <class T> struct Traits { using Value = typename T::Value; };\ntemplate <class T> T make();\n";
+
+    #[test]
+    fn calls_through_deeply_nested_template_arguments_are_not_certain() {
+        check(
+            &format!(
+                "{NESTED}template <class T> void g1(W3<T>& w) {{ w.v.v.v.f(); }}\ntemplate <class T> void g2(Pair<T, Pair<T, W2<T>>>& p) {{ p.second.second.v.v.f(); }}\ntemplate <class T> void g3() {{ typename Traits<W2<T>>::Value v; v.f(); }}\ntemplate <class T> void g4() {{ auto x = make<W3<T>>(); x.v.v.v.f(); }}\ntemplate <class T> void g5(T t) {{ t->f(); t.f(); }}\nvoid ok(A a) {{ a.f(); }}  //=\n"
+            ),
+            true,
+        );
+    }
+}
