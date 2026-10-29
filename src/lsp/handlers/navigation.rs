@@ -45,7 +45,22 @@ impl Server {
         let idx = self.index.as_ref()?;
         let overlay = Overlay(&self.docs);
         let q = Query::new(idx, &overlay);
-        if let Some(r) = q.symbol_refs(&path, text.as_str(), off) {
+        if let Some(p) = self.partial.as_deref() {
+            // Each file's hits go out as soon as it is scanned; `finish` sends the remainder.
+            let certain_only = self.settings.certain_only;
+            let found = q.symbol_refs_streaming(&path, text.as_str(), off, &|c, u| {
+                let mut locs = c.to_vec();
+                if !certain_only {
+                    locs.extend_from_slice(u);
+                }
+                if let Value::Array(items) = self.locations_json(&locs) {
+                    p.push(items);
+                }
+            });
+            if found.is_some() {
+                return Some(json!([]));
+            }
+        } else if let Some(r) = q.symbol_refs(&path, text.as_str(), off) {
             let mut locs = r.certain;
             if !self.settings.certain_only {
                 locs.extend(r.uncertain);

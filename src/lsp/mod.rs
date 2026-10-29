@@ -17,6 +17,7 @@ mod handlers;
 mod position;
 mod router;
 mod session;
+mod stream;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -82,6 +83,8 @@ struct Settings {
     /// Find-references lists only occurrences proven to be the symbol (`references.certainOnly`);
     /// otherwise unresolved same-named occurrences are included too. Rename is always certain-only.
     certain_only: bool,
+    /// Send long result lists as `$/progress` batches when the client asks for them (`streaming`).
+    stream: bool,
 }
 
 /// Last full token data sent per open document, for `full/delta`. Behind a mutex
@@ -118,6 +121,10 @@ pub struct Server {
     settings: Settings,
     refresh_seq: u64,
     sem: SemanticCache,
+    /// Where streamed batches go the moment they are ready; without one they are queued for handle's output.
+    sink: Option<stream::Sink>,
+    /// The running request's partial-result collector, if it has one.
+    partial: Option<Arc<stream::Partial>>,
     pub exit_code: Option<i32>,
 }
 
@@ -137,9 +144,11 @@ impl Server {
             last_progress: ((0, 0), std::time::Instant::now()),
             shutdown: false,
             caps: ClientCaps::default(),
-            settings: Settings { max_signatures: 3, certain_only: false },
+            settings: Settings { max_signatures: 3, certain_only: false, stream: true },
             refresh_seq: 0,
             sem: SemanticCache::default(),
+            sink: None,
+            partial: None,
             exit_code: None,
         }
     }
@@ -154,11 +163,24 @@ impl Server {
         if let Some(b) = v.pointer("/references/certainOnly").and_then(Value::as_bool) {
             self.settings.certain_only = b;
         }
+        if let Some(b) = v.get("streaming").and_then(Value::as_bool) {
+            self.settings.stream = b;
+        }
     }
 
     /// Starting value of `references.certainOnly`; client settings still override it.
     pub fn set_certain_only(&mut self, on: bool) {
         self.settings.certain_only = on;
+    }
+
+    /// Starting value of `streaming`; client settings still override it.
+    pub fn set_streaming(&mut self, on: bool) {
+        self.settings.stream = on;
+    }
+
+    /// Sends streamed batches through send as they are ready, from whichever thread produced them.
+    pub fn set_sink(&mut self, send: impl Fn(Value) + Send + Sync + 'static) {
+        self.sink = Some(Arc::new(send));
     }
 
     pub fn index(&self) -> Option<&Index> {

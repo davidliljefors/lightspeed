@@ -76,6 +76,12 @@ impl Query<'_> {
     /// Occurrences of the symbol named at `offset`; `None` for parameters/locals
     /// (see [`Query::local_at`]) or when the name resolves to nothing.
     pub fn symbol_refs(&self, path: &str, text: &str, offset: u32) -> Option<SymbolRefs> {
+        self.symbol_refs_streaming(path, text, offset, &|_, _| {})
+    }
+
+    /// [`Self::symbol_refs`] that also hands each file's `(certain, uncertain)` hits to `on_file` as soon
+    /// as that file is scanned, from the worker thread that scanned it. Files with no hits are skipped.
+    pub fn symbol_refs_streaming(&self, path: &str, text: &str, offset: u32, on_file: &(dyn Fn(&[Location], &[Location]) + Sync)) -> Option<SymbolRefs> {
         let toks = sig_tokens(text);
         let hit = ident_at(&toks, offset)?;
         if self.local_in(&toks, path, text, hit).is_some() {
@@ -148,6 +154,9 @@ impl Query<'_> {
                     } else if inside == r.len() {
                         certain.push(loc);
                     }
+                }
+                if !certain.is_empty() || !uncertain.is_empty() {
+                    on_file(&certain, &uncertain);
                 }
                 (certain, uncertain)
             })

@@ -135,8 +135,21 @@ impl Server {
             out.push(error(id, -32601, "method not found"));
             return;
         };
-        let reply = match handler(self, params, out) {
-            Ok(result) => respond(id, result.unwrap_or(Value::Null)),
+        self.partial = super::stream::Partial::for_request(self.settings.stream, method, params, self.sink.clone());
+        let answer = handler(self, params, out);
+        let partial = self.partial.take();
+        let reply = match answer {
+            Ok(result) => {
+                let result = match partial {
+                    Some(p) => {
+                        let (result, queued) = p.finish(result);
+                        out.extend(queued);
+                        result
+                    }
+                    None => result,
+                };
+                respond(id, result.unwrap_or(Value::Null))
+            }
             Err(msg) => error(id, -32803, &msg),
         };
         out.push(reply);

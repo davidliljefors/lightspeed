@@ -1260,3 +1260,117 @@ fn member_type_of_a_header_is_judged_by_that_headers_includes() {
     assert!(paths.contains(&"a.cpp".to_owned()), "{paths:?}");
     assert!(!paths.contains(&"b.cpp".to_owned()), "{paths:?}");
 }
+
+/// Long answers go out as `$/progress` batches when the client sends a `partialResultToken`.
+mod streaming {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    fn calls(n: usize) -> String {
+        let mut s = String::from("void f();\nvoid g() {\n");
+        for _ in 0..n {
+            s.push_str("  f();\n");
+        }
+        s.push_str("}\n");
+        s
+    }
+
+    fn setup(src: &str) -> (tempfile::TempDir, Client, String) {
+        let (d, root) = tmp();
+        let a = format!("{root}/a.cpp");
+        std::fs::write(&a, src).unwrap();
+        write_cdb_for(&root, &["a.cpp"]);
+        let mut c = Client::new(&root);
+        c.open(&a, src);
+        (d, c, a)
+    }
+
+    fn refs_params(a: &str, src: &str, token: Option<&str>) -> Value {
+        let mut p = json!({"textDocument": {"uri": path_to_uri(a)}, "position": pos_of(src, "f()", 0), "context": {"includeDeclaration": true}});
+        if let Some(t) = token {
+            p["partialResultToken"] = json!(t);
+        }
+        p
+    }
+
+    fn lines(items: &[Value]) -> BTreeSet<u64> {
+        items.iter().map(|l| l["range"]["start"]["line"].as_u64().unwrap()).collect()
+    }
+
+    fn ask(c: &mut Client, method: &str, params: Value) -> Vec<Value> {
+        let mut out = Vec::new();
+        c.server.handle(json!({"jsonrpc": "2.0", "id": 99, "method": method, "params": params}), &mut out);
+        out
+    }
+
+    fn batches(out: &[Value], token: &str) -> Vec<Vec<Value>> {
+        out.iter()
+            .filter(|m| m["method"] == "$/progress" && m["params"]["token"] == token)
+            .map(|m| m["params"]["value"].as_array().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn references_arrive_in_batches_and_the_final_response_is_empty() {
+        let src = calls(200);
+        let (_d, mut c, a) = setup(&src);
+        let whole = c.request("textDocument/references", refs_params(&a, &src, None))["result"].as_array().unwrap().clone();
+        assert_eq!(whole.len(), 201);
+        let out = ask(&mut c, "textDocument/references", refs_params(&a, &src, Some("tok")));
+        let got = batches(&out, "tok");
+        assert!(got.len() >= 2, "expected several batches, got {}", got.len());
+        let last = out.last().unwrap();
+        assert_eq!(last["id"], 99);
+        assert_eq!(last["result"], json!([]));
+        let streamed: Vec<Value> = got.into_iter().flatten().collect();
+        assert_eq!(streamed.len(), whole.len());
+        assert_eq!(lines(&streamed), lines(&whole));
+    }
+
+    #[test]
+    fn short_answers_are_not_split() {
+        let src = calls(3);
+        let (_d, mut c, a) = setup(&src);
+        let out = ask(&mut c, "textDocument/references", refs_params(&a, &src, Some("tok")));
+        assert!(batches(&out, "tok").is_empty());
+        assert_eq!(out.last().unwrap()["result"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn streaming_can_be_switched_off() {
+        let src = calls(200);
+        let (_d, mut c, a) = setup(&src);
+        c.notify("workspace/didChangeConfiguration", json!({"settings": {"streaming": false}}));
+        let out = ask(&mut c, "textDocument/references", refs_params(&a, &src, Some("tok")));
+        assert!(batches(&out, "tok").is_empty());
+        assert_eq!(out.last().unwrap()["result"].as_array().unwrap().len(), 201);
+    }
+
+    #[test]
+    fn a_live_sink_receives_batches_before_the_response() {
+        let src = calls(200);
+        let (_d, mut c, a) = setup(&src);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let log = sent.clone();
+        c.server.set_sink(move |m| log.lock().unwrap().push(m));
+        let out = ask(&mut c, "textDocument/references", refs_params(&a, &src, Some("tok")));
+        assert!(batches(&out, "tok").is_empty(), "batches must not be queued behind the response");
+        assert_eq!(out.last().unwrap()["result"], json!([]));
+        let sent = sent.lock().unwrap();
+        let streamed: usize = batches(&sent, "tok").iter().map(Vec::len).sum();
+        assert_eq!(streamed, 201);
+    }
+
+    #[test]
+    fn other_long_lists_are_chunked_too() {
+        let src: String = (0..150).map(|i| format!("int Thing_{i};\n")).collect();
+        let (_d, mut c, _a) = setup(&src);
+        let whole = c.request("workspace/symbol", json!({"query": "Thing_"}))["result"].as_array().unwrap().len();
+        assert!(whole > 100, "{whole}");
+        let out = ask(&mut c, "workspace/symbol", json!({"query": "Thing_", "partialResultToken": "ws"}));
+        assert!(batches(&out, "ws").len() >= 2);
+        assert_eq!(batches(&out, "ws").iter().map(Vec::len).sum::<usize>(), whole);
+        assert_eq!(out.last().unwrap()["result"], json!([]));
+    }
+}

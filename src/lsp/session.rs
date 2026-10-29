@@ -25,7 +25,13 @@ pub(super) fn is_source_ext(p: &Path) -> bool {
 
 impl Server {
     /// Serves until the client exits or closes stdin. Returns the exit code.
-    pub fn run(mut self, input: impl BufRead + Send + 'static, mut output: impl Write) -> i32 {
+    pub fn run(mut self, input: impl BufRead + Send + 'static, output: impl Write + Send + 'static) -> i32 {
+        let output = Arc::new(std::sync::Mutex::new(output));
+        let live = output.clone();
+        // Batches of a long answer leave from the thread that found them, ahead of the final response.
+        self.set_sink(move |m| {
+            let _ = write_frame(&mut *live.lock().unwrap_or_else(|e| e.into_inner()), &m);
+        });
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         self.events = Some(tx.clone());
         self.background = true;
@@ -116,7 +122,7 @@ impl Server {
                 }
             }
             for m in out.drain(..) {
-                if write_frame(&mut output, &m).is_err() {
+                if write_frame(&mut *output.lock().unwrap_or_else(|e| e.into_inner()), &m).is_err() {
                     return 1;
                 }
             }
