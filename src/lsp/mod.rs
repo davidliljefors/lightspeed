@@ -6,17 +6,20 @@
 //!
 //! Edits are applied lazily: `didChange` only records the new buffer, and the
 //! index is patched (one file, then an O(symbols) flush) right before the next
-//! request or when the client goes idle.
+//! request or when the client goes idle. Position-based "go to" requests don't
+//! wait for that: they are answered from the index as it is and mapped through
+//! the edit (see `stale`).
 //!
 //! Layout: `transport` (framing), `position` (URIs, UTF-16), `session` (the loop,
 //! background indexing, watcher), `router` (method table), `handlers/` (one file per
-//! feature), `convert` (index data -> LSP JSON).
+//! feature), `convert` (index data -> LSP JSON), `stale` (buffers ahead of the index).
 
 mod convert;
 mod handlers;
 mod position;
 mod router;
 mod session;
+mod stale;
 mod stream;
 #[cfg(test)]
 mod tests;
@@ -32,7 +35,7 @@ use serde_json::Value;
 
 use crate::workspace::index::{Index, Progress};
 use crate::pp::vfs::path_key;
-use crate::query::{DiskText, Text, TextSource};
+use crate::query::{DiskText, Text, TextSource, identifier_at};
 use crate::base::source::LineIndex;
 
 pub use position::{offset_to_position, path_to_uri, position_to_offset, uri_to_path};
@@ -50,20 +53,65 @@ pub enum Msg {
 
 struct Doc {
     path: String,
+    /// What the editor holds.
     text: Arc<str>,
+    /// The text the index was last built from, once known. Differs from `text` while an edit is pending.
+    indexed: Option<Arc<str>>,
     /// Buffer differs from what the index holds.
     dirty: bool,
 }
 
-/// Open buffers shadow the disk.
+impl Doc {
+    fn new(path: String, text: &str, indexed: Option<Arc<str>>) -> Self {
+        Self { path, text: text.into(), indexed, dirty: true }
+    }
+
+    /// The text the index (and so every query) sees.
+    fn seen(&self) -> &Arc<str> {
+        self.indexed.as_ref().unwrap_or(&self.text)
+    }
+
+    /// The index lags behind the buffer.
+    fn ahead(&self) -> bool {
+        self.indexed.as_ref().is_some_and(|i| !Arc::ptr_eq(i, &self.text))
+    }
+}
+
+/// Open buffers shadow the disk, as the index last saw them.
 struct Overlay<'a>(&'a HashMap<u64, Doc>);
 
 impl TextSource for Overlay<'_> {
     fn text(&self, path: &str) -> Option<Text> {
         match self.0.get(&path_key(path)) {
-            Some(d) => Some(Text::Shared(d.text.clone())),
+            Some(d) => Some(Text::Shared(d.seen().clone())),
             None => DiskText.text(path),
         }
+    }
+}
+
+/// A file as the editor shows it now, plus how to read positions the index gives for it.
+pub(super) struct Now {
+    cur: Text,
+    li: LineIndex,
+    /// Set while the index lags: the indexed text and its relation to `cur`.
+    from: Option<(Text, stale::EditMap)>,
+}
+
+impl Now {
+    /// A range of the indexed text as an LSP range in the current text; `None` when the edit touches it.
+    pub(super) fn range(&self, a: u32, b: u32) -> Option<Value> {
+        let (a, b) = match &self.from {
+            Some((old, em)) => em.old_to_new(old.as_str(), self.cur.as_str(), a, b)?,
+            None => (a, b),
+        };
+        let t = self.cur.as_str();
+        let (s, e) = (offset_to_position(t, &self.li, a), offset_to_position(t, &self.li, b));
+        Some(serde_json::json!({"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}}))
+    }
+
+    /// The line (0-based) of an offset of the indexed text.
+    pub(super) fn line(&self, off: u32) -> Option<u32> {
+        self.range(off, off).and_then(|r| r["start"]["line"].as_u64()).map(|l| l as u32)
     }
 }
 
@@ -191,13 +239,62 @@ impl Server {
         Overlay(&self.docs).text(path)
     }
 
-    /// Document path, its text and the byte offset of the request position.
+    /// `path` as the editor shows it now.
+    pub(in crate::lsp) fn now(&self, path: &str) -> Option<Now> {
+        let Some(d) = self.docs.get(&path_key(path)) else {
+            let cur = DiskText.text(path)?;
+            return Some(Now { li: LineIndex::new(cur.as_str()), cur, from: None });
+        };
+        let cur = Text::Shared(d.text.clone());
+        let from = d.ahead().then(|| {
+            let old = Text::Shared(d.seen().clone());
+            let em = stale::EditMap::between(old.as_str(), cur.as_str());
+            (old, em)
+        });
+        Some(Now { li: LineIndex::new(cur.as_str()), cur, from })
+    }
+
+    /// Document path, the text the index has for it, and the byte offset of the request position
+    /// in that text. When the buffer is ahead of the index the position is mapped back through the
+    /// edit; `None` if the edit covers what the cursor is on.
     pub(in crate::lsp) fn cursor(&self, params: &Value) -> Option<(String, Text, u32)> {
         let path = uri_to_path(params["textDocument"]["uri"].as_str()?)?;
-        let text = self.text_of(&path)?;
         let (line, col) = (params["position"]["line"].as_u64()? as u32, params["position"]["character"].as_u64()? as u32);
-        let li = LineIndex::new(text.as_str());
-        let off = position_to_offset(text.as_str(), &li, line, col);
-        Some((path, text, off))
+        let Some(d) = self.docs.get(&path_key(&path)).filter(|d| d.ahead()) else {
+            let text = self.text_of(&path)?;
+            let off = position_to_offset(text.as_str(), &LineIndex::new(text.as_str()), line, col);
+            return Some((path, text, off));
+        };
+        let (cur, old) = (&*d.text, d.seen());
+        let off = position_to_offset(cur, &LineIndex::new(cur), line, col);
+        let (a, b) = identifier_at(cur, off).unwrap_or((off, off));
+        let (old_a, _) = stale::EditMap::between(old, cur).new_to_old(old, cur, a, b)?;
+        Some((path, Text::Shared(old.clone()), old_a + (off - a)))
+    }
+
+    /// Whether `method` can be answered without first indexing the buffer's pending edit.
+    pub(in crate::lsp) fn can_defer(&self, method: &str, params: &Value) -> bool {
+        const DEFERRABLE: &[&str] = &[
+            "textDocument/definition",
+            "textDocument/declaration",
+            "textDocument/implementation",
+            "textDocument/typeDefinition",
+            "textDocument/references",
+            "textDocument/hover",
+        ];
+        if !DEFERRABLE.contains(&method) {
+            return false;
+        }
+        let Some(path) = params["textDocument"]["uri"].as_str().and_then(uri_to_path) else { return false };
+        let Some(d) = self.docs.get(&path_key(&path)).filter(|d| d.dirty) else { return true };
+        let (Some(line), Some(col)) = (params["position"]["line"].as_u64(), params["position"]["character"].as_u64()) else { return false };
+        if !d.ahead() {
+            return false;
+        }
+        let (cur, old) = (&*d.text, d.seen());
+        let off = position_to_offset(cur, &LineIndex::new(cur), line as u32, col as u32);
+        let em = stale::EditMap::between(old, cur);
+        let (a, b) = identifier_at(cur, off).unwrap_or((off, off));
+        em.new_to_old(old, cur, a, b).is_some() && !em.touches_line(cur, off)
     }
 }

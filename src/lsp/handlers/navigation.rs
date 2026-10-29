@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 
 use crate::lsp::{Overlay, Server};
 use crate::query::{Location, Query, identifier_at};
-use crate::base::source::LineIndex;
 use crate::symbols::SymbolId;
 
 impl Server {
@@ -26,7 +25,7 @@ impl Server {
                 return Some(json!([]));
             }
             let uri = params["textDocument"]["uri"].as_str()?;
-            let range = Self::range_json(text.as_str(), &LineIndex::new(text.as_str()), l.decl);
+            let range = self.now(&path)?.range(l.decl.0, l.decl.1)?;
             return Some(json!([{"uri": uri, "range": range}]));
         }
         let locs: Vec<Location> = find(&q, &path, text.as_str(), off).into_iter().filter_map(|s| q.location(s)).collect();

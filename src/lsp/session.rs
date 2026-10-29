@@ -118,6 +118,10 @@ impl Server {
                 Err(RecvTimeoutError::Timeout) => {
                     if self.apply_pending() {
                         self.refresh_tokens(&mut out);
+                    } else if let Some(idx) = self.index.as_mut()
+                        && idx.maintain()
+                    {
+                        crate::log!("lightspeed: compacted the index while idle");
                     }
                 }
             }
@@ -235,15 +239,25 @@ impl Server {
 
     /// Applies buffered edits and disk changes to the index; true if anything changed.
     pub fn apply_pending(&mut self) -> bool {
+        self.apply(false)
+    }
+
+    /// With `defer`, edits to buffers the index already knows are left pending: the caller answers
+    /// from the index as it is and maps positions through the edit (see `stale`).
+    pub(in crate::lsp) fn apply(&mut self, defer: bool) -> bool {
         let Some(idx) = self.index.as_mut() else { return false };
         let mut changed = false;
         for d in self.docs.values_mut().filter(|d| d.dirty) {
+            if defer && d.indexed.is_some() {
+                continue;
+            }
             d.dirty = false;
             let unchanged = idx.file_index(&d.path).is_some_and(|i| idx.files[i].content_hash == hash_bytes(d.text.as_bytes()));
             if !unchanged {
                 idx.update(&d.path, Some(&d.text));
                 changed = true;
             }
+            d.indexed = Some(d.text.clone());
         }
         for p in std::mem::take(&mut self.fs_dirty) {
             // The editor's buffer is the truth for open files.

@@ -1374,3 +1374,126 @@ mod streaming {
         assert_eq!(out.last().unwrap()["result"], json!([]));
     }
 }
+
+/// Navigation answers from the index while an edit is still pending, mapped through the edit.
+mod pending_edits {
+    use super::*;
+    use lightspeed::base::hash::hash_bytes;
+
+    fn setup(files: &[(&str, &str)]) -> (tempfile::TempDir, Client, String) {
+        let (d, root) = tmp();
+        for (n, t) in files {
+            std::fs::write(format!("{root}/{n}"), t).unwrap();
+        }
+        let tus: Vec<&str> = files.iter().map(|f| f.0).filter(|n| n.ends_with(".cpp")).collect();
+        write_cdb_for(&root, &tus);
+        let mut c = Client::new(&root);
+        for (n, t) in files {
+            c.open(&format!("{root}/{n}"), t);
+        }
+        (d, c, root)
+    }
+
+    fn indexed(c: &Client, path: &str, text: &str) -> bool {
+        let idx = c.server.index().unwrap();
+        idx.file_index(path).is_some_and(|i| idx.files[i].content_hash == hash_bytes(text.as_bytes()))
+    }
+
+    fn at(path: &str, text: &str, needle: &str, nth: usize) -> Value {
+        json!({"textDocument": {"uri": path_to_uri(path)}, "position": pos_of(text, needle, nth), "context": {"includeDeclaration": true}})
+    }
+
+    fn lines(r: &Value) -> Vec<(String, u64)> {
+        let mut v: Vec<_> = r["result"].as_array().unwrap().iter().map(|l| (l["uri"].as_str().unwrap().to_owned(), l["range"]["start"]["line"].as_u64().unwrap())).collect();
+        v.sort();
+        v
+    }
+
+    const SRC: &str = "void target() {}\nvoid other() {}\nvoid caller() { target(); other(); }\n";
+
+    #[test]
+    fn lines_added_above_shift_the_answer_without_reindexing() {
+        let (_d, mut c, root) = setup(&[("a.cpp", SRC)]);
+        let a = format!("{root}/a.cpp");
+        let edited = format!("// one\n// two\n{SRC}");
+        c.change(&a, &edited);
+        let r = c.request("textDocument/definition", at(&a, &edited, "target", 1));
+        assert_eq!(lines(&r), [(path_to_uri(&a), 2)]);
+        assert!(!indexed(&c, &a, &edited), "the request must not have waited for the edit to be indexed");
+        let r = c.request("textDocument/references", at(&a, &edited, "target", 1));
+        assert_eq!(lines(&r), [(path_to_uri(&a), 2), (path_to_uri(&a), 4)]);
+        assert!(!indexed(&c, &a, &edited));
+    }
+
+    #[test]
+    fn a_declaration_that_was_deleted_is_not_answered() {
+        let (_d, mut c, root) = setup(&[("a.cpp", SRC)]);
+        let a = format!("{root}/a.cpp");
+        let edited = SRC.replace("void target() {}\n", "");
+        c.change(&a, &edited);
+        let r = c.request("textDocument/definition", at(&a, &edited, "other", 1));
+        assert_eq!(lines(&r), [(path_to_uri(&a), 0)], "an unrelated declaration moved up");
+        let r = c.request("textDocument/definition", at(&a, &edited, "caller", 0));
+        assert!(lines(&r).is_empty(), "a definition has nowhere to go");
+        c.request("textDocument/documentSymbol", json!({"textDocument": {"uri": path_to_uri(&a)}}));
+        assert!(indexed(&c, &a, &edited), "other requests index the edit first");
+    }
+
+    #[test]
+    fn an_edit_on_the_cursor_line_is_indexed_first() {
+        let (_d, mut c, root) = setup(&[("a.cpp", SRC)]);
+        let a = format!("{root}/a.cpp");
+        let edited = SRC.replace("target(); other();", "other(); target();");
+        c.change(&a, &edited);
+        let r = c.request("textDocument/definition", at(&a, &edited, "target", 1));
+        assert_eq!(lines(&r), [(path_to_uri(&a), 0)]);
+        assert!(indexed(&c, &a, &edited));
+    }
+
+    #[test]
+    fn a_pending_edit_in_a_header_moves_locations_found_from_another_file() {
+        let h = "#pragma once\nstruct S { int field; };\n";
+        let a = "#include \"s.h\"\nint get(S* s) { return s->field; }\n";
+        let (_d, mut c, root) = setup(&[("s.h", h), ("a.cpp", a)]);
+        let (hp, ap) = (format!("{root}/s.h"), format!("{root}/a.cpp"));
+        let edited = "#pragma once\n// doc\n// doc\nstruct S { int field; };\n".to_string();
+        c.change(&hp, &edited);
+        let r = c.request("textDocument/definition", at(&ap, a, "field", 0));
+        assert_eq!(lines(&r), [(path_to_uri(&hp), 3)]);
+        assert!(!indexed(&c, &hp, &edited));
+    }
+
+    /// Whatever a request answers while the index lags must be part of the answer once it has caught up.
+    #[test]
+    fn deferred_answers_are_never_wrong() {
+        type Edit = fn(&str) -> String;
+        let edits: [(&str, Edit); 7] = [
+            ("lines above", |s| format!("// a\n// b\n{s}")),
+            ("a line deleted", |s| s.replace("void other() {}\n", "")),
+            ("a body edited", |s| s.replace("void target() {}", "void target() { int x = 0; }")),
+            ("a name changed", |s| s.replace("void other()", "void another()")),
+            ("an identifier extended", |s| s.replace("void target()", "void targetX()")),
+            ("a call swapped", |s| s.replace("target(); other();", "other(); target();")),
+            ("a declaration added between", |s| s.replace("void other() {}\n", "void other() {}\nint added;\n")),
+        ];
+        for (what, edit) in edits {
+            for needle in ["target", "other", "caller"] {
+                let (_d, mut c, root) = setup(&[("a.cpp", SRC)]);
+                let a = format!("{root}/a.cpp");
+                let edited = edit(SRC);
+                c.change(&a, &edited);
+                for nth in 0..edited.matches(needle).count() {
+                    for method in ["textDocument/definition", "textDocument/references"] {
+                        let mut c2 = Client::new(&root);
+                        c2.open(&a, SRC);
+                        c2.change(&a, &edited);
+                        let lazy = lines(&c2.request(method, at(&a, &edited, needle, nth)));
+                        c2.request("textDocument/documentSymbol", json!({"textDocument": {"uri": path_to_uri(&a)}}));
+                        let fresh = lines(&c2.request(method, at(&a, &edited, needle, nth)));
+                        assert!(lazy.iter().all(|l| fresh.contains(l)), "{what}: {method} of `{needle}` #{nth}: {lazy:?} is not within {fresh:?}");
+                    }
+                }
+            }
+        }
+    }
+}

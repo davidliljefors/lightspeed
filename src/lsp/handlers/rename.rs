@@ -14,9 +14,9 @@ impl Server {
         let idx = self.index.as_ref()?;
         let overlay = Overlay(&self.docs);
         let l = Query::new(idx, &overlay).local_at(&path, text.as_str(), off)?;
-        let li = LineIndex::new(text.as_str());
-        let uses = l.uses.iter().map(|&r| Self::range_json(text.as_str(), &li, r)).collect();
-        Some((Self::range_json(text.as_str(), &li, l.hovered), uses, l.name))
+        let now = self.now(&path)?;
+        let uses = l.uses.iter().filter_map(|&(a, b)| now.range(a, b)).collect();
+        Some((now.range(l.hovered.0, l.hovered.1)?, uses, l.name))
     }
 
     pub(in crate::lsp) fn inside_root(&self, path: &str) -> bool {

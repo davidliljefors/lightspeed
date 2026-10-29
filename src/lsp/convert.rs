@@ -61,16 +61,10 @@ impl Server {
             .par_iter()
             .map(|(file, ids)| {
                 let path = &idx.files[*file as usize].path;
-                let Some(t) = self.text_of(path) else { return Vec::new() };
-                let li = LineIndex::new(t.as_str());
+                let Some(now) = self.now(path) else { return Vec::new() };
                 let uri = path_to_uri(path);
-                ids.iter()
-                    .map(|&i| {
-                        let l = &locs[i];
-                        let (s, e) = (offset_to_position(t.as_str(), &li, l.start), offset_to_position(t.as_str(), &li, l.end));
-                        (i, json!({"uri": uri, "range": {"start": {"line": s.0, "character": s.1}, "end": {"line": e.0, "character": e.1}}}))
-                    })
-                    .collect()
+                // Locations the pending edit covers have no place in the buffer yet, so they are left out.
+                ids.iter().filter_map(|&i| now.range(locs[i].start, locs[i].end).map(|r| (i, json!({"uri": uri, "range": r})))).collect()
             })
             .collect();
         let mut flat: Vec<(usize, Value)> = done.into_iter().flatten().collect();

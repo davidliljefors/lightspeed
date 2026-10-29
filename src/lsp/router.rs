@@ -130,7 +130,7 @@ impl Server {
             out.push(reply);
             return;
         }
-        self.apply_pending();
+        self.apply(self.can_defer(method, params));
         let Some(&(_, _, handler)) = route else {
             out.push(error(id, -32601, "method not found"));
             return;
@@ -195,7 +195,7 @@ impl Server {
             && let Some(path) = uri_to_path(uri)
         {
             let key = path_key(&path);
-            self.docs.insert(key, Doc { path, text: text.into(), dirty: true });
+            self.docs.insert(key, Doc::new(path, text, None));
             // Index on open so the first query doesn't pay for it; a no-op when the content is already indexed.
             self.apply_pending();
             if let Some(idx) = self.index.as_mut()
@@ -211,7 +211,9 @@ impl Server {
         // Full sync: the last change carries the whole document.
         let text = params["contentChanges"].as_array().and_then(|c| c.last()).and_then(|c| c["text"].as_str());
         if let (Some(path), Some(text)) = (uri, text) {
-            self.docs.insert(path_key(&path), Doc { path, text: text.into(), dirty: true });
+            let key = path_key(&path);
+            let indexed = self.docs.get(&key).and_then(|d| d.indexed.clone());
+            self.docs.insert(key, Doc::new(path, text, indexed));
         }
     }
 

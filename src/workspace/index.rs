@@ -823,13 +823,17 @@ impl Index {
         f.includes = a.includes.iter().map(|p| path_key(p)).collect();
         f.decls = a.decls;
         let t2 = std::time::Instant::now();
-        let (old_len, patched) = (old_range.len(), was_clean && self.patch_in_place(old_range, base..base + n_new));
+        let old_len = old_range.len();
+        let patched = was_clean;
+        if patched {
+            self.patch_in_place(old_range, base..base + n_new);
+        }
         self.dirty = !patched;
         crate::log!(
             "lightspeed: absorb {path}: kill {kill_ms:.1} ms, merge {merge_ms:.1} ms, patch {:.1} ms ({} old / {n_new} new symbols, {}; dead {} of {})",
             t2.elapsed().as_secs_f64() * 1e3,
             old_len,
-            if patched { "patched in place" } else if !was_clean { "skipped: index already dirty" } else { "skipped: too many dead symbols" },
+            if patched { "patched in place" } else { "skipped: index already dirty" },
             self.dead_symbols,
             self.db.len(),
         );
@@ -840,19 +844,14 @@ impl Index {
     }
 
     /// Updates the side indexes and hierarchy for one re-merged file without
-    /// a global rebuild. False when that is not possible (the caller then
-    /// marks the index dirty for a full [`Self::flush`]).
-    fn patch_in_place(&mut self, old: std::ops::Range<usize>, new: std::ops::Range<usize>) -> bool {
-        if self.dead_symbols * 100 > self.db.len() * self.cfg.compact_percent {
-            return false;
-        }
+    /// a global rebuild. Only valid when the indexes were fresh before the file was killed.
+    fn patch_in_place(&mut self, old: std::ops::Range<usize>, new: std::ops::Range<usize>) {
         let t = std::time::Instant::now();
         self.db.patch_indexes(old.clone(), new.clone());
         let idx_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = std::time::Instant::now();
         self.hier.patch(&mut self.db, old, new);
         crate::log!("lightspeed: patch: indexes {idx_ms:.1} ms, hierarchy {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
-        true
     }
 
     fn kill(&mut self, slot: usize) {
@@ -1054,12 +1053,29 @@ impl Index {
 
     pub fn remove(&mut self, path: &str) {
         if let Some(i) = self.file_index(path) {
+            let was_clean = !self.dirty;
+            let old = self.files[i].syms.0 as usize..self.files[i].syms.1 as usize;
             self.kill(i);
+            if was_clean {
+                let end = self.db.len();
+                self.patch_in_place(old, end..end);
+                self.dirty = false;
+            }
         }
     }
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Housekeeping for idle moments: compacts when tombstones pile up (this renumbers
+    /// symbols and rebuilds the indexes, O(symbols)). True if it did.
+    pub fn maintain(&mut self) -> bool {
+        if self.dead_symbols * 100 <= self.db.len() * self.cfg.compact_percent {
+            return false;
+        }
+        self.rebuild_all();
+        true
     }
 
     /// Discards incrementally patched indexes and hierarchy and rebuilds them

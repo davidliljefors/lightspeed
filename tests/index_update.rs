@@ -35,17 +35,18 @@ fn edits_to_files_without_classes_patch_indexes_and_hierarchy_incrementally() {
         let fresh = fresh_ws.index(&["a.cpp"]);
         assert_eq!(observable(&idx), observable(&fresh), "edit {i}");
     }
-    // Many more edits: dead symbols pile up until a compaction forces a full rebuild.
-    let mut rebuilt = 0;
+    // Many more edits: dead symbols pile up, and idle housekeeping compacts them without ever making an edit wait.
+    let mut compactions = 0;
     for i in 0..120 {
         let body = edits[i % edits.len()];
         idx.update(&p, Some(&a(&format!("{body}int tick{i};\n"))));
-        rebuilt += usize::from(idx.is_dirty());
-        idx.flush();
+        assert!(!idx.is_dirty(), "churn edit {i} fell back to a full rebuild");
+        compactions += usize::from(idx.maintain());
+        assert!(!idx.is_dirty());
         let fresh = Ws::new(&[("h.h", h), ("a.cpp", &a(&format!("{body}int tick{i};\n")))], &[]).index(&["a.cpp"]);
         assert_eq!(observable(&idx), observable(&fresh), "churn edit {i}");
     }
-    assert!(rebuilt > 0 && rebuilt < 40, "{rebuilt} full rebuilds");
+    assert!(compactions > 0 && compactions < 40, "{compactions} compactions");
 }
 
 #[test]
@@ -218,7 +219,7 @@ fn update_from_disk_and_new_file_with_new_header() {
 
     std::fs::remove_file(ws.dir.path().join("new.cpp")).unwrap();
     idx.update(&ws.path("new.cpp"), None);
-    idx.flush();
+    assert!(!idx.is_dirty(), "removing a file patches the indexes");
     assert!(idx.db.lookup("n").is_empty());
 }
 
