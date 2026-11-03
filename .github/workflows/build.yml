@@ -17,7 +17,7 @@ jobs:
         include:
           - { os: windows-latest, target: win32-x64, ext: .exe }
           - { os: windows-11-arm, target: win32-arm64, ext: .exe }
-          - { os: macos-latest, target: darwin-arm64, ext: "" }
+#         - { os: macos-latest, target: darwin-arm64, ext: "" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
