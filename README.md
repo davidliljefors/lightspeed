@@ -4,7 +4,9 @@ A speed-first C++ indexer and lightweight language server. Definitions, referenc
 
 ```
 cargo build --release
-target\release\lightspeed lsp --cdb path\to\compile_commands.json   # speaks LSP on stdio; references list only proven hits, add --fuzzy-refs to include uncertain ones; long answers stream as partial results when the client asks (--no-streaming or the `streaming` setting turns that off)
+target\release\lightspeed lsp --cdb path\to\compile_commands.json   # speaks LSP on stdio.
+
+# add --fuzzy-refs to include uncertain references (deep templates etc)
 ```
 
 ## Performance
