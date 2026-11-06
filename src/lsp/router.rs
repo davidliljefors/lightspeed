@@ -50,6 +50,7 @@ const ROUTES: &[(&str, Pending, Handler)] = &[
     ("typeHierarchy/supertypes", Pending::Null, |s, p, _| ok(s.type_hierarchy_step(p, false))),
     ("typeHierarchy/subtypes", Pending::Null, |s, p, _| ok(s.type_hierarchy_step(p, true))),
     ("lightspeed/inheritanceGraph", Pending::Null, |s, p, _| ok(s.inheritance_graph(p))),
+    ("lightspeed/findText", Pending::Null, |s, p, _| s.find_text(p)),
     ("textDocument/semanticTokens/full", Pending::Null, |s, p, _| ok(s.semantic_tokens(p, false))),
     ("textDocument/semanticTokens/full/delta", Pending::Null, |s, p, _| ok(s.semantic_tokens_delta(p))),
     ("textDocument/semanticTokens/range", Pending::Null, |s, p, _| ok(s.semantic_tokens(p, true))),

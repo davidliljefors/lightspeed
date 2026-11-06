@@ -7,9 +7,15 @@
   "repository": "https://github.com/davidliljefors/lightspeed",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Programming Languages"],
-  "activationEvents": ["onLanguage:c", "onLanguage:cpp"],
+  "activationEvents": ["onLanguage:c", "onLanguage:cpp", "onCommand:lightspeed.findText"],
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "lightspeed.findText",
+        "title": "Lightspeed: Find Text in Indexed Code"
+      }
+    ],
     "configuration": {
       "title": "lightspeed",
       "properties": {

@@ -78,13 +78,16 @@ impl Doc {
 }
 
 /// Open buffers shadow the disk, as the index last saw them.
-struct Overlay<'a>(&'a HashMap<u64, Doc>);
+struct Overlay<'a>(&'a HashMap<u64, Doc>, Option<&'a Index>);
 
 impl TextSource for Overlay<'_> {
     fn text(&self, path: &str) -> Option<Text> {
         match self.0.get(&path_key(path)) {
             Some(d) => Some(Text::Shared(d.seen().clone())),
-            None => DiskText.text(path),
+            None => match self.1 {
+                Some(idx) => idx.texts.text(path),
+                None => DiskText.text(path),
+            },
         }
     }
 }
@@ -151,6 +154,8 @@ impl SemanticCache {
 
 pub struct Server {
     cdb_hint: Option<PathBuf>,
+    /// A generated `.ninja` file used instead of a compile database; no workspace search.
+    ninja: Option<PathBuf>,
     index: Option<Index>,
     docs: HashMap<u64, Doc>,
     fs_dirty: HashSet<String>,
@@ -180,6 +185,7 @@ impl Server {
     pub fn new(cdb_hint: Option<PathBuf>) -> Self {
         Self {
             cdb_hint,
+            ninja: None,
             index: None,
             docs: HashMap::new(),
             fs_dirty: HashSet::new(),
@@ -226,6 +232,11 @@ impl Server {
         self.settings.stream = on;
     }
 
+    /// Index from a generated `.ninja` file instead of a `compile_commands.json`.
+    pub fn set_ninja(&mut self, path: Option<PathBuf>) {
+        self.ninja = path;
+    }
+
     /// Sends streamed batches through send as they are ready, from whichever thread produced them.
     pub fn set_sink(&mut self, send: impl Fn(Value) + Send + Sync + 'static) {
         self.sink = Some(Arc::new(send));
@@ -236,7 +247,7 @@ impl Server {
     }
 
     pub(in crate::lsp) fn text_of(&self, path: &str) -> Option<Text> {
-        Overlay(&self.docs).text(path)
+        Overlay(&self.docs, self.index.as_ref()).text(path)
     }
 
     /// `path` as the editor shows it now.

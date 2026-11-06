@@ -104,7 +104,7 @@ fn normalize(path: String) -> String {
     if cfg!(windows) && path.contains('\\') { path.replace('\\', "/") } else { path }
 }
 
-fn absolutize(dir: &str, p: &str) -> String {
+pub(crate) fn absolutize(dir: &str, p: &str) -> String {
     if Path::new(p).is_absolute() || p.starts_with('/') {
         normalize(p.to_owned())
     } else {
@@ -283,11 +283,20 @@ impl CompileDb {
         Self::from_json(src.text())
     }
 
+    /// Loads a generated `.ninja` build file (see [`crate::workspace::ninja`]).
+    pub fn load_ninja(path: impl AsRef<Path>) -> Result<Self, CompileDbError> {
+        let path = path.as_ref();
+        let src = SourceFile::load(path).map_err(CompileDbError::Load)?;
+        let abs = std::path::absolute(path).map_err(|e| CompileDbError::Load(LoadError::Io(e)))?;
+        let dir = abs.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        Ok(Self::from_parsed(crate::workspace::ninja::parse(src.text(), &dir)))
+    }
+
     pub fn from_json(json: &str) -> Result<Self, CompileDbError> {
         let raw: Vec<RawEntry> = serde_json::from_str(json).map_err(CompileDbError::Json)?;
 
         // Parallel and lock-free: each entry is independent.
-        let parsed: Vec<(String, FlagSet, u64)> = raw
+        let parsed: Vec<(String, std::sync::Arc<FlagSet>, u64)> = raw
             .par_iter()
             .map(|e| {
                 let args = match (&e.arguments, &e.command) {
@@ -297,28 +306,42 @@ impl CompileDb {
                 };
                 let flags = parse_args(&args, &e.directory);
                 let hash = flags.hash();
-                (absolutize(&e.directory, &e.file), flags, hash)
+                (absolutize(&e.directory, &e.file), std::sync::Arc::new(flags), hash)
             })
             .collect();
+        Ok(Self::from_parsed(parsed))
+    }
 
-        // Sequential dedupe: one hash probe per entry.
+    /// Builds the database from `(absolute file, flags, flags hash)` triples.
+    pub(crate) fn from_parsed(parsed: Vec<(String, std::sync::Arc<FlagSet>, u64)>) -> Self {
+        // Sequential dedupe: one hash probe per entry. Entries sharing an Arc skip the deep compare.
         let mut db = Self::default();
         let mut ids: hashbrown::HashMap<u64, FlagsId, FxBuildHasher> = Default::default();
+        // Keeping the Arc alive keeps its address unique.
+        let mut by_ptr: hashbrown::HashMap<usize, (FlagsId, std::sync::Arc<FlagSet>), FxBuildHasher> = Default::default();
         db.entries.reserve(parsed.len());
         for (file, flags, hash) in parsed {
-            let id = match ids.get(&hash) {
-                Some(&id) if db.flag_sets[id] == flags => id,
-                _ => {
-                    let id = db.flag_sets.push(flags);
-                    db.flag_hashes.push(hash);
-                    ids.insert(hash, id);
+            let key = std::sync::Arc::as_ptr(&flags) as usize;
+            let id = match by_ptr.get(&key) {
+                Some(&(id, _)) => id,
+                None => {
+                    let id = match ids.get(&hash) {
+                        Some(&id) if db.flag_sets[id] == *flags => id,
+                        _ => {
+                            let id = db.flag_sets.push((*flags).clone());
+                            db.flag_hashes.push(hash);
+                            ids.insert(hash, id);
+                            id
+                        }
+                    };
+                    by_ptr.insert(key, (id, flags));
                     id
                 }
             };
             db.entries.push(CompileEntry { file, flags: id, flags_hash: hash });
         }
         db.build_file_index();
-        Ok(db)
+        db
     }
 
     fn build_file_index(&mut self) {

@@ -6,6 +6,15 @@
 //! one symbol. Occurrences that bind to a parameter/local never match.
 
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// TEMP profiling: [read ns, lex ns, resolve ns, bytes, files read, files with name, candidates]
+pub static PROF: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+pub(crate) fn lap(slot: usize, t: &mut std::time::Instant) {
+    PROF[slot].fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    *t = std::time::Instant::now();
+}
 
 use super::{Location, Query, ident_at, sig_tokens};
 use crate::lexer::TokenKind as K;
@@ -112,16 +121,25 @@ impl Query<'_> {
 
         let files: Vec<(usize, &str)> =
             self.idx.live_files().filter(|(_, f)| f.may_contain(name)).map(|(i, f)| (i, f.path.as_str())).collect();
+        PROF[6].store(files.len() as u64, Ordering::Relaxed);
         let per_file: Vec<(Vec<Location>, Vec<Location>)> = files
             .par_iter()
             .map(|&(fi, path)| {
                 let (mut certain, mut uncertain) = (Vec::new(), Vec::new());
+                let t0 = std::time::Instant::now();
                 let Some(t) = self.texts.text(path) else { return (certain, uncertain) };
                 let text = t.as_str();
+                PROF[0].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                PROF[3].fetch_add(text.len() as u64, Ordering::Relaxed);
+                PROF[4].fetch_add(1, Ordering::Relaxed);
                 if memchr::memmem::find(text.as_bytes(), name.as_bytes()).is_none() {
                     return (certain, uncertain);
                 }
+                PROF[5].fetch_add(1, Ordering::Relaxed);
+                let t1 = std::time::Instant::now();
                 let toks = sig_tokens(text);
+                PROF[1].fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                let t2 = std::time::Instant::now();
                 for (i, tok) in toks.iter().enumerate() {
                     if tok.kind != K::Ident || tok.text(text) != name {
                         continue;
@@ -135,7 +153,10 @@ impl Query<'_> {
                         continue;
                     }
                     let scoped = i > 0 && matches!(toks[i - 1].kind, K::Dot | K::Arrow | K::ColonColon);
-                    if !scoped && self.local_in(&toks, path, text, i).is_some() {
+                    let tl = std::time::Instant::now();
+                    let is_local = !scoped && self.local_in(&toks, path, text, i).is_some();
+                    PROF[13].fetch_add(tl.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    if is_local {
                         continue;
                     }
                     if is_label(&toks, text, i) {
@@ -155,6 +176,7 @@ impl Query<'_> {
                         certain.push(loc);
                     }
                 }
+                PROF[2].fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 if !certain.is_empty() || !uncertain.is_empty() {
                     on_file(&certain, &uncertain);
                 }

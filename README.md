@@ -5,6 +5,7 @@ A speed-first C++ indexer and lightweight language server. Definitions, referenc
 ```
 cargo build --release
 target\release\lightspeed lsp --cdb path\to\compile_commands.json   # speaks LSP on stdio.
+target\release\lightspeed lsp --ninja path\to\build.ninja  # tries it best to parse ninja directly
 
 # add --fuzzy-refs to include uncertain references (deep templates etc)
 ```

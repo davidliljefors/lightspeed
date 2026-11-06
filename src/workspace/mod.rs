@@ -5,4 +5,6 @@
 pub mod compile_commands;
 pub mod depgraph;
 pub mod index;
+pub mod ninja;
+pub mod textstore;
 pub(crate) mod sysinc;

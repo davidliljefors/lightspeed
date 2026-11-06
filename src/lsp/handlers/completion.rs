@@ -15,7 +15,7 @@ impl Server {
     pub(in crate::lsp) fn signature_help(&self, params: &Value) -> Option<Value> {
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let h = Query::new(idx, &overlay).signature_help(&path, text.as_str(), off, self.settings.max_signatures)?;
         let more = (h.more > 0).then(|| json!({"kind": "markdown", "value": format!("… +{} more overload{}", h.more, if h.more == 1 { "" } else { "s" })}));
         let signatures: Vec<Value> = h
@@ -35,7 +35,7 @@ impl Server {
     pub(in crate::lsp) fn completion(&self, params: &Value) -> Option<Value> {
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let (syms, truncated) = Query::new(idx, &overlay).completions(&path, text.as_str(), off, COMPLETION_LIMIT);
         let mut seen: HashSet<(&str, u8)> = HashSet::new();
         let syms: Vec<SymbolId> = syms.into_iter().filter(|&s| seen.insert((idx.db.name(s), idx.db.symbol(s).kind as u8))).collect();

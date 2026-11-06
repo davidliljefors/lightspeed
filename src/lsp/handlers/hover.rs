@@ -9,7 +9,7 @@ impl Server {
     pub(in crate::lsp) fn hover(&self, params: &Value) -> Option<Value> {
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let h = Query::new(idx, &overlay).hover(&path, text.as_str(), off)?;
         let mut md = format!("```cpp\n{}\n```\n", h.signature);
         let mut facts = h.kind.clone();

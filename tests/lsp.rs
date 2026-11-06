@@ -130,6 +130,46 @@ fn definition_references_and_live_edits() {
     assert!(r["result"].as_array().unwrap().is_empty());
 }
 
+#[test]
+fn find_text_over_rpc() {
+    let (_d, root) = tmp();
+    let h = format!("{root}/shape.h");
+    let a = format!("{root}/a.cpp");
+    let htxt = "#pragma once\nstruct Shape { virtual float area(); };\n";
+    let atxt = "#include \"shape.h\"\nfloat Shape::area() { return 1; }\n// ünï shape\n";
+    std::fs::write(&h, htxt).unwrap();
+    std::fs::write(&a, atxt).unwrap();
+    common::write_cdb(&root, true);
+    let mut c = Client::new(&root);
+
+    let r = c.request("lightspeed/findText", json!({"query": "area"}));
+    let m = r["result"]["matches"].as_array().unwrap();
+    assert_eq!(m.len(), 2, "{r}");
+    // Sorted by path: a.cpp before shape.h.
+    assert_eq!(m[0]["uri"], path_to_uri(&a));
+    assert_eq!(m[0]["range"]["start"], json!({"line": 1, "character": 13}));
+    assert_eq!(m[0]["preview"], "float Shape::area() { return 1; }");
+    assert_eq!(m[1]["uri"], path_to_uri(&h));
+
+    // Case-insensitive, whole word, regex; UTF-16 columns after a non-ASCII char.
+    let r = c.request("lightspeed/findText", json!({"query": "SHAPE", "caseSensitive": false, "wholeWord": true}));
+    assert_eq!(r["result"]["matches"].as_array().unwrap().len(), 4);
+    let r = c.request("lightspeed/findText", json!({"query": "ünï (\\w+)", "regex": true}));
+    assert_eq!(r["result"]["matches"][0]["range"]["end"]["character"], 12);
+    let r = c.request("lightspeed/findText", json!({"query": "area", "maxResults": 1}));
+    assert_eq!(r["result"]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(r["result"]["truncated"], true);
+
+    // Unsaved buffers are searched, not the disk.
+    c.open(&a, atxt);
+    c.change(&a, &atxt.replace("return 1", "return needle"));
+    let r = c.request("lightspeed/findText", json!({"query": "needle"}));
+    assert_eq!(r["result"]["matches"].as_array().unwrap().len(), 1);
+
+    assert!(c.request("lightspeed/findText", json!({"query": "(", "regex": true}))["error"].is_object());
+    assert!(c.request("lightspeed/findText", json!({"query": ""}))["result"]["matches"].as_array().unwrap().is_empty());
+}
+
 /// Ctrl-click on a function that is defined right where the cursor is has nowhere to go.
 /// Answering with its own location makes editors start a find-references search instead.
 #[test]

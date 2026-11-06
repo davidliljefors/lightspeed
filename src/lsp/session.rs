@@ -155,7 +155,15 @@ impl Server {
         crate::log!("lightspeed: indexed {} files, {} symbols in {:.0} ms", idx.live_files().count(), idx.db.len(), ms);
         crate::log!("{}", idx.stats.report(rayon::current_num_threads()));
         crate::log!("{}", idx.memory_report());
+        let (store, paths): (_, Vec<String>) = (idx.texts.clone(), idx.live_files().map(|(_, f)| f.path.clone()).collect());
         self.index = Some(idx);
+        // Every file is needed sooner or later; compress them all in the background.
+        let _ = std::thread::Builder::new().name("lightspeed-texts".into()).spawn(move || {
+            let t = std::time::Instant::now();
+            store.warm(&paths);
+            let (n, raw, packed) = store.stats();
+            crate::log!("lightspeed: cached {n} files, {} MB as {} MB in {:.1} s", raw >> 20, packed >> 20, t.elapsed().as_secs_f64());
+        });
     }
 
     /// Returns a user-facing warning when no usable compile database was found.
@@ -169,21 +177,27 @@ impl Server {
                 .map(|r| root.join(r))
                 .find(|p| p.is_file())
         };
-        let cdb_path = match self.cdb_hint.clone() {
-            Some(h) if h.is_file() => Some(h),
-            Some(h) => {
+        let use_ninja = self.ninja.is_some();
+        let cdb_path = match (self.ninja.clone(), self.cdb_hint.clone()) {
+            (Some(n), _) if n.is_file() => Some(n),
+            (Some(n), _) => {
+                warning = Some(format!("lightspeed: ninja file {} not found; nothing indexed", n.display()));
+                None
+            }
+            (None, Some(h)) if h.is_file() => Some(h),
+            (None, Some(h)) => {
                 warning = Some(format!("lightspeed: compile database {} not found; searching the workspace", h.display()));
                 found(root)
             }
-            None => found(root),
+            (None, None) => found(root),
         };
-        if cdb_path.is_none() {
+        if cdb_path.is_none() && !use_ninja {
             warning = Some("lightspeed: no compile_commands.json found (workspace root, build/, out/); nothing indexed".into());
         }
         if let Some(w) = &warning {
             eprintln!("{w}");
         }
-        let load = |p: Option<PathBuf>| match p.as_ref().map(CompileDb::load) {
+        let load = move |p: Option<PathBuf>| match p.as_ref().map(|p| if use_ninja { CompileDb::load_ninja(p) } else { CompileDb::load(p) }) {
             Some(Ok(mut db)) => {
                 let n = db.add_system_includes();
                 crate::log!("lightspeed: {n} built-in include dirs discovered");

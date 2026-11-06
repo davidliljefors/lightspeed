@@ -20,7 +20,7 @@ impl Server {
             let at = |p: &Value| position_to_offset(text, &li, p["line"].as_u64().unwrap_or(0) as u32, p["character"].as_u64().unwrap_or(0) as u32);
             (at(&params["range"]["start"]), at(&params["range"]["end"]))
         });
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let toks = Query::new(idx, &overlay).semantic_tokens(&path, text, range);
         let mut data = Vec::with_capacity(toks.len() * 5);
         let (mut pl, mut pc) = (0u32, 0u32);

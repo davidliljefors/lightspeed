@@ -80,7 +80,7 @@ impl Server {
     /// `SymbolInformation` for each symbol; files are loaded and line-indexed once per call.
     pub(in crate::lsp) fn symbol_infos(&self, ids: impl IntoIterator<Item = SymbolId>) -> Value {
         let Some(idx) = self.index.as_ref() else { return Value::Array(Vec::new()) };
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let q = Query::new(idx, &overlay);
         let mut cache: HashMap<u32, Option<(Text, LineIndex, Value)>> = HashMap::new();
         let mut arr = Vec::new();

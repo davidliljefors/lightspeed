@@ -12,7 +12,7 @@ impl Server {
     pub(in crate::lsp) fn local_ranges(&self, params: &Value) -> Option<(Value, Vec<Value>, String)> {
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let l = Query::new(idx, &overlay).local_at(&path, text.as_str(), off)?;
         let now = self.now(&path)?;
         let uses = l.uses.iter().filter_map(|&(a, b)| now.range(a, b)).collect();
@@ -31,7 +31,7 @@ impl Server {
         }
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let q = Query::new(idx, &overlay);
         let seeds = q.definition(&path, text.as_str(), off);
         if seeds.is_empty() || seeds.iter().any(|&s| !self.inside_root(idx.db.files.path(idx.db.symbol(s).file))) {
@@ -56,7 +56,7 @@ impl Server {
         }
         let (path, text, off) = self.cursor(params).ok_or("cannot read document")?;
         let idx = self.index.as_ref().ok_or("not initialized")?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let refs = Query::new(idx, &overlay).symbol_refs(&path, text.as_str(), off).ok_or("cannot resolve a symbol here")?;
         if let Some(&t) = refs.targets.iter().find(|&&t| !self.inside_root(idx.db.files.path(idx.db.symbol(t).file))) {
             return Err(format!("`{}` is declared outside the workspace ({}); not renaming", refs.name, idx.db.files.path(idx.db.symbol(t).file)));

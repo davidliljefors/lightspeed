@@ -18,7 +18,8 @@ mod hover;
 mod locals;
 mod occurrences;
 pub use occurrences::{FileOccurrences, OccurrenceStats};
-mod refs;
+pub mod refs;
+pub mod textsearch;
 mod search;
 mod semantic;
 mod templates;
@@ -167,11 +168,16 @@ fn call_arity(toks: &[Token], open: usize) -> u32 {
 pub struct Query<'a> {
     pub idx: &'a Index,
     pub texts: &'a dyn TextSource,
+    /// Member accesses whose receiver type is unknown, and qualified names whose qualifier resolves to nothing,
+    /// match every same-named symbol, and the answer only depends on the name, arity and which of the two it is;
+    /// thousands of such sites in one request share it. Lives as long as this
+    /// `Query`, which borrows the index and so can never outlive an index change.
+    unknown_receiver: std::sync::Mutex<std::collections::HashMap<(crate::symbols::NameId, Option<u32>, bool), Arc<Vec<SymbolId>>>>,
 }
 
 impl<'a> Query<'a> {
     pub fn new(idx: &'a Index, texts: &'a dyn TextSource) -> Self {
-        Self { idx, texts }
+        Self { idx, texts, unknown_receiver: Default::default() }
     }
 
     /// Scope declarations enclosing `offset`, innermost first. Out-of-line

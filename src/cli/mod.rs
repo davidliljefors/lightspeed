@@ -43,15 +43,21 @@ pub fn run(mut args: Vec<String>) -> i32 {
         Some((cmd, rest)) if cmd == "parse" => analyze::parse_cmd(threads, rest),
         Some((cmd, rest)) if cmd == "index" => index::index_cmd(threads, rest),
         Some((cmd, rest)) if cmd == "def" => index::def_cmd(threads, rest),
+        Some((cmd, rest)) if cmd == "refs" => index::refs_cmd(threads, rest),
         Some((cmd, rest)) if cmd == "lsp" => {
-            let cdb = rest.iter().position(|a| a == "--cdb").and_then(|i| rest.get(i + 1)).map(std::path::PathBuf::from);
+            let path_arg = |flag: &str| rest.iter().position(|a| a == flag).and_then(|i| rest.get(i + 1)).map(std::path::PathBuf::from);
+            let (cdb, ninja) = (path_arg("--cdb"), path_arg("--ninja"));
+            if cdb.is_some() && ninja.is_some() {
+                eprintln!("lightspeed: pass either --cdb or --ninja, not both");
+                return 2;
+            }
             if rayon::ThreadPoolBuilder::new().num_threads(threads).stack_size(16 << 20).build_global().is_err() {
                 eprintln!("lightspeed: thread pool already initialised");
             }
-            lightspeed::lsp::serve_stdio(cdb, !rest.iter().any(|a| a == "--fuzzy-refs"), !rest.iter().any(|a| a == "--no-streaming"))
+            lightspeed::lsp::serve_stdio(cdb, ninja, !rest.iter().any(|a| a == "--fuzzy-refs"), !rest.iter().any(|a| a == "--no-streaming"))
         }
         _ => {
-            eprintln!("usage: lightspeed lex [-j threads] <file|dir>... | gen <dir> <files> <bytes> | cdb <compile_commands.json> | pp|parse|index [-j threads] <compile_commands.json> | lsp [--cdb compile_commands.json] [--fuzzy-refs] [--no-streaming]");
+            eprintln!("usage: lightspeed lex [-j threads] <file|dir>... | gen <dir> <files> <bytes> | cdb <compile_commands.json> | pp|parse|index [-j threads] <compile_commands.json> | lsp [--cdb compile_commands.json | --ninja file.ninja] [--fuzzy-refs] [--no-streaming]");
             2
         }
     }

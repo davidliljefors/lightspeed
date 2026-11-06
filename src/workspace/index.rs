@@ -411,6 +411,8 @@ pub struct Index {
     scope_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<crate::scope_decls::ScopeDecls>>>,
     reach_cache: std::sync::RwLock<std::collections::HashMap<usize, std::sync::Arc<hashbrown::HashSet<u32, FxBuildHasher>>>>,
     pub(crate) param_cache: crate::query::types::ParamCache,
+    /// Compressed in-memory copy of every file's text, shared with background warm-up.
+    pub texts: std::sync::Arc<super::textstore::TextStore>,
     dirty: bool,
     dead_symbols: usize,
     /// Files that could not be read during the last build.
@@ -438,6 +440,7 @@ impl Index {
             scope_cache: Default::default(),
             reach_cache: Default::default(),
             param_cache: Default::default(),
+            texts: Default::default(),
             db,
             hier,
             files: Vec::new(),
@@ -987,10 +990,15 @@ impl Index {
             crate::pp::vfs::invalidate_dir_of(&p);
             let loaded;
             let src = match text.filter(|_| first) {
-                Some(t) => t,
+                Some(t) => {
+                    // An unsaved buffer: the store keeps mirroring the disk.
+                    self.texts.remove(&p);
+                    t
+                }
                 None => match SourceFile::load(&p) {
                     Ok(s) => {
                         loaded = s;
+                        self.texts.put(&p, loaded.text());
                         loaded.text()
                     }
                     Err(_) => {
@@ -1052,6 +1060,7 @@ impl Index {
     }
 
     pub fn remove(&mut self, path: &str) {
+        self.texts.remove(path);
         if let Some(i) = self.file_index(path) {
             let was_clean = !self.dirty;
             let old = self.files[i].syms.0 as usize..self.files[i].syms.1 as usize;

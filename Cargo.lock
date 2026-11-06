@@ -392,11 +392,13 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "hashbrown",
+ "lz4_flex",
  "memchr",
  "memmap2",
  "mimalloc",
  "notify",
  "rayon",
+ "regex",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -416,6 +418,15 @@ name = "log"
 version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
 
 [[package]]
 name = "memchr"
@@ -777,6 +788,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "unicode-ident"

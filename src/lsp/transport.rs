@@ -50,9 +50,10 @@ pub(super) fn error(id: &Value, code: i32, message: &str) -> Value {
 }
 
 /// Convenience for the CLI: serve on the process's stdio.
-pub fn serve_stdio(cdb: Option<PathBuf>, certain_only: bool, streaming: bool) -> i32 {
+pub fn serve_stdio(cdb: Option<PathBuf>, ninja: Option<PathBuf>, certain_only: bool, streaming: bool) -> i32 {
     let stdin = std::io::BufReader::new(std::io::stdin());
     let mut server = Server::new(cdb);
+    server.set_ninja(ninja);
     server.set_certain_only(certain_only);
     server.set_streaming(streaming);
     server.run(stdin, std::io::stdout())

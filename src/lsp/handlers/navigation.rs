@@ -18,7 +18,7 @@ impl Server {
     pub(in crate::lsp) fn navigate(&self, params: &Value, locals_here: bool, stay_put: bool, find: impl Fn(&Query, &str, &str, u32) -> Vec<SymbolId>) -> Option<Value> {
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let q = Query::new(idx, &overlay);
         if locals_here && let Some(l) = q.local_at(&path, text.as_str(), off) {
             if stay_put && l.decl.0 <= off && off <= l.decl.1 {
@@ -42,7 +42,7 @@ impl Server {
         }
         let (path, text, off) = self.cursor(params)?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let q = Query::new(idx, &overlay);
         if let Some(p) = self.partial.as_deref() {
             // Each file's hits go out as soon as it is scanned; `finish` sends the remainder.

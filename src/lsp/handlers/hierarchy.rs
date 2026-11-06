@@ -18,7 +18,7 @@ impl Server {
     /// `TypeHierarchyItem`s (also the nodes of the inheritance graph) for `ids`.
     pub(in crate::lsp) fn type_items(&self, ids: &[SymbolId]) -> Vec<Value> {
         let Some(idx) = self.index.as_ref() else { return Vec::new() };
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let q = Query::new(idx, &overlay);
         let mut cache: HashMap<u32, Option<(Text, LineIndex, Value)>> = HashMap::new();
         let mut out = Vec::with_capacity(ids.len());
@@ -52,7 +52,7 @@ impl Server {
         let idx = self.index.as_ref()?;
         let db = &idx.db;
         let item = params.get("item").unwrap_or(params);
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         // Items are resolved by where the name is written now: symbol ids are
         // renumbered when the index is rebuilt after an edit, positions are not.
         if let (Some(uri), Some(line), Some(col)) = (item["uri"].as_str(), item["selectionRange"]["start"]["line"].as_u64(), item["selectionRange"]["start"]["character"].as_u64())

@@ -133,6 +133,76 @@ pub(super) fn index_cmd(threads: usize, args: &[String]) -> i32 {
     0
 }
 
+pub(super) fn refs_cmd(threads: usize, args: &[String]) -> i32 {
+    use lightspeed::query::Query;
+    use std::sync::atomic::Ordering::Relaxed;
+    let [cdb_path, file, line, col] = args else {
+        eprintln!("usage: lightspeed refs <compile_commands.json> <file> <line> <col>   (1-based)");
+        return 2;
+    };
+    let Ok(mut cdb) = lightspeed::workspace::compile_commands::CompileDb::load(cdb_path) else { return 1 };
+    cdb.add_system_includes();
+    let pool = super::pool(threads);
+    let cfg = lightspeed::workspace::index::IndexConfig {
+        cache: lightspeed::store::CacheConfig::for_project(std::path::Path::new(cdb_path)),
+        ..Default::default()
+    };
+    let t = Instant::now();
+    let idx = pool.install(|| lightspeed::workspace::index::Index::build(cdb, cfg));
+    println!("index {:.1} s", t.elapsed().as_secs_f64());
+    let text = std::fs::read_to_string(file).expect("read file");
+    let li = lightspeed::base::source::LineIndex::new(&text);
+    let off = li.line_start(line.parse::<usize>().unwrap() - 1).unwrap() + col.parse::<u32>().unwrap() - 1;
+    let mut path = file.replace('\\', "/");
+    lightspeed::pp::vfs::normalize_path(&mut path);
+    let q = Query::new(&idx, &*idx.texts);
+    if std::env::var_os("LS_NOWARM").is_none() {
+        let paths: Vec<String> = idx.live_files().map(|(_, f)| f.path.clone()).collect();
+        let t = Instant::now();
+        pool.install(|| idx.texts.warm(&paths));
+        let (n, raw, packed) = idx.texts.stats();
+        println!("text store: {n} files, {} MB raw as {} MB lz4, warmed in {:.1} s", raw >> 20, packed >> 20, t.elapsed().as_secs_f64());
+    }
+    if let Ok(needle) = std::env::var("LS_GREP") {
+        use rayon::prelude::*;
+        let paths: Vec<&str> = idx.live_files().map(|(_, f)| f.path.as_str()).collect();
+        for run in 0..2 {
+            let t = Instant::now();
+            let hits = pool.install(|| {
+                paths.par_iter().filter(|p| idx.texts.get(p).is_some_and(|t| memchr::memmem::find(t.as_bytes(), needle.as_bytes()).is_some())).count()
+            });
+            println!("grep {run}: {hits} files with hits in {:.0} ms over {} files", t.elapsed().as_secs_f64() * 1e3, paths.len());
+        }
+        return 0;
+    }
+    for run in 0..2 {
+        for p in lightspeed::query::refs::PROF.iter() {
+            p.store(0, Relaxed);
+        }
+        let t = Instant::now();
+        let r = pool.install(|| q.symbol_refs(&path, &text, off));
+        let wall = t.elapsed().as_secs_f64() * 1e3;
+        let p = |i: usize| lightspeed::query::refs::PROF[i].load(Relaxed);
+        let (c, u) = r.map_or((0, 0), |r| (r.certain.len(), r.uncertain.len()));
+        println!(
+            "run {run}: wall {wall:.0} ms | certain {c} uncertain {u} | candidates {} read {} files w/ name {} | {:.0} MB | thread-time: read {:.0} ms, lex {:.0} ms, resolve {:.0} ms",
+            p(6), p(4), p(5), p(3) as f64 / 1e6, p(0) as f64 / 1e6, p(1) as f64 / 1e6, p(2) as f64 / 1e6
+        );
+        println!(
+            "   definition_in calls {} (member {}), avg cands {:.0} | thread-time: local_in {:.0} ms, scopes {:.0} ms, lookup {:.0} ms, receiver {:.0} ms",
+            p(7), p(11), p(12) as f64 / p(7).max(1) as f64, p(13) as f64 / 1e6, p(8) as f64 / 1e6, p(9) as f64 / 1e6, p(10) as f64 / 1e6
+        );
+        let ms = |i: usize| p(i) as f64 / 1e6;
+        let n = p(7).max(1) as f64;
+        println!(
+            "   stages ms: sort/dedup {:.0}, qualifier {:.0}, drop_fwd {:.0}, spec {:.0}, unqual {:.0}, score {:.0}, overloads {:.0} | avg cands after: dedup {:.0}, drop_fwd {:.0}, pre-score {:.0}, picked {:.1} | qualified calls {}, unqualified {}",
+            ms(14), ms(15), ms(16), ms(17), ms(18), ms(19), ms(20),
+            p(24) as f64 / n, p(26) as f64 / n, p(28) as f64 / n, p(29) as f64 / n, p(25), p(27)
+        );
+    }
+    0
+}
+
 pub(super) fn def_cmd(threads: usize, args: &[String]) -> i32 {
     use lightspeed::query::{DiskText, Query};
     let [cdb_path, file, line, col] = args else {

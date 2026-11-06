@@ -19,7 +19,7 @@ impl Server {
     pub(in crate::lsp) fn workspace_symbols(&self, params: &Value) -> Option<Value> {
         let q = params["query"].as_str()?;
         let idx = self.index.as_ref()?;
-        let overlay = Overlay(&self.docs);
+        let overlay = Overlay(&self.docs, self.index.as_ref());
         let hits = Query::new(idx, &overlay).search_symbols(q, WORKSPACE_SYMBOL_LIMIT);
         Some(self.symbol_infos(hits))
     }
